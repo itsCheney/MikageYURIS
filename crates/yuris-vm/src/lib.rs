@@ -29,6 +29,8 @@ use std::collections::HashMap;
 pub mod boot;
 pub mod commands;
 pub mod host;
+mod tasks;
+pub use tasks::TaskReport;
 
 use yuris_core::{Error, Result};
 use yuris_format::ystb::YstbFile;
@@ -97,6 +99,8 @@ pub mod cmd {
     pub const TASKINFO: u8 = 0x61;
     /// SYSTEMINFO.
     pub const SYSTEMINFO: u8 = 0x5e;
+    /// TASKEND.
+    pub const TASKEND: u8 = 0x60;
 }
 
 /// VM 状态机。
@@ -554,6 +558,11 @@ pub struct LoopFrame {
     pub limit: Option<u64>,
     /// 已完成次数(引擎 +0x10/+0x14;LOOP 置 1 → LOOPEND 检查后 +1)。
     pub counter: u64,
+    /// IF stack depth at LOOP. LOOPBREAK/LOOPCONTINUE drop the IFs opened
+    /// inside the body: `IF ... LOOPBREAK IFEND` leaves its IF open, and a
+    /// later IFBLEND would otherwise take that IF's end as its own
+    /// (Erewhon es.SP.FINISH.SET).
+    pub if_depth: usize,
 }
 
 /// IF 嵌套帧(引擎 obj[0x40+level*4] 块的子集)。
@@ -636,6 +645,8 @@ pub struct GroupVm {
     /// Declaration). On by default for tests and traces; a player turns it
     /// off, as they are most of the cost of a run.
     trace: bool,
+    /// Engine clock in ms (`@1[1]`); the host advances it.
+    clock_ms: u64,
     /// Decoded expression windows by (script, offset, len); boot evaluates
     /// the same windows millions of times.
     decoded: yuris_core::FastHashMap<(u16, u32, u32), std::sync::Arc<[yuris_script::Instruction]>>,
@@ -671,11 +682,18 @@ pub struct GroupVm {
     file_probe: Option<std::sync::Arc<yuris_format::vfs::GameFs>>,
     /// The script list (`ysbin\yst_list.ybn`), for SYSTEMINFO.
     script_list: Option<std::sync::Arc<yuris_format::ystl::YstlTable>>,
-    /// 命名任务注册表(TASK 创建 → TASKINFO EXIST 查询;引擎 FUN_0040ca7d
-    /// 按名查找的等价面。任务的实际执行经 GOSUB 标签链顺序进入 —— 引擎
-    /// trace 实证:es.IDSubTask 的入口脚本由主线 GOSUB 串行调起,boot 段
-    /// 无并行交错;调度器模型归 P7.1 scenario 合流点定性)。
-    tasks: std::collections::HashSet<Vec<u8>>,
+    /// Tasks (see [`tasks`]); empty until the first TASK, then [0] is the
+    /// main script.
+    tasks: Vec<tasks::Task>,
+    /// Index of the running task in `tasks`.
+    current_task: usize,
+    /// Next task creation number.
+    task_seq: u64,
+    /// This frame's run order (task creation numbers) and position in it.
+    frame_order: Vec<u64>,
+    frame_pos: usize,
+    /// A frame was handed to the host; the next `run` starts a new one.
+    frame_done: bool,
     /// CG 状态注册表(CG 名(SJIS 字节)→ 状态;P7.1,成果 62)。
     cg_registry: HashMap<Vec<u8>, CgState>,
 }
@@ -714,6 +732,7 @@ impl GroupVm {
             ctx: std::sync::Arc::new(ctx),
             ctx_cache: HashMap::new(),
             trace: true,
+            clock_ms: 0,
             decoded: Default::default(),
             cmd_map: std::sync::Arc::new(commands::CommandMap::identity()),
             host: None,
@@ -741,7 +760,12 @@ impl GroupVm {
             ysvr_kind2_applied: std::collections::HashSet::new(),
             file_probe: None,
             script_list: None,
-            tasks: std::collections::HashSet::new(),
+            tasks: Vec::new(),
+            current_task: 0,
+            task_seq: 0,
+            frame_order: Vec::new(),
+            frame_pos: 0,
+            frame_done: false,
             cg_registry: HashMap::new(),
         })
     }
@@ -815,6 +839,22 @@ impl GroupVm {
     /// 已消费事件。
     pub fn events(&self) -> &[VmEvent] {
         &self.events
+    }
+
+    /// Return points of the active GOSUB frames, outermost first, as
+    /// (script id, pc to return to). For diagnostics.
+    pub fn call_stack(&self) -> Vec<(u16, usize)> {
+        self.frames.iter().skip(1).map(|f| (f.script_id, f.return_pc)).collect()
+    }
+
+    /// Sets the engine clock (ms since start) that scripts read as `@1[1]`.
+    pub fn set_clock_ms(&mut self, ms: u64) {
+        self.clock_ms = ms;
+    }
+
+    /// The engine clock in ms.
+    pub fn clock_ms(&self) -> u64 {
+        self.clock_ms
     }
 
     /// Turns control-flow events on or off (see the `trace` field).
@@ -912,6 +952,37 @@ impl GroupVm {
         Ok(applied)
     }
 
+    /// A YSVR string initial value. Erewhon (v481) stores these as compiled
+    /// expressions: `M len "text"` for a literal (`$1068` =
+    /// `M\x10\0"SCENARIO_START"`) and `V..` for an array read; plain bytes
+    /// otherwise. An expression that decodes and evaluates to one value
+    /// gives that value, without the literal's quotes.
+    fn ysvr_string(&mut self, b: &[u8]) -> Value {
+        if matches!(b.first(), Some(0x4d | 0x56)) {
+            if let Ok(instrs) = yuris_script::decode_window(b) {
+                let unknown = instrs
+                    .iter()
+                    .any(|i| matches!(i.kind, yuris_script::Insn::Unknown { .. }));
+                if !unknown {
+                    let mut ev = Evaluator::new(&mut self.store);
+                    if let Ok(mut stack) = ev.eval_instructions(&instrs) {
+                        if stack.len() == 1 {
+                            return match stack.pop().unwrap() {
+                                Value::Str(s)
+                                    if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' =>
+                                {
+                                    Value::Str(s[1..s.len() - 1].to_vec())
+                                }
+                                v => v,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Value::Str(b.to_vec())
+    }
+
     /// 应用单条 YSVR 条目(边界覆盖 + 初值)。
     fn apply_ysvr_entry(&mut self, e: &yuris_format::ysvr::YsvrEntry) -> Result<()> {
         use yuris_value::{ElemType, Value};
@@ -931,7 +1002,7 @@ impl GroupVm {
         let v = match &e.init {
             yuris_format::ysvr::YsvrInit::Int(i) => Value::Int(*i),
             yuris_format::ysvr::YsvrInit::Float(f) => Value::Float(*f),
-            yuris_format::ysvr::YsvrInit::Str(b) => Value::Str(b.clone()),
+            yuris_format::ysvr::YsvrInit::Str(b) => self.ysvr_string(b),
             yuris_format::ysvr::YsvrInit::None => {
                 // 仅声明无初值:数组按边界清零,标量按 type 默认
                 if e.bounds.is_empty() {
@@ -1015,8 +1086,12 @@ impl GroupVm {
             VmState::Idle | VmState::Running => {}
         }
         self.state = VmState::Running;
+        if let Some(s) = self.resume_frame() {
+            return Ok(s);
+        }
 
         let mut used = 0usize;
+        loop {
         while self.pc < self.ctx.groups.len() {
             if used >= budget {
                 return Ok(VmSuspend::None);
@@ -1203,8 +1278,16 @@ impl GroupVm {
                                 condition: None,
                             });
                         }
-                        self.state = VmState::Finished;
-                        return Ok(VmSuspend::Complete);
+                        // RETURN from the entry frame ends the task (the
+                        // main script's ends the run).
+                        match self.task_finished() {
+                            None => continue,
+                            Some(VmSuspend::Complete) => {
+                                self.state = VmState::Finished;
+                                return Ok(VmSuspend::Complete);
+                            }
+                            Some(s) => return Ok(s),
+                        }
                     }
                     let mut ret_vals: Vec<(u32, Value)> = Vec::new();
                     for w in &windows {
@@ -1263,13 +1346,17 @@ impl GroupVm {
                                 u32,
                                 yuris_value::ElemType,
                             ) = match b0 {
-                                // 槽号从 1 起(成果 54);B0=0 = 默认槽 1
+                                // YSCM RETURN slots: 0-15 RINT..RINT16 ->
+                                // @60[1..16], 16-31 RFLT.. -> @61, 32-47
+                                // RSTR.. -> $62. RINT2 is @60[2] (Erewhon
+                                // es.TX.KIDOKU.PER.ONE.KDKLIST.GET returns
+                                // RSTR, RINT2, RINT3).
                                 0x00..=0x0f => (
                                     yuris_value::VarRef {
                                         space: yuris_value::VarSpace::At,
                                         id: 60,
                                     },
-                                    b0.max(1),
+                                    b0 + 1,
                                     yuris_value::ElemType::Int,
                                 ),
                                 0x10..=0x1f => (
@@ -1277,7 +1364,7 @@ impl GroupVm {
                                         space: yuris_value::VarSpace::At,
                                         id: 61,
                                     },
-                                    (b0 - 0x10).max(1),
+                                    b0 - 0x10 + 1,
                                     yuris_value::ElemType::Float,
                                 ),
                                 0x20..=0x2f => (
@@ -1285,7 +1372,7 @@ impl GroupVm {
                                         space: yuris_value::VarSpace::Dollar,
                                         id: 62,
                                     },
-                                    (b0 - 0x20).max(1),
+                                    b0 - 0x20 + 1,
                                     yuris_value::ElemType::Str,
                                 ),
                                 _ => continue,
@@ -1577,6 +1664,7 @@ impl GroupVm {
                         exit_target,
                         limit,
                         counter: 1,
+                        if_depth: self.if_nest.len(),
                     });
                     // 引擎 00445a00 limit==0 路径:counter=0 且 PC = rec+8
                     // (退出点)—— **不进循环体**,记录留栈由 LOOPEND 弹出
@@ -1647,6 +1735,7 @@ impl GroupVm {
                         });
                     }
                     self.loops.truncate(keep + 1);
+                    self.if_nest.truncate(self.loops[keep].if_depth);
                     if let Some(f) = self.loops.last_mut() {
                         f.counter = 0;
                         f.limit = Some(0);
@@ -1692,6 +1781,7 @@ impl GroupVm {
                         });
                     }
                     self.loops.truncate(keep + 1);
+                    self.if_nest.truncate(self.loops[keep].if_depth);
                     self.pc = exit;
                     continue;
                 }
@@ -1787,7 +1877,10 @@ impl GroupVm {
                         });
                     }
                     self.pc += 1; // 先推进:等完后继续执行
-                    return Ok(VmSuspend::Wait { counter, time_ms });
+                    match self.task_wait(counter, time_ms) {
+                        Some(s) => return Ok(s),
+                        None => continue,
+                    }
                 }
                 cmd::TEXT => {
                     // 引擎 CMDH_00452888:FILE 参数为字符串(UTF-8/SJIS)→ 显示层;
@@ -3001,7 +3094,15 @@ impl GroupVm {
                                 continue;
                             }
                             if let Some(v) = self.eval_window_condition(Some(w))? {
-                                init = v;
+                                // The initial value takes the declared type:
+                                // `INT @a = @f` with a float @f stores the
+                                // truncated integer (Erewhon es.SP.DRAW then
+                                // does `@a %= 360`).
+                                init = match (&init, v) {
+                                    (Value::Int(_), Value::Float(f)) => Value::Int(f as i64),
+                                    (Value::Float(_), Value::Int(n)) => Value::Float(n as f64),
+                                    (_, v) => v,
+                                };
                             }
                             break;
                         }
@@ -3065,7 +3166,7 @@ impl GroupVm {
                                 1 => {
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
                                         path = Some(v.str_as_string());
-                                        if self.trace {
+                                        {
                                             evaluated.push((slot, value_summary(&v)));
                                         }
                                     }
@@ -3073,7 +3174,7 @@ impl GroupVm {
                                 4 => {
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
                                         exist = matches!(&v, Value::Int(n) if *n != 0);
-                                        if self.trace {
+                                        {
                                             evaluated.push((slot, value_summary(&v)));
                                         }
                                     }
@@ -3081,7 +3182,7 @@ impl GroupVm {
                                 7 => let_ref = Some(w.clone()),
                                 _ => {
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
-                                        if self.trace {
+                                        {
                                             evaluated.push((slot, value_summary(&v)));
                                         }
                                     }
@@ -3101,7 +3202,7 @@ impl GroupVm {
                                     let target = extract_var_target(&bytes)?;
                                     let hit = probe.exists(p);
                                     self.write_var_target(&target, Value::Int(hit as i64))?;
-                                    if self.trace {
+                                    {
                                         evaluated.push((
                                             255u8,
                                             format!("EXIST({p})={} → {}", hit as i64, target.summary()),
@@ -3109,12 +3210,12 @@ impl GroupVm {
                                     }
                                 }
                                 (Some(_), (None, _)) => {
-                                    if self.trace {
+                                    {
                                         evaluated.push((255u8, "err:EXIST 无 FILE 路径".into()));
                                     }
                                 }
                                 (Some(_), (_, None)) => {
-                                    if self.trace {
+                                    {
                                         evaluated.push((255u8, "err:无 file_probe".into()));
                                     }
                                 }
@@ -3148,17 +3249,13 @@ impl GroupVm {
                         self.pc += 1;
                         continue;
                     }
-                    // TASK(0x5f,引擎 0044fe40 反编译):命名任务创建/重配置。
-                    // 槽 0=ID(名)、槽 1=E/槽 2=A/槽 3=Z(优先级)、槽 4-13=TINT、
-                    // 14-23=TFLT、24-33=TSTR、槽 34='#'(入口标签)、35/36=SCRIPTPOS/
-                    // TEXTPOS、37=RESTART。引擎:查/建任务对象 → 标签查表装载
-                    // 入口脚本 → 参数写入任务对象。VM:**注册名字**(TASKINFO
-                    // EXIST 的查询面)+ 求值记录;不 spawn —— 引擎 trace 实证
-                    // 任务入口经主线 GOSUB 标签链顺序调起(s24 g195 → s2 pc47
-                    // GOSUB → s266 → s9),boot 段无并行交错。
-                    if other == cmd::TASK {
+                    // TASK (0x5f) / TASKEND (0x60) / TASKINFO (0x61): see
+                    // `tasks`. TASK slots: 0 ID, 1 E, 2 A, 3 Z, 4-13 TINT,
+                    // 14-23 TFLT, 24-33 TSTR, 34 '#', 35 SCRIPTPOS,
+                    // 36 TEXTPOS, 37 RESTART.
+                    if other == cmd::TASK || other == cmd::TASKEND {
                         let mut evaluated: Vec<(u8, String)> = Vec::new();
-                        let mut name: Option<Vec<u8>> = None;
+                        let mut params = tasks::TaskParams::default();
                         for w in &windows {
                             if w.len == 0 {
                                 continue;
@@ -3166,10 +3263,64 @@ impl GroupVm {
                             let slot = (w.tag & 0xff) as u8;
                             match self.eval_window_condition(Some(w)) {
                                 Ok(Some(v)) => {
-                                    if slot == 0 {
-                                        if let Value::Str(bytes) = &v {
-                                            name = Some(bytes.clone());
-                                        }
+                                    params.set(slot, &v);
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => evaluated.push((slot, format!("err:{e}"))),
+                            }
+                        }
+                        let (desc, switched) = if other == cmd::TASK {
+                            self.exec_task(params)?
+                        } else {
+                            self.exec_taskend(params.id.as_deref())
+                        };
+                        if self.trace {
+                            evaluated.push((255u8, desc));
+                        }
+                        self.events.push(VmEvent::Subsystem {
+                            pc: self.pc,
+                            command: other,
+                            evaluated,
+                        });
+                        match switched {
+                            // The running task paused or ended itself.
+                            Some(Some(VmSuspend::Complete)) => {
+                                self.state = VmState::Finished;
+                                return Ok(VmSuspend::Complete);
+                            }
+                            Some(Some(s)) => return Ok(s),
+                            Some(None) => continue,
+                            None => {
+                                self.pc += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    // TASKINFO slots: 0 ID (default: the running task),
+                    // 1 LET, 2.. queries (see `GroupVm::task_info`).
+                    if other == cmd::TASKINFO {
+                        let mut evaluated: Vec<(u8, String)> = Vec::new();
+                        let mut name: Option<Vec<u8>> = None;
+                        let mut query: Option<u8> = None;
+                        let mut pending_let: Option<yuris_format::ystb::CommandSlot> = None;
+                        for w in &windows {
+                            if w.len == 0 {
+                                continue;
+                            }
+                            let slot = (w.tag & 0xff) as u8;
+                            if slot == 1 {
+                                pending_let = Some(w.clone());
+                                continue;
+                            }
+                            match self.eval_window_condition(Some(w)) {
+                                Ok(Some(v)) => {
+                                    match (slot, &v) {
+                                        (0, Value::Str(_)) => name = Some(tasks::strip_quotes(&v)),
+                                        (2.., Value::Int(n)) if *n != 0 => query = Some(slot),
+                                        _ => {}
                                     }
                                     if self.trace {
                                         evaluated.push((slot, value_summary(&v)));
@@ -3179,105 +3330,31 @@ impl GroupVm {
                                 Err(e) => evaluated.push((slot, format!("err:{e}"))),
                             }
                         }
-                        if let Some(n) = name {
-                            let existed = self.tasks.contains(&n);
-                            self.tasks.insert(n.clone());
-                            if self.trace {
-                                evaluated.push((
-                                    255u8,
-                                    format!(
-                                        "task {} {}",
-                                        if existed { "已存在(重配置)" } else { "注册" },
-                                        String::from_utf8_lossy(&n)
-                                    ),
-                                ));
-                            }
-                        }
-                        self.events.push(VmEvent::Subsystem {
-                            pc: self.pc,
-                            command: other,
-                            evaluated,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // TASKINFO(0x61,引擎 00451838 反编译):任务状态查询。
-                    // 槽 0=ID(任务名;缺省=当前任务)、槽 1=LET(写回目标)、
-                    // 槽 2=EXIST → 注册表命中写 1/未命中写 0(引擎:查不到
-                    // 任务 → LET=0 后返回;查到且 EXIST → 写 1)。其余查询槽
-                    // (E/A/Z/FILE/../NEXTVOICE/GOLABEL/...)走 FUN_0045baf8 ——
-                    // 语料未执行,到访挂起(不猜)。
-                    if other == cmd::TASKINFO {
-                        let mut evaluated: Vec<(u8, String)> = Vec::new();
-                        let mut name: Option<Vec<u8>> = None;
-                        let mut let_target: Option<VarTarget> = None;
-                        let mut exist = false;
-                        let mut other_query = false;
-                        let mut pending_let: Option<yuris_format::ystb::CommandSlot> = None;
-                        for w in &windows {
-                            if w.len == 0 {
-                                continue;
-                            }
-                            let slot = (w.tag & 0xff) as u8;
-                            match slot {
-                                1 => pending_let = Some(w.clone()),
-                                _ => {
-                                    match self.eval_window_condition(Some(w)) {
-                                        Ok(Some(v)) => {
-                                            match slot {
-                                                0 => {
-                                                    if let Value::Str(bytes) = &v {
-                                                        name = Some(bytes.clone());
-                                                    }
-                                                }
-                                                2 => {
-                                                    exist = matches!(&v, Value::Int(n) if *n != 0)
-                                                }
-                                                _ => other_query = true,
-                                            }
-                                            if self.trace {
-                                                evaluated.push((slot, value_summary(&v)));
-                                            }
-                                        }
-                                        Ok(None) => {}
-                                        Err(e) => evaluated.push((slot, format!("err:{e}"))),
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(w) = pending_let {
-                            let bytes = self
-                                .ctx
-                                .script
-                                .window_bytes_pooled_copy(&w)
-                                .ok_or_else(|| Error::format("TASKINFO LET 引用窗越过池尾"))?;
-                            let_target = Some(extract_var_target(&bytes)?);
-                        }
-                        if other_query {
-                            return Err(self.halt_err(
-                                self.pc,
-                                cmd::TASKINFO,
-                                "TASKINFO 非 EXIST 查询槽未实现(引擎 FUN_0045baf8 族;\
-                                 语料未出现;不猜)",
-                            ));
-                        }
-                        if exist {
-                            let hit = name
-                                .as_deref()
-                                .map(|n| self.tasks.contains(n))
-                                .unwrap_or(false);
-                            if let Some(target) = &let_target {
-                                self.write_var_target(target, Value::Int(hit as i64))?;
+                        let answer = query.and_then(|q| self.task_info(name.as_deref(), q));
+                        match (answer, pending_let) {
+                            (Some(v), Some(w)) => {
+                                let bytes = self
+                                    .ctx
+                                    .script
+                                    .window_bytes_pooled_copy(&w)
+                                    .ok_or_else(|| Error::format("TASKINFO LET 引用窗越过池尾"))?;
+                                let target = extract_var_target(&bytes)?;
                                 if self.trace {
                                     evaluated.push((
                                         255u8,
-                                        format!(
-                                            "EXIST({:?})={} → {}",
-                                            name.map(|n| String::from_utf8_lossy(&n).into_owned()),
-                                            hit as i64,
-                                            target.summary()
-                                        ),
+                                        format!("{} -> {}", value_summary(&v), target.summary()),
                                     ));
+                                }
+                                self.write_var_target(&target, v)?;
+                            }
+                            (_, None) => {}
+                            (None, Some(_)) => {
+                                let reason = format!(
+                                    "TASKINFO query {query:?} not implemented s{} pc={}",
+                                    self.ctx.script_id, self.pc
+                                );
+                                if let Some(r) = self.halt_or_record(self.pc, cmd::TASKINFO, reason) {
+                                    return Ok(VmSuspend::Error(r));
                                 }
                             }
                         }
@@ -3409,32 +3486,48 @@ impl GroupVm {
                 }
             }
         }
-        self.state = VmState::Finished;
-        Ok(VmSuspend::Complete)
+        // Past the last group: the task ends, like a RETURN.
+        match self.task_finished() {
+            None => continue,
+            Some(VmSuspend::Complete) => {
+                self.state = VmState::Finished;
+                return Ok(VmSuspend::Complete);
+            }
+            Some(s) => return Ok(s),
+        }
+        }
     }
 
     /// 切换到目标脚本上下文(取目标脚本 ctx,替换当前 ctx,重设 pc 与 script_id)。
     ///
     /// 需要已绑定 `ScriptHost`;无 host 或加载失败 → `Err`。
-    fn switch_script(&mut self, script_id: u16, target_pc: usize) -> Result<()> {
+    /// A script's remapped context. Loading copies the script and remapping
+    /// walks every window, so each is kept once and shared.
+    fn load_ctx(&mut self, script_id: u16) -> Result<std::sync::Arc<ScriptCtx>> {
+        if let Some(ctx) = self.ctx_cache.get(&script_id) {
+            return Ok(ctx.clone());
+        }
+        if script_id == self.ctx.script_id {
+            self.ctx_cache.insert(script_id, self.ctx.clone());
+            return Ok(self.ctx.clone());
+        }
         let Some(host) = &mut self.host else {
+            return Err(Error::format(format!("script {script_id} needs a ScriptHost")));
+        };
+        let mut ctx = host.load(script_id)?;
+        self.cmd_map.remap(&mut ctx);
+        let ctx = std::sync::Arc::new(ctx);
+        self.ctx_cache.insert(script_id, ctx.clone());
+        Ok(ctx)
+    }
+
+    fn switch_script(&mut self, script_id: u16, target_pc: usize) -> Result<()> {
+        if self.host.is_none() {
             return Err(Error::format(format!(
                 "跨脚本跳转到 script {script_id} 但未绑定 ScriptHost"
             )));
-        };
-        // Loading a script copies it and remapping walks every window, so
-        // keep each remapped script once and share it.
-        let new_ctx = match self.ctx_cache.get(&script_id) {
-            Some(ctx) => ctx.clone(),
-            None => {
-                let mut ctx = host.load(script_id)?;
-                self.cmd_map.remap(&mut ctx);
-                let ctx = std::sync::Arc::new(ctx);
-                self.ctx_cache.insert(script_id, ctx.clone());
-                ctx
-            }
-        };
-        self.ctx = new_ctx;
+        }
+        self.ctx = self.load_ctx(script_id)?;
         self.pc = target_pc;
         // 引擎加载脚本时消费其声明组(INT/FLT/STR 建立变量,Confirmed 形态)。
         // 每脚本只全扫一次(已消费集跟踪):GO/GOSUB 高频跨脚本,重复全扫
@@ -3491,13 +3584,28 @@ impl GroupVm {
         let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
             return Ok(GoOutcome::Halted(self.halted(self.pc, cmd::GO, "GO 窗口越过池尾")));
         };
-        let Some(name) = mstring(&bytes) else {
-            return Ok(GoOutcome::Halted(self.halted(
-                self.pc,
-                cmd::GO,
-                "GO 窗口不是 M-串标签",
-            )));
+        // The label is usually a string literal; it can also be computed
+        // (Erewhon's es.SCENARIO.FLOW does `GO #=$1068`).
+        let name: Vec<u8> = match mstring(&bytes) {
+            Some(n) => n.to_vec(),
+            None => match self.eval_window_condition(Some(w))? {
+                Some(Value::Str(s)) => {
+                    if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' {
+                        s[1..s.len() - 1].to_vec()
+                    } else {
+                        s
+                    }
+                }
+                _ => {
+                    return Ok(GoOutcome::Halted(self.halted(
+                        self.pc,
+                        cmd::GO,
+                        "GO 窗口不是 M-串标签",
+                    )))
+                }
+            },
         };
+        let name = name.as_slice();
         match self.labels.get(name).copied() {
             Some((target_pc, script_id)) => {
                 if script_id != self.ctx.script_id {
@@ -3604,6 +3712,7 @@ impl GroupVm {
         // 迭代计数 —— 引擎读 obj+0x244 嵌套栈顶记录 +0x10,LOOP 置 1、
         // LOOPEND +1;无活动循环 = 0(GOSUB 不压该栈,跨帧可见)。
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
+        ev.set_clock_ms(self.clock_ms as i64);
         match ev.eval_instructions(&instrs) {
             Ok(stack) => Ok(stack.into_iter().next_back()),
             Err(e) => {
@@ -3728,8 +3837,8 @@ impl GroupVm {
         // 无实参窗 → **清零**(INT 0 / FLT 0.0 / STR "")—— 引擎逐槽
         // `if (arg窗==0) { *str=0; flag=0 }` 分支;计数外槽不写不声明
         // (引擎写循环只到 count,读越界走 sysvar 边界检查 = 0)。
-        // 类型区段:B0 0x01-0x0f → INT @53[slot];0x11-0x1f → FLT @54[slot-0x10];
-        //           0x21-0x2f → STR $55[slot-0x20]。
+        // 类型区段:B0 1-16 → INT @53[1..16];17-32 → FLT @54[1..16];
+        //           33-48 → STR $55[1..16]。
         // 帧局部数组在 locals 内以 {At,53}/{At,54}/{Dollar,55} 键承载 ——
         // 与 LET 帧局部写路径(fr.locals.set_elem)及 aload 帧局部读路径
         // (eval.rs locals 优先)共用同一寻址。
@@ -3745,10 +3854,10 @@ impl GroupVm {
                 continue;
             }
             let b0 = (w.tag & 0xff) as u32;
+            // YSCM GOSUB slots: 1-16 PINT..PINT16, 17-32 PFLT..,
+            // 33-48 PSTR.. (slot 0 is the label).
             let (ty, slot) = match b0 {
-                0x01..=0x0f => (0usize, b0),
-                0x10..=0x1f => (1usize, b0 - 0x10),
-                0x20..=0x2f => (2usize, b0 - 0x20),
+                1..=48 => (((b0 - 1) / 16) as usize, (b0 - 1) % 16 + 1),
                 _ => continue, // 条件/标签窗(B0=0)或区段外
             };
             args[ty].insert(slot, w);
@@ -3889,6 +3998,7 @@ impl GroupVm {
         ev.set_cursor(cx, cy);
         // @48 注入(同 eval_window_condition;左值下标表达式可读系统变量)
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
+        ev.set_clock_ms(self.clock_ms as i64);
         match ev.eval_lvalue_window_instrs(&instrs) {
             Ok(l) => Ok(l),
             Err(e) => {
@@ -4397,6 +4507,7 @@ impl GroupVm {
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
+        ev.set_clock_ms(self.clock_ms as i64);
         let stack = ev.eval_instructions(idx).map_err(|e| {
             Error::format(format!("引用槽下标表达式求值失败: {e}"))
         })?;

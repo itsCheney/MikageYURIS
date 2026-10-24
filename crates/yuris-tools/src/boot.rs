@@ -24,6 +24,8 @@ pub struct BootArgs {
     pub max_groups: usize,
     pub jsonl: Option<PathBuf>,
     pub strict: bool,
+    pub trace: bool,
+    pub tail: usize,
 }
 
 fn hex(k: &[u8]) -> String {
@@ -101,8 +103,8 @@ pub fn run(args: BootArgs) -> Result<()> {
 
     let mut vm = booted.vm;
     vm.set_strict(args.strict);
-    // Control-flow events are only worth their cost when written out.
-    vm.set_trace(args.jsonl.is_some());
+    // Control-flow events cost most of a run; record them only if asked.
+    vm.set_trace(args.trace || args.tail > 0);
     let foreign = vm.command_map().foreign_names();
     if !foreign.is_empty() {
         println!("commands not in the v555 table: {}", foreign.join(", "));
@@ -121,6 +123,7 @@ pub fn run(args: BootArgs) -> Result<()> {
         None => None,
     };
 
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut frames = 0usize;
     let mut kinds = [0usize; KINDS.len()];
     let mut unsupported: BTreeMap<String, (usize, String)> = BTreeMap::new();
@@ -133,6 +136,12 @@ pub fn run(args: BootArgs) -> Result<()> {
         for e in &vm.take_events() {
             if let Some(o) = out.as_mut() {
                 writeln!(o, "{}", yuris_vm::event_json(e))?;
+            }
+            if args.tail > 0 {
+                if tail.len() == args.tail {
+                    tail.pop_front();
+                }
+                tail.push_back(yuris_vm::event_json(e));
             }
             kinds[kind(e)] += 1;
             match e {
@@ -151,8 +160,12 @@ pub fn run(args: BootArgs) -> Result<()> {
         }
         match s {
             VmSuspend::None => {}
-            VmSuspend::Wait { .. } => {
+            VmSuspend::Wait { counter, time_ms } => {
+                // Simulated time: a frame is 1/60 s; a timed wait passes
+                // its whole duration at once.
                 frames += 1;
+                let step = time_ms.unwrap_or(0).max(counter.unwrap_or(1) * 1000 / 60).max(1);
+                vm.set_clock_ms(vm.clock_ms() + step);
                 if let Err(e) = vm.resume(ResumeResponse::Continue) {
                     break format!("resume error: {e}");
                 }
@@ -167,12 +180,70 @@ pub fn run(args: BootArgs) -> Result<()> {
 
     println!();
     println!(
-        "stopped: {stop}\n  at yst{:05} pc {}, {} groups, {} waits",
+        "stopped: {stop}\n  at yst{:05} pc {}, {} groups, {} waits, {:.1} s simulated",
         vm.script_id(),
         vm.pc(),
         vm.executed_groups(),
-        frames
+        frames,
+        vm.clock_ms() as f64 / 1000.0
     );
+    // Where the run stopped, as label + offset for each GOSUB return point.
+    let labels = fs
+        .read("ysbin\\ysl.ybn")
+        .ok()
+        .and_then(|b| yuris_format::yslb::YslbTable::from_bytes(&b).ok());
+    let place = |sid: u16, pc: usize| -> String {
+        let best = labels.as_ref().and_then(|t| {
+            t.labels()
+                .iter()
+                .filter(|l| l.script_id == sid && l.target_pc as usize <= pc)
+                .max_by_key(|l| l.target_pc)
+        });
+        match best {
+            Some(l) => format!(
+                "yst{sid:05} pc {pc} ({}+{})",
+                String::from_utf8_lossy(&l.name),
+                pc - l.target_pc as usize
+            ),
+            None => format!("yst{sid:05} pc {pc}"),
+        }
+    };
+    if !tail.is_empty() {
+        println!("last {} events:", tail.len());
+        for line in &tail {
+            let line: String = line.chars().take(240).collect();
+            println!("  {line}");
+        }
+    }
+    if vm.has_tasks() {
+        println!("tasks (call stacks, innermost last):");
+        for t in vm.task_stacks() {
+            let name = if t.name.is_empty() { "(main)" } else { t.name.as_str() };
+            let mut state = Vec::new();
+            if t.running {
+                state.push("running".to_string());
+            }
+            if !t.enabled {
+                state.push("paused".to_string());
+            }
+            if t.wait_frames > 0 {
+                state.push(format!("waits {} frames", t.wait_frames));
+            }
+            if t.wait_until_ms > vm.clock_ms() {
+                state.push(format!("waits {} ms", t.wait_until_ms - vm.clock_ms()));
+            }
+            println!("  {name} Z={} {}", t.z, state.join(", "));
+            for (sid, pc) in t.stack {
+                println!("    {}", place(sid, pc));
+            }
+        }
+    } else {
+        println!("call stack (innermost last):");
+        for (sid, pc) in vm.call_stack() {
+            println!("  {}", place(sid, pc.saturating_sub(1)));
+        }
+        println!("  {}", place(vm.script_id(), vm.pc()));
+    }
     println!("events:");
     for (k, n) in KINDS.iter().zip(kinds) {
         if n > 0 {

@@ -59,6 +59,12 @@ enum Cmd {
         /// and skipped).
         #[arg(long)]
         strict: bool,
+        /// Also record control-flow events (groups, jumps, calls) in --jsonl.
+        #[arg(long)]
+        trace: bool,
+        /// Prints the last N events (control flow included) when the run stops.
+        #[arg(long, default_value_t = 0)]
+        tail: usize,
     },
     /// List the files of an Enigma Virtual Box exe or external package.
     Evb {
@@ -270,7 +276,7 @@ fn main() -> Result<()> {
                 println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
             }
         }
-        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict } => {
+        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail } => {
             boot::run(boot::BootArgs {
                 dir,
                 launcher,
@@ -279,6 +285,8 @@ fn main() -> Result<()> {
                 max_groups,
                 jsonl,
                 strict,
+                trace,
+                tail,
             })?;
         }
         Cmd::Ypf { sub } => match sub {

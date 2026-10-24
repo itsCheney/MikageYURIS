@@ -25,6 +25,10 @@ pub struct Evaluator<'s> {
     /// +0x2ac/+0x2b0,每帧 GetCursorPos→ScreenToClient→逻辑缩放,
     /// recon_00403f2c_input_poll.c)。由 VM 注入;(0,0) = 无输入面。
     cursor: (i64, i64),
+    /// Engine clock in milliseconds, read as `@1[1]` (scripts time fades
+    /// and waits with it: Erewhon's es.CGFADEEXEC computes
+    /// `256 * (@1[1] - start) / duration`). Set by the VM.
+    clock_ms: i64,
     /// 调试:打印变量装载(默认 false)。
     pub verbose: bool,
 }
@@ -32,7 +36,7 @@ pub struct Evaluator<'s> {
 impl<'s> Evaluator<'s> {
     /// 绑定变量存储(无帧局部)。
     pub fn new(store: &'s mut VariableStore) -> Self {
-        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), verbose: false }
+        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), clock_ms: 0, verbose: false }
     }
 
     /// 绑定变量存储 + 帧局部。
@@ -40,12 +44,17 @@ impl<'s> Evaluator<'s> {
         store: &'s mut VariableStore,
         locals: Option<&'s VariableStore>,
     ) -> Self {
-        Self { store, locals, loop_counter: 0, cursor: (0, 0), verbose: false }
+        Self { store, locals, loop_counter: 0, cursor: (0, 0), clock_ms: 0, verbose: false }
     }
 
     /// 注入 @48 当前值(内层 LOOP 迭代计数;无循环 = 0)。
     pub fn set_loop_counter(&mut self, v: i64) {
         self.loop_counter = v;
+    }
+
+    /// Sets the clock `@1[1]` reads.
+    pub fn set_clock_ms(&mut self, ms: i64) {
+        self.clock_ms = ms;
     }
 
     /// 注入光标逻辑坐标(@133/@138;引擎 obj+0x2ac/+0x2b0)。
@@ -120,6 +129,10 @@ impl<'s> Evaluator<'s> {
                         // @48(引擎 sysvar case 0x30):LOOP 迭代计数,读即
                         // 计算、无存储;引擎对下标不敏感(语料无索引用法)
                         Value::Int(self.loop_counter)
+                    } else if r.space == VarSpace::At && r.id == 1 && indices == [1] {
+                        // @1[1]: the engine clock in ms (the only element
+                        // Erewhon's scripts read; 370 uses).
+                        Value::Int(self.clock_ms)
                     } else if r.space == VarSpace::At && r.id == 114 {
                         // @114(sysvar case 0x72):显示色深 bpp(成果 59c)
                         Value::Int(32)

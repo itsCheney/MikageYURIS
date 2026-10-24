@@ -30,7 +30,7 @@ fn taskinfo_exist_roundtrip() {
         0x4d, 9, 0, b'"', b'e', b's', b'.', b'T', b'e', b's', b't', b'"',
     ];
     let w_label: &[u8] = &[
-        0x4d, 8, 0, b'"', b'E', b'S', b'.', b'L', b'O', b'O', b'P', b'"',
+        0x4d, 9, 0, b'"', b'E', b'S', b'.', b'L', b'O', b'O', b'P', b'"',
     ];
     let w_exist: &[u8] = &[0x42, 1, 0, 1]; // push 1
     // TASKINFO 的 ID 槽 = 字符串(合成用字面量推入;引擎经 $55[1] 帧局部)
@@ -54,6 +54,9 @@ fn taskinfo_exist_roundtrip() {
     let bytes = make_ystb(key, groups, windows);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
+    // The task's entry label has to exist: ES.LOOP = the RETURN group.
+    let sid = vm.script_id();
+    vm.set_labels([(b"ES.LOOP".to_vec(), (2u32, sid))].into_iter().collect());
     let s = vm.run(100).unwrap();
     assert!(matches!(s, VmSuspend::Complete), "{s:?}");
     let r = var(VarSpace::At, 9000);
@@ -88,9 +91,10 @@ fn taskinfo_exist_missing() {
     assert_eq!(vm.store().get(&r).unwrap(), &Value::Int(0), "未注册 EXIST=0");
 }
 
-/// 非 EXIST 查询槽(NEXTVOICE=1 无 ID)→ 显式 Unsupported(不猜)。
+/// NEXTVOICE (slot 13) without an ID asks about the running task. Text is
+/// not implemented yet, so it reads 0.
 #[test]
-fn taskinfo_other_query_halts() {
+fn taskinfo_nextvoice_reads_zero() {
     let key = SAMPLE_KEY;
     let w_voice: &[u8] = &[0x42, 1, 0, 1]; // 槽 13 NEXTVOICE = 1
     let w_let: &[u8] = &[0x48, 3, 0, 0x40, 0x2a, 0x23]; // var @9002
@@ -102,6 +106,8 @@ fn taskinfo_other_query_halts() {
     let bytes = make_ystb(key, groups, windows);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
-    let err = vm.run(100).unwrap_err();
-    assert!(err.to_string().contains("非 EXIST 查询槽"), "{err}");
+    let s = vm.run(100).unwrap();
+    assert!(matches!(s, VmSuspend::Complete), "{s:?}");
+    let r = var(VarSpace::At, 9002);
+    assert_eq!(vm.store().get(&r).unwrap(), &Value::Int(0));
 }
