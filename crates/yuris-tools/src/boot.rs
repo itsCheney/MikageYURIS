@@ -101,6 +101,8 @@ pub fn run(args: BootArgs) -> Result<()> {
 
     let mut vm = booted.vm;
     vm.set_strict(args.strict);
+    // Control-flow events are only worth their cost when written out.
+    vm.set_trace(args.jsonl.is_some());
     let foreign = vm.command_map().foreign_names();
     if !foreign.is_empty() {
         println!("commands not in the v555 table: {}", foreign.join(", "));
@@ -119,9 +121,8 @@ pub fn run(args: BootArgs) -> Result<()> {
         None => None,
     };
 
-    let mut seen = 0usize;
     let mut frames = 0usize;
-    let mut kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut kinds = [0usize; KINDS.len()];
     let mut unsupported: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut subsystem: BTreeMap<String, usize> = BTreeMap::new();
     let stop = loop {
@@ -129,11 +130,11 @@ pub fn run(args: BootArgs) -> Result<()> {
             Ok(s) => s,
             Err(e) => break format!("error: {e}"),
         };
-        for e in &vm.events()[seen..] {
+        for e in &vm.take_events() {
             if let Some(o) = out.as_mut() {
                 writeln!(o, "{}", yuris_vm::event_json(e))?;
             }
-            *kinds.entry(kind(e)).or_default() += 1;
+            kinds[kind(e)] += 1;
             match e {
                 VmEvent::Unsupported { command, reason, .. } => {
                     let slot = unsupported.entry(cmd_name(*command)).or_insert((0, reason.clone()));
@@ -145,7 +146,6 @@ pub fn run(args: BootArgs) -> Result<()> {
                 _ => {}
             }
         }
-        seen = vm.events().len();
         if vm.executed_groups() >= args.max_groups {
             break format!("group budget {} reached", args.max_groups);
         }
@@ -174,8 +174,10 @@ pub fn run(args: BootArgs) -> Result<()> {
         frames
     );
     println!("events:");
-    for (k, n) in &kinds {
-        println!("  {k:<14} {n}");
+    for (k, n) in KINDS.iter().zip(kinds) {
+        if n > 0 {
+            println!("  {k:<14} {n}");
+        }
     }
     if !unsupported.is_empty() {
         println!("unsupported commands (count, first reason):");
@@ -195,23 +197,29 @@ pub fn run(args: BootArgs) -> Result<()> {
     Ok(())
 }
 
-fn kind(e: &VmEvent) -> &'static str {
+const KINDS: [&str; 16] = [
+    "GroupExecuted", "Jump", "Call", "Text", "Cg", "Sound", "VarQuery", "Declaration", "CgAct",
+    "CgInfo", "Load", "Save", "CgEnd", "ScriptSwitch", "Unsupported", "Subsystem",
+];
+
+/// Index into [`KINDS`].
+fn kind(e: &VmEvent) -> usize {
     match e {
-        VmEvent::GroupExecuted { .. } => "GroupExecuted",
-        VmEvent::Jump { .. } => "Jump",
-        VmEvent::Call { .. } => "Call",
-        VmEvent::Text { .. } => "Text",
-        VmEvent::Cg { .. } => "Cg",
-        VmEvent::Sound { .. } => "Sound",
-        VmEvent::VarQuery { .. } => "VarQuery",
-        VmEvent::Declaration { .. } => "Declaration",
-        VmEvent::CgAct { .. } => "CgAct",
-        VmEvent::CgInfo { .. } => "CgInfo",
-        VmEvent::Load { .. } => "Load",
-        VmEvent::Save { .. } => "Save",
-        VmEvent::CgEnd { .. } => "CgEnd",
-        VmEvent::ScriptSwitch { .. } => "ScriptSwitch",
-        VmEvent::Unsupported { .. } => "Unsupported",
-        VmEvent::Subsystem { .. } => "Subsystem",
+        VmEvent::GroupExecuted { .. } => 0,
+        VmEvent::Jump { .. } => 1,
+        VmEvent::Call { .. } => 2,
+        VmEvent::Text { .. } => 3,
+        VmEvent::Cg { .. } => 4,
+        VmEvent::Sound { .. } => 5,
+        VmEvent::VarQuery { .. } => 6,
+        VmEvent::Declaration { .. } => 7,
+        VmEvent::CgAct { .. } => 8,
+        VmEvent::CgInfo { .. } => 9,
+        VmEvent::Load { .. } => 10,
+        VmEvent::Save { .. } => 11,
+        VmEvent::CgEnd { .. } => 12,
+        VmEvent::ScriptSwitch { .. } => 13,
+        VmEvent::Unsupported { .. } => 14,
+        VmEvent::Subsystem { .. } => 15,
     }
 }

@@ -95,6 +95,8 @@ pub mod cmd {
     pub const TASK: u8 = 0x5f;
     /// TASKINFO(任务状态查询;引擎 00451838,EXIST → LET=0/1)。
     pub const TASKINFO: u8 = 0x61;
+    /// SYSTEMINFO.
+    pub const SYSTEMINFO: u8 = 0x5e;
 }
 
 /// VM 状态机。
@@ -627,7 +629,16 @@ impl Default for CgState {
 /// YU-RIS 组级 VM(单脚本)。
 pub struct GroupVm {
     /// 当前脚本上下文(组表 + 窗口起始)。
-    ctx: ScriptCtx,
+    ctx: std::sync::Arc<ScriptCtx>,
+    /// Scripts already loaded and remapped, shared between switches.
+    ctx_cache: HashMap<u16, std::sync::Arc<ScriptCtx>>,
+    /// Record control-flow events (GroupExecuted, Jump, Call, ScriptSwitch,
+    /// Declaration). On by default for tests and traces; a player turns it
+    /// off, as they are most of the cost of a run.
+    trace: bool,
+    /// Decoded expression windows by (script, offset, len); boot evaluates
+    /// the same windows millions of times.
+    decoded: yuris_core::FastHashMap<(u16, u32, u32), std::sync::Arc<[yuris_script::Instruction]>>,
     /// Game command index -> canonical index (see [`commands`]).
     cmd_map: std::sync::Arc<commands::CommandMap>,
     /// 跨脚本宿主(按脚本号取上下文);None = 单脚本模式。
@@ -652,10 +663,14 @@ pub struct GroupVm {
     input_cursor: (i64, i64),
     /// YSVR kind2(按脚本初值)条目暂存,首载时应用(成果 59h)。
     ysvr_kind2: Vec<yuris_format::ysvr::YsvrEntry>,
+    /// Global YSVR entries (kind 1), kept for VARACT INIT.
+    ysvr_globals: Vec<yuris_format::ysvr::YsvrEntry>,
     /// 已应用 kind2 的脚本号。
     ysvr_kind2_applied: std::collections::HashSet<u16>,
     /// The game's file system, for FILEINFO EXIST, CGINFO sizes and LOAD.
     file_probe: Option<std::sync::Arc<yuris_format::vfs::GameFs>>,
+    /// The script list (`ysbin\yst_list.ybn`), for SYSTEMINFO.
+    script_list: Option<std::sync::Arc<yuris_format::ystl::YstlTable>>,
     /// 命名任务注册表(TASK 创建 → TASKINFO EXIST 查询;引擎 FUN_0040ca7d
     /// 按名查找的等价面。任务的实际执行经 GOSUB 标签链顺序进入 —— 引擎
     /// trace 实证:es.IDSubTask 的入口脚本由主线 GOSUB 串行调起,boot 段
@@ -696,7 +711,10 @@ impl GroupVm {
     pub fn load(script: YstbFile) -> Result<Self> {
         let ctx = ScriptCtx::parse(0, script)?;
         Ok(Self {
-            ctx,
+            ctx: std::sync::Arc::new(ctx),
+            ctx_cache: HashMap::new(),
+            trace: true,
+            decoded: Default::default(),
             cmd_map: std::sync::Arc::new(commands::CommandMap::identity()),
             host: None,
             pc: 0,
@@ -719,8 +737,10 @@ impl GroupVm {
             declared_scripts: std::collections::HashSet::new(),
             input_cursor: (0, 0),
             ysvr_kind2: Vec::new(),
+            ysvr_globals: Vec::new(),
             ysvr_kind2_applied: std::collections::HashSet::new(),
             file_probe: None,
+            script_list: None,
             tasks: std::collections::HashSet::new(),
             cg_registry: HashMap::new(),
         })
@@ -729,7 +749,8 @@ impl GroupVm {
     /// Sets the command map and remaps the loaded script (call once, after
     /// loading and before running). Scripts loaded later are remapped too.
     pub fn set_command_map(&mut self, map: std::sync::Arc<commands::CommandMap>) {
-        map.remap(&mut self.ctx);
+        map.remap(std::sync::Arc::make_mut(&mut self.ctx));
+        self.ctx_cache.clear();
         self.cmd_map = map;
     }
 
@@ -753,6 +774,11 @@ impl GroupVm {
         self.file_probe = Some(probe);
     }
 
+    /// Sets the script list that SYSTEMINFO answers from.
+    pub fn set_script_list(&mut self, list: std::sync::Arc<yuris_format::ystl::YstlTable>) {
+        self.script_list = Some(list);
+    }
+
     /// 标记脚本的声明组已消费(boot 全量消费后调用;防止 switch_script
     /// 的按需重消费用声明期边界**覆盖 YSVR 终态** —— 引擎描述符分配仅在
     /// boot 一次,成果 59)。
@@ -768,7 +794,7 @@ impl GroupVm {
 
     /// 设置当前脚本号(跨脚本跳转判定;`yst%05d.ybn` 的 %05d)。
     pub fn set_script_id(&mut self, id: u16) {
-        self.ctx.script_id = id;
+        std::sync::Arc::make_mut(&mut self.ctx).script_id = id;
     }
 
     /// strict 模式开关(默认 true:遇 Unsupported 挂起)。
@@ -789,6 +815,17 @@ impl GroupVm {
     /// 已消费事件。
     pub fn events(&self) -> &[VmEvent] {
         &self.events
+    }
+
+    /// Turns control-flow events on or off (see the `trace` field).
+    pub fn set_trace(&mut self, on: bool) {
+        self.trace = on;
+    }
+
+    /// Takes the events recorded so far. A long run must drain them, or
+    /// they pile up (boot alone records tens of millions).
+    pub fn take_events(&mut self) -> Vec<VmEvent> {
+        std::mem::take(&mut self.events)
     }
 
     /// 变量存储(只读)。
@@ -845,6 +882,9 @@ impl GroupVm {
                 // 按脚本初值:挂起,待该脚本首次加载时应用
                 self.ysvr_kind2.push(e.clone());
                 continue;
+            }
+            if e.kind == 1 {
+                self.ysvr_globals.push(e.clone());
             }
             self.apply_ysvr_entry(e)?;
             applied += 1;
@@ -996,16 +1036,20 @@ impl GroupVm {
                 cmd::GO => match self.exec_go(&windows)? {
                     GoOutcome::Jump(target) => {
                         let from = self.pc;
-                        self.events.push(VmEvent::Jump {
-                            from,
-                            to: target,
-                            kind: JumpKind::Go,
-                        });
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: from,
-                            command: g.command_type,
-                            condition: None,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::Jump {
+                                from,
+                                to: target,
+                                kind: JumpKind::Go,
+                            });
+                        }
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: from,
+                                command: g.command_type,
+                                condition: None,
+                            });
+                        }
                         self.pc = target;
                         continue;
                     }
@@ -1018,20 +1062,26 @@ impl GroupVm {
                         let from_script = self.ctx.script_id;
                         match self.switch_script(script_id, target) {
                             Ok(()) => {
-                                self.events.push(VmEvent::GroupExecuted {
-                                    pc: from,
-                                    command: g.command_type,
-                                    condition: None,
-                                });
-                                self.events.push(VmEvent::ScriptSwitch {
-                                    from_script,
-                                    to_script: script_id,
-                                });
-                                self.events.push(VmEvent::Jump {
-                                    from,
-                                    to: target,
-                                    kind: JumpKind::Go,
-                                });
+                                if self.trace {
+                                    self.events.push(VmEvent::GroupExecuted {
+                                        pc: from,
+                                        command: g.command_type,
+                                        condition: None,
+                                    });
+                                }
+                                if self.trace {
+                                    self.events.push(VmEvent::ScriptSwitch {
+                                        from_script,
+                                        to_script: script_id,
+                                    });
+                                }
+                                if self.trace {
+                                    self.events.push(VmEvent::Jump {
+                                        from,
+                                        to: target,
+                                        kind: JumpKind::Go,
+                                    });
+                                }
                                 continue;
                             }
                             Err(e) => {
@@ -1064,22 +1114,26 @@ impl GroupVm {
                     };
                     let truthy = value_truthy(&cond)?;
                     if !truthy {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: Some(cond),
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: self.pc,
+                                command: g.command_type,
+                                condition: Some(cond),
+                            });
+                        }
                         self.pc += 1;
                         continue;
                     }
                     // 标签解析:找 M-串窗口(引擎查 hash 表);未命中 → 引擎静默不跳
                     let resolved = self.resolve_label_in(&windows)?;
                     let Some((target, target_script)) = resolved else {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: Some(cond),
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: self.pc,
+                                command: g.command_type,
+                                condition: Some(cond),
+                            });
+                        }
                         self.pc += 1;
                         continue;
                     };
@@ -1096,18 +1150,24 @@ impl GroupVm {
                         if_nest_depth: self.if_nest.len(),
                         loop_depth: self.loops.len(),
                     });
-                    self.events.push(VmEvent::Call { from, to: target });
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: Some(cond),
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::Call { from, to: target });
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: from,
+                            command: g.command_type,
+                            condition: Some(cond),
+                        });
+                    }
                     // 跨脚本 GOSUB:压帧后切换上下文到目标脚本,并记 ScriptSwitch。
                     if target_script != from_script {
-                        self.events.push(VmEvent::ScriptSwitch {
-                            from_script: from_script,
-                            to_script: target_script,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::ScriptSwitch {
+                                from_script: from_script,
+                                to_script: target_script,
+                            });
+                        }
                         self.switch_script(target_script, target)?;
                     } else {
                         self.pc = target;
@@ -1136,11 +1196,13 @@ impl GroupVm {
                     // (FUN_00451724)。VM frames.len() ↔ 引擎 depth:
                     // len≤1 = 基帧上 RETURN → 结束;len>1 → 弹帧写调用者帧。
                     if self.frames.len() <= 1 {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: None,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: self.pc,
+                                command: g.command_type,
+                                condition: None,
+                            });
+                        }
                         self.state = VmState::Finished;
                         return Ok(VmSuspend::Complete);
                     }
@@ -1169,23 +1231,29 @@ impl GroupVm {
                         let cur_script = self.ctx.script_id;
                         // 返回帧所在脚本号;切帧(跨脚本返回)。
                         let cross = frame.script_id != cur_script;
-                        self.events.push(VmEvent::Jump {
-                            from,
-                            to: frame.return_pc,
-                            kind: JumpKind::Return,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::Jump {
+                                from,
+                                to: frame.return_pc,
+                                kind: JumpKind::Return,
+                            });
+                        }
                         // 本组事件归属 = 派发点脚本(P1 引擎对拍);跨脚本时
                         // 须在切换前发 ScriptSwitch,否则事件流重建脚本号错位。
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: from,
-                            command: g.command_type,
-                            condition: None,
-                        });
-                        if cross {
-                            self.events.push(VmEvent::ScriptSwitch {
-                                from_script: cur_script,
-                                to_script: frame.script_id,
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: from,
+                                command: g.command_type,
+                                condition: None,
                             });
+                        }
+                        if cross {
+                            if self.trace {
+                                self.events.push(VmEvent::ScriptSwitch {
+                                    from_script: cur_script,
+                                    to_script: frame.script_id,
+                                });
+                            }
                             self.switch_script(frame.script_id, frame.return_pc)?;
                         }
                         // 返回值写入调用者帧(弹出后 frames.last() = 调用者)
@@ -1293,24 +1361,30 @@ impl GroupVm {
                             windows[2].len
                         };
                         let from = self.pc;
-                        self.events.push(VmEvent::Jump {
-                            from,
-                            to: to as usize,
-                            kind: JumpKind::IfFalse,
-                        });
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: from,
-                            command: g.command_type,
-                            condition: Some(cond),
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::Jump {
+                                from,
+                                to: to as usize,
+                                kind: JumpKind::IfFalse,
+                            });
+                        }
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: from,
+                                command: g.command_type,
+                                condition: Some(cond),
+                            });
+                        }
                         self.pc = to as usize;
                         continue;
                     }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: Some(cond),
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: self.pc,
+                            command: g.command_type,
+                            condition: Some(cond),
+                        });
+                    }
                     self.pc += 1;
                     continue;
                 }
@@ -1325,16 +1399,20 @@ impl GroupVm {
                         continue;
                     };
                     let from = self.pc;
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: top.end_target as usize,
-                        kind: JumpKind::Else,
-                    });
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::Jump {
+                            from,
+                            to: top.end_target as usize,
+                            kind: JumpKind::Else,
+                        });
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: from,
+                            command: g.command_type,
+                            condition: None,
+                        });
+                    }
                     self.pc = top.end_target as usize;
                     continue;
                 }
@@ -1444,11 +1522,13 @@ impl GroupVm {
                         self.state = VmState::Error;
                         return Ok(VmSuspend::Error(e.to_string()));
                     }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: Some(newv),
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: self.pc,
+                            command: g.command_type,
+                            condition: Some(newv),
+                        });
+                    }
                     self.pc += 1;
                     continue;
                 }
@@ -1505,21 +1585,25 @@ impl GroupVm {
                         if let Some(f) = self.loops.last_mut() {
                             f.counter = 0;
                         }
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: None,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: self.pc,
+                                command: g.command_type,
+                                condition: None,
+                            });
+                        }
                         self.pc = exit_target;
                         continue;
                     }
                     // 注意:limit>0 恒压帧;LOOPEND「counter+1 >= limit → 弹帧」
                     // 循环体内的 GOSUB 返回后 LOOPEND 有配对(端到端实测踩坑,勿回退)。
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: None,
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: self.pc,
+                            command: g.command_type,
+                            condition: None,
+                        });
+                    }
                     self.pc += 1;
                     continue;
                 }
@@ -1548,16 +1632,20 @@ impl GroupVm {
                     let keep = self.loops.len() - level; // 保留该层(含)
                     let exit = self.loops[keep].exit_target;
                     let from = self.pc;
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: exit,
-                        kind: JumpKind::LoopBreak,
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: from,
+                            command: g.command_type,
+                            condition: None,
+                        });
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::Jump {
+                            from,
+                            to: exit,
+                            kind: JumpKind::LoopBreak,
+                        });
+                    }
                     self.loops.truncate(keep + 1);
                     if let Some(f) = self.loops.last_mut() {
                         f.counter = 0;
@@ -1589,16 +1677,20 @@ impl GroupVm {
                     let keep = self.loops.len() - level;
                     let exit = self.loops[keep].exit_target;
                     let from = self.pc;
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: exit,
-                        kind: JumpKind::LoopContinue,
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: from,
+                            command: g.command_type,
+                            condition: None,
+                        });
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::Jump {
+                            from,
+                            to: exit,
+                            kind: JumpKind::LoopContinue,
+                        });
+                    }
                     self.loops.truncate(keep + 1);
                     self.pc = exit;
                     continue;
@@ -1619,11 +1711,13 @@ impl GroupVm {
                     if let Some(limit) = top.limit {
                         if counter > limit {
                             self.loops.pop();
-                            self.events.push(VmEvent::GroupExecuted {
-                                pc: self.pc,
-                                command: g.command_type,
-                                condition: None,
-                            });
+                            if self.trace {
+                                self.events.push(VmEvent::GroupExecuted {
+                                    pc: self.pc,
+                                    command: g.command_type,
+                                    condition: None,
+                                });
+                            }
                             self.pc += 1;
                             continue;
                         }
@@ -1634,16 +1728,20 @@ impl GroupVm {
                     let from = self.pc;
                     // 循环回跳路径同样记本组事件(引擎每派发必有一事件;
                     // P1 对拍实锤:engine 39 pc118 LOOPEND 每次迭代都有事件)
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: top.body_start,
-                        kind: JumpKind::LoopContinue,
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: from,
+                            command: g.command_type,
+                            condition: None,
+                        });
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::Jump {
+                            from,
+                            to: top.body_start,
+                            kind: JumpKind::LoopContinue,
+                        });
+                    }
                     self.pc = top.body_start;
                     continue;
                 }
@@ -1671,19 +1769,23 @@ impl GroupVm {
                     }
                     if counter.is_none() && time_ms.is_none() {
                         // 无参数 → 引擎直接返回 0(不等待)
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: self.pc,
+                                command: g.command_type,
+                                condition: None,
+                            });
+                        }
+                        self.pc += 1;
+                        continue;
+                    }
+                    if self.trace {
                         self.events.push(VmEvent::GroupExecuted {
                             pc: self.pc,
                             command: g.command_type,
                             condition: None,
                         });
-                        self.pc += 1;
-                        continue;
                     }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: None,
-                    });
                     self.pc += 1; // 先推进:等完后继续执行
                     return Ok(VmSuspend::Wait { counter, time_ms });
                 }
@@ -1881,8 +1983,10 @@ impl GroupVm {
                         continue;
                     };
                     if truthy {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc, command: g.command_type, condition: None });
+                        if self.trace {
+                            self.events.push(VmEvent::GroupExecuted {
+                                pc: self.pc, command: g.command_type, condition: None });
+                        }
                         self.pc += 1;
                         continue;
                     }
@@ -1893,10 +1997,14 @@ impl GroupVm {
                         top.end_target as usize
                     };
                     let from = self.pc;
-                    self.events.push(VmEvent::Jump {
-                        from, to, kind: JumpKind::Else });
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from, command: g.command_type, condition: None });
+                    if self.trace {
+                        self.events.push(VmEvent::Jump {
+                            from, to, kind: JumpKind::Else });
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: from, command: g.command_type, condition: None });
+                    }
                     self.pc = to;
                     continue;
                 }
@@ -1906,8 +2014,10 @@ impl GroupVm {
                     let ret = if let Some(w) = windows.first() {
                         self.eval_window_condition(Some(w)).ok().flatten()
                     } else { None };
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc, command: g.command_type, condition: ret });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: self.pc, command: g.command_type, condition: ret });
+                    }
                     self.state = VmState::Finished;
                     return Ok(VmSuspend::Complete);
                 }
@@ -1943,7 +2053,9 @@ impl GroupVm {
                                 if enabled && op_slot.is_none() {
                                     op_slot = Some((slot, v.clone()));
                                 }
-                                evaluated.push((slot, value_summary(&v)));
+                                if self.trace {
+                                    evaluated.push((slot, value_summary(&v)));
+                                }
                                 slot_vals.push((slot, v));
                             }
                         }
@@ -1982,7 +2094,9 @@ impl GroupVm {
                         self.write_var_target(target, result)?;
                     }
                     if let Some(t) = &let_target {
-                        evaluated.push((255u8, format!("→ {}", t.summary())));
+                        if self.trace {
+                            evaluated.push((255u8, format!("→ {}", t.summary())));
+                        }
                     }
                     self.events.push(VmEvent::VarQuery {
                         pc: self.pc,
@@ -2028,7 +2142,9 @@ impl GroupVm {
                                     let b3 = ((w.tag >> 24) & 0xff) as u8;
                                     ops.push((slot, b3, v.clone()));
                                 }
-                                evaluated.push((slot, value_summary(&v)));
+                                if self.trace {
+                                    evaluated.push((slot, value_summary(&v)));
+                                }
                             }
                         }
                     }
@@ -2044,6 +2160,46 @@ impl GroupVm {
                         } else {
                             let_target = Some(t);
                         }
+                    }
+                    // INIT (16) with G_INT..G_STR4 (17-28) and no SET: reset
+                    // the globals of the flagged save groups to their YSVR
+                    // initial values. The group is the YSVR category (G_INT3
+                    // = INT globals of category 3); Erewhon's yst00045 resets
+                    // group 3 when a game starts.
+                    if set_target.is_none() && ops.iter().any(|(s, _, _)| *s == 16) {
+                        let mut reset = 0usize;
+                        for (slot, _, v) in &ops {
+                            if !(17..=28).contains(slot) || !matches!(v, Value::Int(n) if *n != 0) {
+                                continue;
+                            }
+                            let ty = 1 + (*slot - 17) / 4;
+                            let ty = match ty {
+                                1 => 1, // G_INT
+                                2 => 2, // G_FLT
+                                _ => 3, // G_STR
+                            };
+                            let group = 1 + (*slot - 17) % 4;
+                            let entries: Vec<_> = self
+                                .ysvr_globals
+                                .iter()
+                                .filter(|e| e.category == group && e.ty == ty)
+                                .cloned()
+                                .collect();
+                            for e in &entries {
+                                self.apply_ysvr_entry(e)?;
+                            }
+                            reset += entries.len();
+                        }
+                        if self.trace {
+                            evaluated.push((255, format!("INIT reset {reset} globals")));
+                        }
+                        self.events.push(VmEvent::Subsystem {
+                            pc: self.pc,
+                            command: cmd::VARACT,
+                            evaluated,
+                        });
+                        self.pc += 1;
+                        continue;
                     }
                     let target = set_target.ok_or_else(|| {
                         Error::format("VARACT 无 SET 引用槽(引擎必填)")
@@ -2266,7 +2422,9 @@ impl GroupVm {
                             Error::format("VARACT CUT 有结果但无 LET(1) 引用槽(引擎必填)")
                         })?;
                         self.write_var_target(&lt, v)?;
-                        evaluated.push((255u8, format!("→ {}", lt.summary())));
+                        if self.trace {
+                            evaluated.push((255u8, format!("→ {}", lt.summary())));
+                        }
                     }
                     if !unimplemented.is_empty() {
                         let slots: Vec<String> =
@@ -2312,7 +2470,9 @@ impl GroupVm {
                                     if let Value::Str(_) = v {
                                         label = Some(v.str_as_string());
                                     }
-                                    evaluated.push((slot, value_summary(&v)));
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
                                 }
                             }
                             1 => pending_let = Some(w.clone()),
@@ -2322,7 +2482,9 @@ impl GroupVm {
                                     exist = matches!(&v, Some(Value::Int(n)) if *n != 0);
                                 }
                                 if let Some(v) = &v {
-                                    evaluated.push((slot, value_summary(v)));
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(v)));
+                                    }
                                 }
                             }
                         }
@@ -2342,7 +2504,9 @@ impl GroupVm {
                             .is_some();
                         if let Some(target) = &let_target {
                             self.write_var_target(target, Value::Int(hit as i64))?;
-                            evaluated.push((255u8, format!("EXIST({label:?})={} → {}", hit as i64, target.summary())));
+                            if self.trace {
+                                evaluated.push((255u8, format!("EXIST({label:?})={} → {}", hit as i64, target.summary())));
+                            }
                         }
                     }
                     self.events.push(VmEvent::VarQuery {
@@ -2382,13 +2546,17 @@ impl GroupVm {
                                         id = Some(v.str_as_string());
                                         id_bytes = Some(bytes.clone());
                                     }
-                                    evaluated.push((slot, value_summary(&v)));
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
                                 }
                             }
                             33 => pending_let = Some(w.clone()),
                             _ => {
                                 if let Some(v) = self.eval_window_condition(Some(w))? {
-                                    evaluated.push((slot, value_summary(&v)));
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
                                     if query.is_none() {
                                         query = Some(slot);
                                     }
@@ -2431,21 +2599,27 @@ impl GroupVm {
                             }
                             _ => format!("→ {}", target.summary()),
                         };
-                        evaluated.push((255u8, note));
+                        if self.trace {
+                            evaluated.push((255u8, note));
+                        }
                     } else if let (Some(target), Some(name_bytes)) = (&let_target, &id_bytes) {
                         // 未建模查询且 CG 存在:不写回(变量保持原值)。
                         if self.cg_registry.contains_key(name_bytes) {
-                            evaluated.push((
-                                254u8,
-                                format!("→ {} (未建模查询,不写回)", target.summary()),
-                            ));
+                            if self.trace {
+                                evaluated.push((
+                                    254u8,
+                                    format!("→ {} (未建模查询,不写回)", target.summary()),
+                                ));
+                            }
                         } else {
                             self.write_var_target(target, Value::Int(0))?;
                             let name = id.as_deref().unwrap_or("?");
-                            evaluated.push((
-                                255u8,
-                                format!("→ {} (cg {name:?} 不存在路径=0)", target.summary()),
-                            ));
+                            if self.trace {
+                                evaluated.push((
+                                    255u8,
+                                    format!("→ {} (cg {name:?} 不存在路径=0)", target.summary()),
+                                ));
+                            }
                         }
                     }
                     self.events.push(VmEvent::CgInfo {
@@ -2492,7 +2666,9 @@ impl GroupVm {
                                 }
                                 _ => {}
                             }
-                            evaluated.push((slot, value_summary(&v)));
+                            if self.trace {
+                                evaluated.push((slot, value_summary(&v)));
+                            }
                         }
                     }
                     if let Some(b) = id_bytes {
@@ -2541,7 +2717,9 @@ impl GroupVm {
                                 .window_bytes_pooled_copy(w)
                                 .ok_or_else(|| Error::format("LOAD 引用窗越过池尾"))?;
                             let lval = self.eval_window_lvalue(&bytes)?;
-                            evaluated.push((slot, format!("@{}", lval.var.display())));
+                            if self.trace {
+                                evaluated.push((slot, format!("@{}", lval.var.display())));
+                            }
                             target = Some(lval);
                             continue;
                         }
@@ -2557,7 +2735,9 @@ impl GroupVm {
                                 4 => id_flag = v.as_int_opt().unwrap_or(0),
                                 _ => {}
                             }
-                            evaluated.push((slot, value_summary(&v)));
+                            if self.trace {
+                                evaluated.push((slot, value_summary(&v)));
+                            }
                         }
                     }
                     if let (Some(fname), Some(dno_v), Some(lval)) = (file.clone(), dno, &target) {
@@ -2643,7 +2823,9 @@ impl GroupVm {
                                     if let Value::Int(n) = &v {
                                         set_flag = *n != 0;
                                     }
-                                    evaluated.push((slot, value_summary(&v)));
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
                                 }
                             }
                             _ => {
@@ -2656,7 +2838,9 @@ impl GroupVm {
                                     (3, Value::Int(n)) => set_flag = *n != 0,
                                     _ => {}
                                 }
-                                evaluated.push((slot, value_summary(&v)));
+                                if self.trace {
+                                    evaluated.push((slot, value_summary(&v)));
+                                }
                             }
                         }
                     }
@@ -2709,7 +2893,9 @@ impl GroupVm {
                                     id_bytes = Some(bytes.clone());
                                 }
                             }
-                            evaluated.push((slot, value_summary(&v)));
+                            if self.trace {
+                                evaluated.push((slot, value_summary(&v)));
+                            }
                         }
                     }
                     if let Some(bytes) = &id_bytes {
@@ -2733,11 +2919,13 @@ impl GroupVm {
                         self.pc += 1;
                         continue;
                     }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: None,
-                    });
+                    if self.trace {
+                        self.events.push(VmEvent::GroupExecuted {
+                            pc: self.pc,
+                            command: g.command_type,
+                            condition: None,
+                        });
+                    }
                     self.pc += 1;
                     continue;
                 }
@@ -2818,11 +3006,13 @@ impl GroupVm {
                             break;
                         }
                         self.store.set(&r, init);
-                        self.events.push(VmEvent::Declaration {
-                            pc: self.pc,
-                            command: other,
-                            windows: g.window_count,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::Declaration {
+                                pc: self.pc,
+                                command: other,
+                                windows: g.window_count,
+                            });
+                        }
                         self.pc += 1;
                         continue;
                     }
@@ -2833,11 +3023,23 @@ impl GroupVm {
                     // 「按名切脚本」,不可靠;实测引擎 pc 顺序推进,已按上
                     // 声明族实现。0x65 VAR(0x453158)语义未定性(Unknown)。
                     if is_declaration(other) {
-                        self.events.push(VmEvent::Declaration {
-                            pc: self.pc,
-                            command: other,
-                            windows: g.window_count,
-                        });
+                        if self.trace {
+                            self.events.push(VmEvent::Declaration {
+                                pc: self.pc,
+                                command: other,
+                                windows: g.window_count,
+                            });
+                        }
+                        self.pc += 1;
+                        continue;
+                    }
+                    if other == cmd::SYSTEMINFO {
+                        if let Some(reason) = self.exec_systeminfo(&windows)? {
+                            if self.strict {
+                                self.state = VmState::Error;
+                                return Ok(VmSuspend::Error(reason));
+                            }
+                        }
                         self.pc += 1;
                         continue;
                     }
@@ -2863,19 +3065,25 @@ impl GroupVm {
                                 1 => {
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
                                         path = Some(v.str_as_string());
-                                        evaluated.push((slot, value_summary(&v)));
+                                        if self.trace {
+                                            evaluated.push((slot, value_summary(&v)));
+                                        }
                                     }
                                 }
                                 4 => {
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
                                         exist = matches!(&v, Value::Int(n) if *n != 0);
-                                        evaluated.push((slot, value_summary(&v)));
+                                        if self.trace {
+                                            evaluated.push((slot, value_summary(&v)));
+                                        }
                                     }
                                 }
                                 7 => let_ref = Some(w.clone()),
                                 _ => {
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
-                                        evaluated.push((slot, value_summary(&v)));
+                                        if self.trace {
+                                            evaluated.push((slot, value_summary(&v)));
+                                        }
                                     }
                                 }
                             }
@@ -2893,16 +3101,22 @@ impl GroupVm {
                                     let target = extract_var_target(&bytes)?;
                                     let hit = probe.exists(p);
                                     self.write_var_target(&target, Value::Int(hit as i64))?;
-                                    evaluated.push((
-                                        255u8,
-                                        format!("EXIST({p})={} → {}", hit as i64, target.summary()),
-                                    ));
+                                    if self.trace {
+                                        evaluated.push((
+                                            255u8,
+                                            format!("EXIST({p})={} → {}", hit as i64, target.summary()),
+                                        ));
+                                    }
                                 }
                                 (Some(_), (None, _)) => {
-                                    evaluated.push((255u8, "err:EXIST 无 FILE 路径".into()));
+                                    if self.trace {
+                                        evaluated.push((255u8, "err:EXIST 无 FILE 路径".into()));
+                                    }
                                 }
                                 (Some(_), (_, None)) => {
-                                    evaluated.push((255u8, "err:无 file_probe".into()));
+                                    if self.trace {
+                                        evaluated.push((255u8, "err:无 file_probe".into()));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -2957,7 +3171,9 @@ impl GroupVm {
                                             name = Some(bytes.clone());
                                         }
                                     }
-                                    evaluated.push((slot, value_summary(&v)));
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(e) => evaluated.push((slot, format!("err:{e}"))),
@@ -2966,14 +3182,16 @@ impl GroupVm {
                         if let Some(n) = name {
                             let existed = self.tasks.contains(&n);
                             self.tasks.insert(n.clone());
-                            evaluated.push((
-                                255u8,
-                                format!(
-                                    "task {} {}",
-                                    if existed { "已存在(重配置)" } else { "注册" },
-                                    String::from_utf8_lossy(&n)
-                                ),
-                            ));
+                            if self.trace {
+                                evaluated.push((
+                                    255u8,
+                                    format!(
+                                        "task {} {}",
+                                        if existed { "已存在(重配置)" } else { "注册" },
+                                        String::from_utf8_lossy(&n)
+                                    ),
+                                ));
+                            }
                         }
                         self.events.push(VmEvent::Subsystem {
                             pc: self.pc,
@@ -3017,7 +3235,9 @@ impl GroupVm {
                                                 }
                                                 _ => other_query = true,
                                             }
-                                            evaluated.push((slot, value_summary(&v)));
+                                            if self.trace {
+                                                evaluated.push((slot, value_summary(&v)));
+                                            }
                                         }
                                         Ok(None) => {}
                                         Err(e) => evaluated.push((slot, format!("err:{e}"))),
@@ -3048,15 +3268,17 @@ impl GroupVm {
                                 .unwrap_or(false);
                             if let Some(target) = &let_target {
                                 self.write_var_target(target, Value::Int(hit as i64))?;
-                                evaluated.push((
-                                    255u8,
-                                    format!(
-                                        "EXIST({:?})={} → {}",
-                                        name.map(|n| String::from_utf8_lossy(&n).into_owned()),
-                                        hit as i64,
-                                        target.summary()
-                                    ),
-                                ));
+                                if self.trace {
+                                    evaluated.push((
+                                        255u8,
+                                        format!(
+                                            "EXIST({:?})={} → {}",
+                                            name.map(|n| String::from_utf8_lossy(&n).into_owned()),
+                                            hit as i64,
+                                            target.summary()
+                                        ),
+                                    ));
+                                }
                             }
                         }
                         self.events.push(VmEvent::Subsystem {
@@ -3151,7 +3373,11 @@ impl GroupVm {
                             // 求值失败不传播:引擎对未声明/未初始化变量读取
                             // 容忍(实测 desc 全零仍继续),事件如实记录
                             match self.eval_window_condition(Some(w)) {
-                                Ok(Some(v)) => evaluated.push((slot, value_summary(&v))),
+                                Ok(Some(v)) => {
+                                    if self.trace {
+                                        evaluated.push((slot, value_summary(&v)));
+                                    }
+                                }
                                 Ok(None) => {}
                                 Err(e) => evaluated.push((slot, format!("err:{e}"))),
                             }
@@ -3196,8 +3422,18 @@ impl GroupVm {
                 "跨脚本跳转到 script {script_id} 但未绑定 ScriptHost"
             )));
         };
-        let mut new_ctx = host.load(script_id)?;
-        self.cmd_map.remap(&mut new_ctx);
+        // Loading a script copies it and remapping walks every window, so
+        // keep each remapped script once and share it.
+        let new_ctx = match self.ctx_cache.get(&script_id) {
+            Some(ctx) => ctx.clone(),
+            None => {
+                let mut ctx = host.load(script_id)?;
+                self.cmd_map.remap(&mut ctx);
+                let ctx = std::sync::Arc::new(ctx);
+                self.ctx_cache.insert(script_id, ctx.clone());
+                ctx
+            }
+        };
         self.ctx = new_ctx;
         self.pc = target_pc;
         // 引擎加载脚本时消费其声明组(INT/FLT/STR 建立变量,Confirmed 形态)。
@@ -3337,18 +3573,27 @@ impl GroupVm {
         if w.len == 0 {
             return Ok(None);
         }
-        let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
-            // A window past the pool end is corrupt. `run` sets the error
-            // state; some callers only record the error and carry on.
-            return Err(Error::format(format!(
-                "窗口 {}+{} 越过 content+part4 池尾",
-                w.offset, w.len
-            )));
-        };
-        let instrs = match yuris_script::decode_window(&bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(Error::format(format!("条件窗口解码失败: {e}")));
+        let key = (self.ctx.script_id, w.offset, w.len);
+        let instrs = match self.decoded.get(&key) {
+            Some(i) => i.clone(),
+            None => {
+                let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
+                    // A window past the pool end is corrupt. `run` sets the
+                    // error state; some callers only record it and carry on.
+                    return Err(Error::format(format!(
+                        "窗口 {}+{} 越过 content+part4 池尾",
+                        w.offset, w.len
+                    )));
+                };
+                let instrs: std::sync::Arc<[yuris_script::Instruction]> =
+                    match yuris_script::decode_window(&bytes) {
+                        Ok(v) => v.into(),
+                        Err(e) => {
+                            return Err(Error::format(format!("条件窗口解码失败: {e}")));
+                        }
+                    };
+                self.decoded.insert(key, instrs.clone());
+                instrs
             }
         };
         let locals = self.frames.last().map(|f| &f.locals);
@@ -3491,7 +3736,7 @@ impl GroupVm {
         let int_count = ((gparam & 0xff) >> 3) as u32;
         let flt_count = ((gparam & 7) as u32) * 4 + ((gparam >> 14) as u32);
         let str_count = ((gparam >> 9) & 0x1f) as u32;
-        let dbg = std::env::var("YURIS_DEBUG_FRAME").is_ok();
+        let dbg = debug_frame();
         // 先收集实参窗:(type, slot) → 窗口
         let mut args: [std::collections::HashMap<u32, &yuris_format::ystb::CommandSlot>; 3] =
             Default::default();
@@ -3949,7 +4194,7 @@ impl GroupVm {
                 },
             }
         })();
-        if std::env::var("YURIS_DEBUG_FRAME").is_ok() && r.id == 55 {
+        if debug_frame() && r.id == 55 {
             let fr_has = self.frames.last().map(|f| f.locals.has_array(r));
             let vs = match &out {
                 Some(Value::Str(s)) => format!("str:{}B", s.len()),
@@ -4074,6 +4319,12 @@ impl VarTarget {
 /// - `56 + [prefix][id]` + 下标指令×N + `29`(ArrayLoad) → 数组元素,
 ///   基点 = 首条 var 指令,下标 = 其后指令序列(写/读时求值,支持
 ///   变量下标与表达式下标;见 [`VarTarget::Indexed`] 勘误)。
+/// Whether `YURIS_DEBUG_FRAME` is set (read once; getenv was hot).
+fn debug_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YURIS_DEBUG_FRAME").is_some())
+}
+
 fn extract_var_target(bytes: &[u8]) -> Result<VarTarget> {
     let instrs = yuris_script::decode_window(bytes)?;
     // 单条 var 类指令 → 标量
@@ -4175,6 +4426,90 @@ impl GroupVm {
         }
     }
 
+    /// SYSTEMINFO: script list queries. Slots (YSCM order): 0 SCRIPTFILE,
+    /// 1 SCRIPTNUM, 2 TEXTNUM, 3 EMOTE, 4 NO, 5 LET. A query slot holds 1
+    /// when asked; NO picks the script (the running one by default).
+    ///
+    /// - SCRIPTNUM: number of entries in `yst_list.ybn`.
+    /// - SCRIPTFILE: that entry's source path as stored
+    ///   (`data\script\...`); Erewhon's yst00042 strips the first two
+    ///   folders itself.
+    /// - TEXTNUM: that entry's text count, which sizes the read-tracking
+    ///   tables (yst00042 loops over it in blocks of 63).
+    ///
+    /// EMOTE is not known yet. A query that cannot be answered records an
+    /// Unsupported event and returns its reason; nothing is written.
+    fn exec_systeminfo(
+        &mut self,
+        windows: &[yuris_format::ystb::CommandSlot],
+    ) -> Result<Option<String>> {
+        let mut asked: Option<u8> = None;
+        let mut no: Option<i64> = None;
+        let mut let_ref = None;
+        let mut evaluated: Vec<(u8, String)> = Vec::new();
+        for w in windows {
+            if w.len == 0 {
+                continue;
+            }
+            let slot = (w.tag & 0xff) as u8;
+            if slot == 5 {
+                let_ref = Some(w.clone());
+                continue;
+            }
+            let Some(v) = self.eval_window_condition(Some(w))? else { continue };
+            if self.trace {
+                evaluated.push((slot, value_summary(&v)));
+            }
+            match (slot, &v) {
+                (0..=3, Value::Int(n)) if *n != 0 => asked = Some(slot),
+                (4, Value::Int(n)) => no = Some(*n),
+                _ => {}
+            }
+        }
+        let id = no.unwrap_or(i64::from(self.ctx.script_id));
+        let list = self.script_list.clone();
+        let entry = list
+            .as_deref()
+            .and_then(|l| u32::try_from(id).ok().and_then(|id| l.get(id)));
+        let answer = match (asked, &list, entry) {
+            (Some(1), Some(l), _) => Some(Value::Int(l.entries.len() as i64)),
+            (Some(0), _, Some(e)) => Some(Value::Str(e.source.clone())),
+            (Some(2), _, Some(e)) => Some(Value::Int(i64::from(e.texts.max(0)))),
+            _ => None,
+        };
+        let (Some(value), Some(w)) = (answer, let_ref) else {
+            let what = match asked {
+                Some(3) => "SYSTEMINFO EMOTE is not implemented".to_string(),
+                Some(_) if list.is_none() => "SYSTEMINFO needs ysbin\\yst_list.ybn".to_string(),
+                Some(_) => format!("SYSTEMINFO: no script {id} in yst_list.ybn"),
+                None => "SYSTEMINFO without a query".to_string(),
+            };
+            let reason = format!("{what} s{} pc={}", self.ctx.script_id, self.pc);
+            self.events.push(VmEvent::Unsupported {
+                pc: self.pc,
+                command: cmd::SYSTEMINFO,
+                reason: reason.clone(),
+            });
+            return Ok(Some(reason));
+        };
+        let bytes = self
+            .ctx
+            .script
+            .window_bytes_pooled_copy(&w)
+            .ok_or_else(|| Error::format("SYSTEMINFO LET window past the pool end"))?;
+        let target = extract_var_target(&bytes)?;
+        if self.trace {
+            evaluated.push((255, format!("{} -> {}", value_summary(&value), target.summary())));
+        }
+        self.write_var_target(&target, value)?;
+        self.events.push(VmEvent::Subsystem {
+            pc: self.pc,
+            command: cmd::SYSTEMINFO,
+            evaluated,
+        });
+        Ok(None)
+    }
+
     fn write_var_target(&mut self, t: &VarTarget, v: Value) -> Result<()> {
         match t {
             VarTarget::Scalar(r) => self.write_var_value(r, &[], v),
@@ -4246,7 +4581,9 @@ impl GroupVm {
                 match v {
                     Value::Str(bytes) => {
                         let n = sjis_char_len(&bytes);
-                        evaluated.push((13u8, format!("LENGTH(fallback)={n}")));
+                        if self.trace {
+                            evaluated.push((13u8, format!("LENGTH(fallback)={n}")));
+                        }
                         Ok(Some(Value::Int(n as i64)))
                     }
                     _ => Err(Error::format(
@@ -4261,7 +4598,9 @@ impl GroupVm {
                     Value::Float(_) => 2,
                     Value::Str(_) => 3,
                 };
-                evaluated.push((2u8, format!("TYPE={code}")));
+                if self.trace {
+                    evaluated.push((2u8, format!("TYPE={code}")));
+                }
                 Ok(Some(Value::Int(code)))
             }
             Some(3) => {
@@ -4283,7 +4622,9 @@ impl GroupVm {
                         self.store.array_dims(r).map(|d| d.len() as i64).unwrap_or(0)
                     }
                 };
-                evaluated.push((4u8, format!("DIMNUM={n}")));
+                if self.trace {
+                    evaluated.push((4u8, format!("DIMNUM={n}")));
+                }
                 Ok(Some(Value::Int(n)))
             }
             Some(slot @ 5..=12) => {
@@ -4302,7 +4643,9 @@ impl GroupVm {
                         dims.get(dim).copied().map(i64::from).unwrap_or(0)
                     }
                 };
-                evaluated.push((slot, format!("DIMSIZE[{}]={n}", dim + 1)));
+                if self.trace {
+                    evaluated.push((slot, format!("DIMSIZE[{}]={n}", dim + 1)));
+                }
                 Ok(Some(Value::Int(n)))
             }
             Some(13) => {
@@ -4314,7 +4657,9 @@ impl GroupVm {
                 match v {
                     Value::Str(bytes) => {
                         let n = sjis_char_len(&bytes);
-                        evaluated.push((13u8, format!("LENGTH={n}")));
+                        if self.trace {
+                            evaluated.push((13u8, format!("LENGTH={n}")));
+                        }
                         Ok(Some(Value::Int(n as i64)))
                     }
                     _ => Err(Error::format(
@@ -4372,7 +4717,9 @@ impl GroupVm {
                         }
                     }
                 }
-                evaluated.push((14u8, format!("SEARCH={found}(n={count})")));
+                if self.trace {
+                    evaluated.push((14u8, format!("SEARCH={found}(n={count})")));
+                }
                 Ok(Some(Value::Int(found)))
             }
             Some(slot) => Err(Error::format(format!(

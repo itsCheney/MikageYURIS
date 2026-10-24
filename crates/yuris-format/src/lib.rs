@@ -13,6 +13,7 @@
 //! | [`ysvr`] | YSVR 变量定义表（`ysv.ybn`） | Confirmed |
 //! | [`yssd`] | YSSD 系统数据（`save/*.sd`）+ SNP 解码 | Confirmed |
 //! | [`yslb`] | YSLB 标签表（`ysl.ybn`，GO/GOSUB 目标） | Confirmed |
+//! | [`ystl`] | YSTL script list (`yst_list.ybn`: source files, per-script counts) | Erewhon |
 //!
 //! 规格文档：`docs/formats/ypf.md`、`docs/formats/ystb.md`、`docs/formats/yscm.md`、
 //! `docs/engine/command-layer.md`。
@@ -27,6 +28,7 @@ pub mod yscf;
 pub mod yscm;
 pub mod yslb;
 pub mod ystb;
+pub mod ystl;
 pub mod ysvr;
 pub mod yssd;
 

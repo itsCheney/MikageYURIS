@@ -17,7 +17,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
 
 use yuris_core::{Error, Result};
 
@@ -462,15 +461,15 @@ pub fn compound_assign(code: u8, lhs: &Value, rhs: &Value) -> Result<Value> {
 
 #[derive(Debug, Clone)]
 pub struct VariableStore {
-    vars: HashMap<(u8, u16), Value>,
-    arrays: HashMap<(u8, u16), ArrayStorage>,
+    vars: yuris_core::FastHashMap<(u8, u16), Value>,
+    arrays: yuris_core::FastHashMap<(u8, u16), ArrayStorage>,
 }
 
 impl Default for VariableStore {
     fn default() -> Self {
         Self {
-            vars: HashMap::new(),
-            arrays: HashMap::new(),
+            vars: Default::default(),
+            arrays: Default::default(),
         }
     }
 }

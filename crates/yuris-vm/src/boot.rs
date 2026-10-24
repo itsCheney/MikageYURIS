@@ -116,6 +116,9 @@ impl Bootstrap {
         // The host serves cross-script calls from here on.
         vm.set_host(Box::new(host));
         vm.set_file_probe(self.fs.clone());
+        if let Ok(b) = self.fs.read("ysbin\\yst_list.ybn") {
+            vm.set_script_list(Arc::new(yuris_format::ystl::YstlTable::from_bytes(&b)?));
+        }
 
         // YSVR initial values, after the declarations. Kinds 1 and 3 apply
         // here; kind 2 applies when its script first loads.

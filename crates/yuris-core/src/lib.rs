@@ -17,7 +17,7 @@ pub mod version;
 
 pub use bytes::{xor_cyclic_skip, Reader};
 pub use error::{Error, Result};
-pub use hash::murmur2;
+pub use hash::{murmur2, FastBuildHasher, FastHashMap, FastHasher};
 pub use version::{CharEncoding, VersionProfile};
 
 /// crate 版本（与 workspace 同步）
