@@ -16,10 +16,6 @@ yuris-format = { workspace = true }
 yuris-value = { workspace = true }
 yuris-script = { workspace = true }
 yuris-vm = { workspace = true }
-yuris-runtime = { workspace = true }
-yuris-render = { workspace = true }
-yuris-audio = { workspace = true }
-yuris-input = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

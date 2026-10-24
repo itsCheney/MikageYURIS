@@ -19,7 +19,7 @@ fn sample_path() -> Option<std::path::PathBuf> {
 fn open_sample() -> Option<YpfArchive> {
     let p = sample_path()?;
     let data = std::fs::read(&p).unwrap();
-    Some(YpfArchive::from_bytes(data, 0xC9).unwrap())
+    Some(YpfArchive::from_bytes(data, None).unwrap())
 }
 
 /// 顺序型脚本:402 个窗口(含 tag0)全部解码,**零 Unknown**
@@ -30,7 +30,7 @@ fn yst00000_decodes_with_zero_unknown() {
         eprintln!("sample not found, skip");
         return;
     };
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
 
     let mut total = 0usize;
@@ -99,7 +99,7 @@ fn yst00000_first_window_semantics() {
         eprintln!("sample not found, skip");
         return;
     };
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
     let s0 = &f.slots()[0];
     let instrs = decode_window(f.slot_content(s0).unwrap()).unwrap();
@@ -126,7 +126,7 @@ fn yst00034_pool_file_decodes() {
         eprintln!("sample not found, skip");
         return;
     };
-    let blob = ypf.read("$ysbin\\yst00034.ybn").unwrap();
+    let blob = ypf.read("ysbin\\yst00034.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
 
     let mut decoded = 0usize;
@@ -159,7 +159,7 @@ fn yst00000_m_strings_are_quoted() {
         eprintln!("sample not found, skip");
         return;
     };
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
     let mut quoted = 0usize;
     let mut total_m = 0usize;
@@ -190,7 +190,7 @@ fn yst00000_evaluator_smoke() {
         eprintln!("sample not found, skip");
         return;
     };
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
 
     let mut store = VariableStore::new();

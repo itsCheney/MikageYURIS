@@ -1,11 +1,10 @@
 //! 字节工具：定长整数读取与 XOR 解密。
 //!
-//! 两个 XOR 都是**样本实测**得到的（见 `docs/formats/ypf.md` / `docs/formats/ystb.md`）：
+//! YSTB 的 XOR 是**样本实测**得到的（见 `docs/formats/ystb.md`）：
 //!
 //! | 函数 | 用途 | 语义 |
 //! |---|---|---|
 //! | [`xor_cyclic_skip`] | YSTB 加密 | 4 字节循环 XOR，跳过前 `skip` 字节，偏移取**绝对值**取模 |
-//! | [`decode_xor_cstring`] | YPF 文件名 | 单字节 XOR，**0x00 不参与**（终止符天然保持为 0） |
 
 use crate::error::{Error, Result};
 
@@ -22,23 +21,6 @@ pub fn xor_cyclic_skip(data: &mut [u8], key: &[u8; 4], skip: usize) {
     for (i, b) in data.iter_mut().enumerate().skip(skip) {
         *b ^= key[i & 3];
     }
-}
-
-/// 解码 YPF 索引中的文件名：单字节 XOR，遇到 0x00 终止（0x00 不参与 XOR）。
-///
-/// ```text
-/// raw:  ED B0 BA AB A0 A7 95 B0 BA BD F9 F9 F9 FA FD E7 B0 AB A7 00
-/// out:  "$ysbin\yst00034.ybn"        (key = 0xC9)
-/// ```
-pub fn decode_xor_cstring(raw: &[u8], key: u8) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
-    for &b in raw {
-        if b == 0 {
-            break;
-        }
-        out.push(b ^ key);
-    }
-    out
 }
 
 /// 顺序读取器：带位置跟踪与越界检查。
@@ -148,21 +130,6 @@ mod tests {
         assert_ne!(&d[..], &orig[..]);
         xor_cyclic_skip(&mut d, &key, 0x20);
         assert_eq!(d, orig, "XOR 必须是自反的");
-    }
-
-    #[test]
-    fn decode_name_stops_at_zero_and_keeps_zero_untouched() {
-        // 真实编码方式：明文逐字节 XOR key，随后追加一个**未加密**的 0x00 终止符
-        let plain = b"$ysbin\\yst00034.ybn";
-        let mut raw: Vec<u8> = plain.iter().map(|&b| b ^ 0xC9).collect();
-        raw.push(0x00); // 终止符不参与 XOR
-        raw.extend_from_slice(b"trailing garbage");
-
-        let out = decode_xor_cstring(&raw, 0xC9);
-        assert_eq!(out, plain.to_vec());
-
-        // 终止符本身绝不会被解码进结果（否则会多出一个 0x00）
-        assert!(!out.contains(&0u8));
     }
 
     #[test]

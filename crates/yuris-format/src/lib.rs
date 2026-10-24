@@ -4,7 +4,8 @@
 //!
 //! | 模块 | 内容 | 证据等级 |
 //! |---|---|---|
-//! | [`ypf`] | YPF 封包（header + 索引 + zlib 数据） | Confirmed |
+//! | [`ypf`] | YPF 封包（header + 索引 + zlib 数据；公开格式，偏移宽度与名字 key 自动推断） | Confirmed |
+//! | [`vfs`] | 游戏文件系统（松散文件 + 封包 + 存档目录） | 约定 |
 //! | [`ystb`] | YSTB 脚本容器（header + 4 分区 + XOR + 命令组/窗口表） | Confirmed |
 //! | [`yscm`] | YSCM **命令字典**（121 命令 / 1113 参数 + tail） | Confirmed |
 //! | [`yscf`] | YSCF 工程配置（`yscfg.ybn`） | 部分确认 |
@@ -18,6 +19,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod vfs;
 pub mod ypf;
 pub mod yscf;
 pub mod yscm;

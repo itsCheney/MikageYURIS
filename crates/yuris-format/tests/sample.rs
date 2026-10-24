@@ -33,21 +33,21 @@ fn ypf_parses_309_entries_and_closes_exactly() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let profile = VersionProfile::sample_v555();
-    let ypf = YpfArchive::from_bytes(data, profile.ypf_name_xor_key).unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
 
     assert_eq!(ypf.header().version, 500);
     assert_eq!(ypf.header().file_count, 309);
     assert_eq!(ypf.entries().len(), 309);
-    assert_eq!(ypf.header().first_data_off, 0x3655);
-    // 闭合：末条 tail 被 first_data_off 钳制，因此解析后位置精确等于 first_data_off
-    assert_eq!(ypf.index_prefix(), 0x0033_AE52);
+    assert_eq!(ypf.header().header_size, 0x3655);
+    // 0x20 处的 u32 = 首条 name_hash = murmur2("ysbin\yst00034.ybn")
+    assert_eq!(ypf.entries()[0].name_hash, 0x0033_AE52);
+    assert_eq!(ypf.index().name_key, 0xC9);
 
     // 抽查已知条目（来自 PROGRESS.md 实测）
-    let e = ypf.entry("9ysbin\\yscfg.ybn").expect("yscfg entry");
-    assert_eq!(e.flags, 1);
+    let e = ypf.entry("ysbin\\yscfg.ybn").expect("yscfg entry");
+    assert_eq!(e.compression, 1);
     assert_eq!(e.uncompressed_len, 106);
-    assert_eq!(e.compressed_len, 74);
+    assert_eq!(e.stored_len, 74);
     assert_eq!(e.offset, 0x0046_6B);
 }
 
@@ -58,15 +58,15 @@ fn ypf_engine_entries_have_expected_magics() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
 
     // 样本实测：5 个引擎数据条目，解压后 magic 各不相同（PROGRESS.md 成果 1）
     let expect: &[(&str, &[u8; 4])] = &[
-        ("%ysbin\\ysc.ybn", b"YSCM"), // ★ Opcode/参数名表
-        ("9ysbin\\yscfg.ybn", b"YSCF"),
-        ("%ysbin\\yse.ybn", b"YSER"),
-        ("%ysbin\\ysl.ybn", b"YSLB"),
-        ("%ysbin\\ysv.ybn", b"YSVR"),
+        ("ysbin\\ysc.ybn", b"YSCM"), // ★ Opcode/参数名表
+        ("ysbin\\yscfg.ybn", b"YSCF"),
+        ("ysbin\\yse.ybn", b"YSER"),
+        ("ysbin\\ysl.ybn", b"YSLB"),
+        ("ysbin\\ysv.ybn", b"YSVR"),
     ];
     for (name, magic) in expect {
         let blob = ypf.read(name).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -74,14 +74,13 @@ fn ypf_engine_entries_have_expected_magics() {
     }
 
     // 已知 stored 条目：%ysbin\yst.ybn（flags=0，16 字节）
-    // 注意前缀：$ / % / 9 是三种不同的虚拟根标记（语义 Unknown）
     let e = ypf
         .entries()
         .iter()
-        .find(|e| e.name.ends_with("\\yst.ybn"))
+        .find(|e| e.name.ends_with(b"\\yst.ybn"))
         .expect("yst.ybn entry");
-    assert_eq!(e.flags, 0);
-    assert_eq!(e.compressed_len, e.uncompressed_len);
+    assert_eq!(e.compression, 0);
+    assert_eq!(e.stored_len, e.uncompressed_len);
 }
 
 #[test]
@@ -91,9 +90,9 @@ fn ystb_key_is_recoverable_and_slots_are_contiguous() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
 
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let (key, score) = guess_key(&blob).unwrap();
     assert_eq!(key, [0x2B, 0x90, 0x4F, 0x93], "guess_key 应还原出实测密钥");
     assert!((score - 1.0).abs() < 1e-6, "正确密钥的连续性应为 1.0，得到 {score}");
@@ -132,8 +131,8 @@ fn ystb_wrong_key_is_detected_by_contiguity() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
 
     // 错误密钥的连续性必须显著低于 1.0
     let wrong = [0x39u8, 0x92, 0x4F, 0x93];
@@ -152,8 +151,8 @@ fn yscf_reports_screen_and_caption() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("9ysbin\\yscfg.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yscfg.ybn").unwrap();
     let f = YscfFile::from_bytes(&blob).unwrap();
 
     assert_eq!(f.version, 555);
@@ -177,8 +176,8 @@ fn yscm_parses_121_commands_and_1113_params() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("%ysbin\\ysc.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\ysc.ybn").unwrap();
     let t = YscmTable::from_bytes(&blob).unwrap();
 
     // header + 总量（逐项，非总量近似）
@@ -230,8 +229,8 @@ fn ystb_sequential_file_all_windows_segment() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
 
     assert_eq!(f.slots().len(), 402);
@@ -261,8 +260,8 @@ fn ystb_pool_file_key_and_windows() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00034.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst00034.ybn").unwrap();
 
     // 池式文件：连续性 < 1.0（窗口重叠），但 guess_key 靠窗口闭合率仍应命中统一密钥
     let (key, score) = guess_key(&blob).unwrap();
@@ -309,8 +308,8 @@ fn ystb_empty_script_has_no_slots() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00080.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst00080.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
     assert_eq!(f.slots().len(), 0);
     assert_eq!(f.header().command_len, 0);
@@ -330,7 +329,7 @@ fn ystb_group_model_holds_on_entire_corpus() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
 
     let mut files = 0usize;
     let mut pooled_overflow = 0usize;
@@ -338,12 +337,12 @@ fn ystb_group_model_holds_on_entire_corpus() {
     let mut if_groups = 0usize;
     let mut let_groups = 0usize;
     for e in ypf.entries() {
-        if !e.name.starts_with("$ysbin\\yst0") {
+        if !e.name.starts_with(b"ysbin\\yst0") {
             continue;
         }
-        let blob = ypf.read(&e.name).unwrap();
+        let blob = ypf.read_entry(e).unwrap();
         let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
-        let groups = f.groups().unwrap_or_else(|err| panic!("{}: {err}", e.name));
+        let groups = f.groups().unwrap_or_else(|err| panic!("{}: {err}", e.name_lossy()));
         files += 1;
 
         let first = f.group_first_slots(&groups);
@@ -359,7 +358,7 @@ fn ystb_group_model_holds_on_entire_corpus() {
                     assert!(
                         f.window_bytes_pooled_copy(w).is_some(),
                         "{}: 窗口越过 content+part4 池尾",
-                        e.name
+                        e.name_lossy()
                     );
                 }
             }
@@ -396,8 +395,8 @@ fn yst00000_group_types_match_expected_histogram() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
     let groups = f.groups().unwrap();
     assert_eq!(groups.len(), 202);
@@ -429,8 +428,8 @@ fn yst_list_is_not_a_v555_ystb() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst_list.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst_list.ybn").unwrap();
     // YSTL magic，from_bytes 直接拒绝
     assert!(YstbFile::from_bytes(&blob, [0; 4]).is_err());
 }
@@ -443,8 +442,8 @@ fn yscm_tail_parses_as_37_crt_messages_plus_256b_table() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("%ysbin\\ysc.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\ysc.ybn").unwrap();
     let yscm = YscmTable::from_bytes(&blob).unwrap();
     assert_eq!(yscm.tail.len(), 1045);
 
@@ -472,8 +471,8 @@ fn ysvr_parses_3362_entries_with_exact_closure() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("%ysbin\\ysv.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\ysv.ybn").unwrap();
     assert_eq!(&blob[..4], b"YSVR");
 
     let t = ysvr::YsvrTable::from_bytes(&blob).unwrap();
@@ -513,8 +512,8 @@ fn yslb_parses_4153_labels_with_exact_closure() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("%ysbin\\ysl.ybn").unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\ysl.ybn").unwrap();
     assert_eq!(&blob[..4], b"YSLB");
 
     let t = yslb::YslbTable::from_bytes(&blob).unwrap();
@@ -545,9 +544,9 @@ fn go_and_gosub_labels_resolve_in_yslb_across_corpus() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = YpfArchive::from_bytes(data, 0xC9).unwrap();
+    let ypf = YpfArchive::from_bytes(data, None).unwrap();
 
-    let ysl = yslb::YslbTable::from_bytes(&ypf.read("%ysbin\\ysl.ybn").unwrap()).unwrap();
+    let ysl = yslb::YslbTable::from_bytes(&ypf.read("ysbin\\ysl.ybn").unwrap()).unwrap();
 
     /// 解码单条 M-串窗口（4d len "name"），返回去掉引号的名字。
     fn mstring(window: &[u8]) -> Option<&[u8]> {
@@ -566,10 +565,10 @@ fn go_and_gosub_labels_resolve_in_yslb_across_corpus() {
     let mut gosub_checked = 0usize;
     let mut gosub_hits = 0usize;
     for e in ypf.entries() {
-        if !e.name.starts_with("$ysbin\\yst0") {
+        if !e.name.starts_with(b"ysbin\\yst0") {
             continue;
         }
-        let blob = ypf.read(&e.name).unwrap();
+        let blob = ypf.read_entry(e).unwrap();
         let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
         let groups = f.groups().unwrap();
         let first = f.group_first_slots(&groups);

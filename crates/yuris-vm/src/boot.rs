@@ -4,29 +4,29 @@
 //! `YSCM 命令表 → 变量描述符分配 → 载 YSVR → 应用初始值 → 哈希查入口标签
 //! → 建任务 → 加载脚本 → 运行`。
 //!
-//! 本模块把现有件串联:[`yuris_format::ypf::YpfArchive`](格式化解析) +
-//! [`YslbTable`](标签表查找入口) + [`YpfScriptHost`](加载目标脚本) +
+//! 本模块把现有件串联:[`GameFs`](游戏文件系统) +
+//! [`YslbTable`](标签表查找入口) + [`FsScriptHost`](加载目标脚本) +
 //! [`GroupVm`](执行)。入口标签由调用方给定(缺省从 YSLB 找 `SYSTEM_START`)。
 //!
 //! **铁律**:Unknown 不猜;各步若缺证据则返回 `Error::Unimplemented`。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use yuris_core::{Error, Result};
+use yuris_format::vfs::GameFs;
 use yuris_format::yslb::YslbTable;
 
 use crate::GroupVm;
 use yuris_value::Value;
-use crate::host::{ScriptHost, YpfScriptHost};
+use crate::host::{guess_script_key, ScriptHost, FsScriptHost};
 
 /// 启动配置。
 pub struct Bootstrap {
-    /// 脚本封包字节(bn.ypf)。
-    pub ypf_bytes: Vec<u8>,
-    /// 封包文件名 XOR key(样本 0xC9)。
-    pub name_key: u8,
-    /// 脚本条目 XOR 密钥(如 `2b904f93`)。
-    pub key: [u8; 4],
+    /// 游戏文件系统。
+    pub fs: Arc<GameFs>,
+    /// 脚本 XOR 密钥;None = 从脚本推断([`guess_script_key`])。
+    pub key: Option<[u8; 4]>,
     /// 执行入口标签名(缺省从 YSLB 查 `SYSTEM_START`)。
     pub entry_label: Option<Vec<u8>>,
 }
@@ -41,16 +41,23 @@ pub struct Booted {
     pub entry_pc: u32,
     /// 已应用的 YSVR 条目数(若提供了 YSLB/YSVR,否则 0 —— 见 [`Bootstrap::boot`])。
     pub applied_ysvr: usize,
+    /// 实际使用的脚本密钥。
+    pub key: [u8; 4],
 }
 
 impl Bootstrap {
     /// 编排启动链,返回就绪的 [`GroupVm`]。
     ///
-    /// - 从 `ypf` 读 YSLB+脚本;若提供了标签表/初值表则一并接入。
+    /// - 从文件系统读 YSLB+脚本;若提供了标签表/初值表则一并接入。
     /// - 缺省入口标签 = `SYSTEM_START`。
+    /// - 文件系统同时作为 VM 的文件探针(FILEINFO / CGINFO / LOAD)。
     pub fn boot(self) -> Result<Booted> {
-        let mut host = YpfScriptHost::from_ypf_bytes(self.ypf_bytes.clone(), self.name_key, self.key)?;
-        let yslb_data = host.read_entry("%ysbin\\ysl.ybn")?;
+        let key = match self.key {
+            Some(k) => k,
+            None => guess_script_key(&self.fs)?,
+        };
+        let mut host = FsScriptHost::new(self.fs.clone(), key);
+        let yslb_data = host.read_entry("ysbin\\ysl.ybn")?;
         let yslb = YslbTable::from_bytes(&yslb_data)?;
 
         // 入口标签名
@@ -62,7 +69,7 @@ impl Bootstrap {
         let (entry_pc, script_id) = (label.target_pc, label.script_id);
 
         // 预读 YSVR(在 host move 进 Box 前完成所有借用)
-        let ysvr_data = host.read_entry("%ysbin\\ysv.ybn")?;
+        let ysvr_data = host.read_entry("ysbin\\ysv.ybn")?;
         let ysvr = yuris_format::ysvr::YsvrTable::from_bytes(&ysvr_data)?;
 
         let ctx = host.load(script_id)?;
@@ -96,6 +103,7 @@ impl Bootstrap {
 
         // 绑定 host(此后跨脚本可用)
         vm.set_host(Box::new(host));
+        vm.set_file_probe(self.fs.clone());
 
         // 应用 YSVR 全局初值(启动链「应用初值」步;须在声明之后,否则覆盖初值)。
         // kind1+kind3 在此应用;kind2 暂存,由入口脚本/switch_script 首载应用。
@@ -113,6 +121,7 @@ impl Bootstrap {
             script_id,
             entry_pc,
             applied_ysvr,
+            key,
         })
     }
 }

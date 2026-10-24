@@ -161,7 +161,7 @@ fn load_yssd_int_array() {
     let target = var(VarSpace::At, 9001);
     let mut vm = load_script(&target);
     vm.store_mut().declare_array(&target, ElemType::Int, &[3]);
-    let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
+    let idx = yuris_format::vfs::GameFs::open(dir.path()).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     let s = vm.run(100).unwrap();
     assert!(matches!(s, VmSuspend::Complete), "无挂起: {s:?}");
@@ -185,7 +185,7 @@ fn load_yssd_str_array() {
     let target = var(VarSpace::Dollar, 9002);
     let mut vm = load_script(&target);
     vm.store_mut().declare_array(&target, ElemType::Str, &[2]);
-    let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
+    let idx = yuris_format::vfs::GameFs::open(dir.path()).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     vm.run(100).unwrap();
     assert_eq!(
@@ -205,7 +205,7 @@ fn load_yssd_scalar() {
     let target = var(VarSpace::At, 9003);
     let mut vm = load_script(&target);
     vm.store_mut().set(&target, Value::Int(0));
-    let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
+    let idx = yuris_format::vfs::GameFs::open(dir.path()).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     vm.run(100).unwrap();
     assert_eq!(vm.store().get(&target).unwrap(), &Value::Int(42));
@@ -219,7 +219,7 @@ fn load_yssd_strict_dim_mismatch_errors() {
     let mut vm = load_script(&target);
     // 声明 4 元素,载荷是 3 → strict 不符
     vm.store_mut().declare_array(&target, ElemType::Int, &[4]);
-    let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
+    let idx = yuris_format::vfs::GameFs::open(dir.path()).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     let err = vm.run(100).unwrap_err();
     assert!(err.to_string().contains("0x1a63a"), "{err}");
@@ -232,7 +232,7 @@ fn load_yssd_type_mismatch_errors() {
     let target = var(VarSpace::Dollar, 9004);
     let mut vm = load_script(&target);
     vm.store_mut().declare_array(&target, ElemType::Str, &[3]);
-    let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
+    let idx = yuris_format::vfs::GameFs::open(dir.path()).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     let err = vm.run(100).unwrap_err();
     assert!(err.to_string().contains("0x18ee8"), "{err}");
@@ -246,7 +246,7 @@ fn load_yssd_missing_file_errors() {
     let target = var(VarSpace::At, 9001);
     let mut vm = load_script(&target);
     vm.store_mut().declare_array(&target, ElemType::Int, &[3]);
-    let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
+    let idx = yuris_format::vfs::GameFs::open(dir.path()).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     let err = vm.run(100).unwrap_err();
     assert!(err.to_string().contains("0x18ed4"), "{err}");

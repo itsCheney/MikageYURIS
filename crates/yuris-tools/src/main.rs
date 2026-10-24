@@ -15,9 +15,10 @@
 
 use std::path::PathBuf;
 
+mod boot;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use yuris_core::VersionProfile;
 use yuris_format::{ypf::YpfArchive, yscf::YscfFile, ystb::{guess_key, YstbFile}};
 
 #[derive(Parser)]
@@ -29,6 +30,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// 打开游戏目录,无画面跑启动链,报告版本/密钥与未实现的命令。
+    Boot {
+        /// 游戏目录(或其 pac 目录)。
+        dir: PathBuf,
+        /// 4 字节脚本密钥(hex);缺省从脚本推断。
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// 入口标签(缺省 SYSTEM_START)。
+        #[arg(long)]
+        entry: Option<String>,
+        /// 执行组数上限(主循环每帧让出,无后端时据此停止)。
+        #[arg(long, default_value_t = 200_000)]
+        max_groups: usize,
+        /// 把 VM 事件流写成 JSONL。
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+        /// 遇到未实现的命令即停(缺省记录后继续)。
+        #[arg(long)]
+        strict: bool,
+    },
     /// YPF 封包操作。
     Ypf {
         #[command(subcommand)]
@@ -78,7 +99,7 @@ enum YpfCmd {
         /// 只显示前 N 条。
         #[arg(long)]
         limit: Option<usize>,
-        /// 文件名 XOR key（默认 0xC9，仅本样本验证）。
+        /// 文件名 XOR key（缺省从封包推断）。
         #[arg(long)]
         key: Option<u8>,
     },
@@ -159,13 +180,13 @@ fn resolve_name(ypf: &YpfArchive, name: &Option<String>, index: &Option<usize>) 
         return ypf
             .entries()
             .get(*i)
-            .map(|e| e.name.clone())
+            .map(|e| e.name_lossy())
             .with_context(|| format!("index {i} out of range"));
     }
     bail!("need --name or --index");
 }
 
-fn open_ypf(path: &PathBuf, name_key: u8) -> Result<YpfArchive> {
+fn open_ypf(path: &PathBuf, name_key: Option<u8>) -> Result<YpfArchive> {
     let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     YpfArchive::from_bytes(data, name_key).map_err(Into::into)
 }
@@ -200,37 +221,50 @@ mod hex {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let profile = VersionProfile::sample_v555();
 
     match cli.cmd {
+        Cmd::Boot { dir, key_hex, entry, max_groups, jsonl, strict } => {
+            boot::run(boot::BootArgs {
+                dir,
+                key: key_hex.as_deref().map(parse_key).transpose()?,
+                entry,
+                max_groups,
+                jsonl,
+                strict,
+            })?;
+        }
         Cmd::Ypf { sub } => match sub {
             YpfCmd::List { path, limit, key } => {
-                let ypf = open_ypf(&path, key.unwrap_or(profile.ypf_name_xor_key))?;
+                let ypf = open_ypf(&path, key)?;
                 let h = ypf.header();
+                let idx = ypf.index();
                 println!(
-                    "version={} count={} first_data_off={:#x} index_prefix={:#x}",
+                    "version={} count={} header_size={:#x} name_key={:#04x} wide_offsets={} name_hash={:?}",
                     h.version,
                     h.file_count,
-                    h.first_data_off,
-                    ypf.index_prefix()
+                    h.header_size,
+                    idx.name_key,
+                    idx.wide_offsets,
+                    idx.name_hash
                 );
                 let entries = ypf.entries();
                 let n = limit.unwrap_or(entries.len());
-                println!("{:>4}  {:<24} {:>5} {:>9} {:>9} {:>9}", "#", "name", "flag", "uncomp", "comp", "offset");
+                println!("{:>4}  {:<24} {:>4} {:>4} {:>9} {:>9} {:>9}", "#", "name", "type", "zlib", "uncomp", "stored", "offset");
                 for (i, e) in entries.iter().take(n).enumerate() {
                     println!(
-                        "{:>4}  {:<24} {:>5} {:>9} {:>9} {:>9}",
+                        "{:>4}  {:<24} {:>4} {:>4} {:>9} {:>9} {:>9}",
                         i,
-                        e.name.replace('\\', "/"),
-                        e.flags,
+                        e.name_lossy().replace('\\', "/"),
+                        e.file_type,
+                        e.compression,
                         e.uncompressed_len,
-                        e.compressed_len,
+                        e.stored_len,
                         format!("{:#x}", e.offset)
                     );
                 }
             }
             YpfCmd::Extract { path, name, index, out } => {
-                let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+                let ypf = open_ypf(&path, None)?;
                 let name = resolve_name(&ypf, &name, &index)?;
                 let data = get_script(&ypf, &name)?;
                 match out {
@@ -247,7 +281,7 @@ fn main() -> Result<()> {
         },
         Cmd::Ystb { sub } => match sub {
             YstbCmd::GuessKey { path, name, index } => {
-                let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+                let ypf = open_ypf(&path, None)?;
                 let name = resolve_name(&ypf, &name, &index)?;
                 let blob = get_script(&ypf, &name)?;
                 match guess_key(&blob) {
@@ -260,7 +294,7 @@ fn main() -> Result<()> {
                 }
             }
             YstbCmd::Info { path, name, index, key_hex } => {
-                let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+                let ypf = open_ypf(&path, None)?;
                 let name = resolve_name(&ypf, &name, &index)?;
                 let blob = get_script(&ypf, &name)?;
                 let key = match key_hex {
@@ -289,7 +323,7 @@ fn main() -> Result<()> {
                 }
             }
             YstbCmd::Slots { path, name, index, key_hex, limit } => {
-                let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+                let ypf = open_ypf(&path, None)?;
                 let name = resolve_name(&ypf, &name, &index)?;
                 let blob = get_script(&ypf, &name)?;
                 let key = match key_hex {
@@ -309,7 +343,7 @@ fn main() -> Result<()> {
                 }
             }
             YstbCmd::Disasm { path, name, index, key_hex, limit } => {
-                let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+                let ypf = open_ypf(&path, None)?;
                 let name = resolve_name(&ypf, &name, &index)?;
                 let blob = get_script(&ypf, &name)?;
                 let key = match key_hex {
@@ -382,11 +416,11 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Yscm { path, name, index, list, cmd } => {
-            let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+            let ypf = open_ypf(&path, None)?;
             let entry_name = match (name, index) {
                 (Some(n), _) => n,
                 (None, Some(i)) => resolve_name(&ypf, &None, &Some(i))?,
-                (None, None) => "%ysbin\\ysc.ybn".to_string(),
+                (None, None) => "ysbin\\ysc.ybn".to_string(),
             };
             let blob = get_script(&ypf, &entry_name)?;
             let t = yuris_format::yscm::YscmTable::from_bytes(&blob)
@@ -423,7 +457,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Yscf { path, name, index } => {
-            let ypf = open_ypf(&path, profile.ypf_name_xor_key)?;
+            let ypf = open_ypf(&path, None)?;
             let name = resolve_name(&ypf, &name, &index)?;
             let blob = get_script(&ypf, &name)?;
             let f = YscfFile::from_bytes(&blob)?;

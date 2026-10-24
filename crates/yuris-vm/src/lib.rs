@@ -27,7 +27,6 @@
 use std::collections::HashMap;
 
 pub mod boot;
-pub mod bridge;
 pub mod host;
 
 use yuris_core::{Error, Result};
@@ -574,7 +573,7 @@ pub struct IfFrame {
 /// 占位图)、occ2 = 1350.0(= `tip_meswindow_txspace.png`,1350×200 消息窗
 /// 纹理);两图均经封包扫描确认存在(`yuris-resource` dims_probe)。
 /// g1092 IF `SX==1 && SY==1 && COLOR==0x808080` = 「是 1×1 占位图」判定。
-/// 本模型:CG 命令 FILE 槽(46)非空 → 经 `PacFileIndex::image_dims` 解析
+/// 本模型:CG 命令 FILE 槽(46)非空 → 经 `GameFs::image_size` 解析
 /// 图像头填 [`img_w`](CgState::img_w)/[`img_h`](CgState::img_h);
 /// 不可解析(无探针/非 stored PNG)→ 0(偏离引擎处逐项定性)。
 /// 缩放乘积(若有)未验证 —— 应答值与图像尺寸逐字节吻合,乘数 = 1。
@@ -651,8 +650,8 @@ pub struct GroupVm {
     ysvr_kind2: Vec<yuris_format::ysvr::YsvrEntry>,
     /// 已应用 kind2 的脚本号。
     ysvr_kind2_applied: std::collections::HashSet<u16>,
-    /// 游戏虚拟 FS 存在性索引(FILEINFO EXIST;见 `host::PacFileIndex`)。
-    file_probe: Option<std::sync::Arc<crate::host::PacFileIndex>>,
+    /// 游戏虚拟 FS 存在性索引(FILEINFO EXIST;见 `yuris_format::vfs::GameFs`)。
+    file_probe: Option<std::sync::Arc<yuris_format::vfs::GameFs>>,
     /// 命名任务注册表(TASK 创建 → TASKINFO EXIST 查询;引擎 FUN_0040ca7d
     /// 按名查找的等价面。任务的实际执行经 GOSUB 标签链顺序进入 —— 引擎
     /// trace 实证:es.IDSubTask 的入口脚本由主线 GOSUB 串行调起,boot 段
@@ -733,7 +732,7 @@ impl GroupVm {
         self.input_cursor = (x, y);
     }
 
-    pub fn set_file_probe(&mut self, probe: std::sync::Arc<crate::host::PacFileIndex>) {
+    pub fn set_file_probe(&mut self, probe: std::sync::Arc<yuris_format::vfs::GameFs>) {
         self.file_probe = Some(probe);
     }
 
@@ -1751,7 +1750,9 @@ impl GroupVm {
                     // img_w/img_h(CGINFO 槽13/14 真值应答源)。
                     let image_dims = match (&file, &self.file_probe) {
                         (Some(f), Some(probe)) => {
-                            probe.image_dims(&String::from_utf8_lossy(f))
+                            probe
+                                .image_size(&String::from_utf8_lossy(f))
+                                .map(|(w, h)| (w as i64, h as i64))
                         }
                         _ => None,
                     };
@@ -2819,7 +2820,7 @@ impl GroupVm {
                     // CGFILE(2)/SOUNDFILE(3) = 路径源;EXIST(4)/SIZE(5)/
                     // RELATION(6) = 查询项;LET(7) = 写回目标。
                     // 本实现:EXIST+FILE+LET → 虚拟 FS 存在性
-                    // (`host::PacFileIndex`;实证 s207 es.R18Check:引擎查
+                    // (`GameFs`;实证 s207 es.R18Check:引擎查
                     // `cg/thumb_cg/A_HAN_2002_a.png` 得 1)。无 probe → 不写
                     // 回,事件记 err(诚实缺省)。其余查询项出现时再逆向。
                     if other == 0x15 {
@@ -3667,10 +3668,12 @@ impl GroupVm {
             return Err(self.halt_err(
                 self.pc,
                 cmd::LOAD,
-                "LOAD 需要文件源(PacFileIndex 未注入;引擎 VFS 语义)",
+                "LOAD 需要文件源(GameFs 未注入;引擎 VFS 语义)",
             ));
         };
-        let Some(bytes) = probe.read_loose(&name) else {
+        // 引擎 VFS 会在 save\ 下找存档(成果 59e),故原名找不到时再试 save\ 前缀。
+        let found = probe.read(&name).or_else(|_| probe.read(&format!("save\\{name}")));
+        let Ok(bytes) = found else {
             return Err(self.halt_err(
                 self.pc,
                 cmd::LOAD,

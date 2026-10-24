@@ -201,8 +201,8 @@ fn sample_yst00000_first_group_is_declaration() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = yuris_format::ypf::YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
+    let ypf = yuris_format::ypf::YpfArchive::from_bytes(data, None).unwrap();
+    let blob = ypf.read("ysbin\\yst00000.ybn").unwrap();
     let script = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
 
     let mut vm = GroupVm::load(script).unwrap();
@@ -336,8 +336,8 @@ fn ysvr_init_chain() {
         return;
     };
     let data = std::fs::read(&p).unwrap();
-    let ypf = yuris_format::ypf::YpfArchive::from_bytes(data, 0xC9).unwrap();
-    let ysv = ypf.read("%ysbin\\ysv.ybn").unwrap();
+    let ypf = yuris_format::ypf::YpfArchive::from_bytes(data, None).unwrap();
+    let ysv = ypf.read("ysbin\\ysv.ybn").unwrap();
     let table = yuris_format::ysvr::YsvrTable::from_bytes(&ysv).unwrap();
     assert_eq!(table.entries().len(), 3362);
 
@@ -771,12 +771,10 @@ fn bootstrap_system_start_reaches_end() {
         eprintln!("sample not found, skip");
         return;
     };
-    let bytes = std::fs::read(&path).unwrap();
-
+    let fs = yuris_format::vfs::GameFs::open(path.parent().unwrap()).unwrap();
     let boot = Bootstrap {
-        ypf_bytes: bytes,
-        name_key: 0xC9,
-        key: [0x2b, 0x90, 0x4f, 0x93],
+        fs: std::sync::Arc::new(fs),
+        key: Some([0x2b, 0x90, 0x4f, 0x93]),
         entry_label: None, // 缺省 SYSTEM_START
     };
     let booted = boot.boot().expect("启动链编排");
@@ -982,11 +980,10 @@ fn sample_script190_varinfo_group_executes() {
         eprintln!("sample not found, skip");
         return;
     };
-    let bytes = std::fs::read(&path).unwrap();
+    let fs = yuris_format::vfs::GameFs::open(path.parent().unwrap()).unwrap();
     let boot = Bootstrap {
-        ypf_bytes: bytes,
-        name_key: 0xC9,
-        key: [0x2b, 0x90, 0x4f, 0x93],
+        fs: std::sync::Arc::new(fs),
+        key: Some([0x2b, 0x90, 0x4f, 0x93]),
         // 直接从脚本190 的 0x67 组所在上下文验证:用入口方式先初始化,
         // 再跳到 script190 跑全部组(trace 下不挂起)
         entry_label: None,
@@ -997,8 +994,8 @@ fn sample_script190_varinfo_group_executes() {
     // 直达:把 script190 的全部组跑完(走 YSLB 上该脚本的真实组)
     // 取 script190 的 YstbFile
     let ypf = yuris_format::ypf::YpfArchive::from_bytes(
-        std::fs::read(&path).unwrap(), 0xC9).unwrap();
-    let blob = ypf.read("$ysbin\\yst00190.ybn").unwrap();
+        std::fs::read(&path).unwrap(), None).unwrap();
+    let blob = ypf.read("ysbin\\yst00190.ybn").unwrap();
     let script190 = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
     let groups = script190.groups().unwrap();
     let gi = groups.iter().position(|g| g.command_type == 0x67).expect("应有 0x67 组");
@@ -1007,7 +1004,7 @@ fn sample_script190_varinfo_group_executes() {
     // 断言 0x67 组在语料中存在 + 其窗口全部可解码 + 引用变量在 YSVR 有声明)
     // @0x188e 不在 YSVR(帧局部/运行时赋值,铁律:不猜其来源);
     // $0x37 经 YSVR 交叉验证(STR 数组,17 元素)。
-    let ysv = ypf.read("%ysbin\\ysv.ybn").unwrap();
+    let ysv = ypf.read("ysbin\\ysv.ybn").unwrap();
     let ysvr = yuris_format::ysvr::YsvrTable::from_bytes(&ysv).unwrap();
     let ids: std::collections::HashSet<u16> =
         ysvr.entries().iter().map(|e| e.var_id).collect();
@@ -1084,10 +1081,10 @@ fn sample_cgact_windows_decode() {
         eprintln!("sample not found, skip");
         return;
     };
-    let ypf = yuris_format::ypf::YpfArchive::from_bytes(std::fs::read(&path).unwrap(), 0xC9).unwrap();
+    let ypf = yuris_format::ypf::YpfArchive::from_bytes(std::fs::read(&path).unwrap(), None).unwrap();
     let mut checked = 0usize;
     for sid in [190usize, 77, 273] {
-        let name = format!("$ysbin\\yst{sid:05}.ybn");
+        let name = format!("ysbin\\yst{sid:05}.ybn");
         let Ok(blob) = ypf.read(&name) else { continue };
         let script = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
         let groups = script.groups().unwrap();

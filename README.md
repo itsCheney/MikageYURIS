@@ -1,4 +1,20 @@
-# Yuris-Tyn
+# Yuris-Tyn（Mikage 分支）
+
+本仓库是 [Weiss-UltimateSavior/Yuris-Tyn](https://github.com/Weiss-UltimateSavior/Yuris-Tyn) 的 fork，
+`mikage` 分支用于 Mikage（iOS 多引擎视觉小说播放器）的 YU-RIS 运行时。
+
+与上游的区别：
+
+- 只保留 `yuris-core`、`yuris-format`、`yuris-value`、`yuris-script`、`yuris-vm` 和 `yuris-tools`。
+  桌面播放器、渲染、scenario 播放器和空壳 crate 已移除，渲染与原生命令层将重新编写。
+- YPF 按公开格式重写（旧实现误读了条目布局），name_key 与偏移宽度从封包推断，见 `docs/formats/ypf.md`。
+- 新增 `yuris_format::vfs::GameFs`：松散文件 + 封包 + 存档目录。
+- 脚本密钥从脚本推断，启动链直接接受游戏目录。
+- `yuris boot <游戏目录>`：无画面跑启动链，报告封包、版本、密钥，以及 VM 停在哪里、哪些命令尚未实现。
+
+许可证仍为 GPL-3.0-or-later。以下为上游原文。
+
+---
 
 > **用 Rust 从零实现一个 YU-RIS 引擎兼容运行内核:直接读取原始游戏数据并运行原游戏。**
 > 不是提取器,不是反编译器,不是转换器。

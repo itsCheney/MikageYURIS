@@ -15,7 +15,7 @@ pub mod error;
 pub mod hash;
 pub mod version;
 
-pub use bytes::{decode_xor_cstring, xor_cyclic_skip, Reader};
+pub use bytes::{xor_cyclic_skip, Reader};
 pub use error::{Error, Result};
 pub use hash::murmur2;
 pub use version::{CharEncoding, VersionProfile};

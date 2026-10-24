@@ -11,8 +11,5 @@ yuris-core = { workspace = true }
 yuris-value = { workspace = true }
 yuris-script = { workspace = true }
 yuris-format = { workspace = true }
-yuris-expr = { workspace = true }
-yuris-scene = { workspace = true }
-yuris-runtime = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
