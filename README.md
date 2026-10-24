@@ -8,9 +8,14 @@
 - 只保留 `yuris-core`、`yuris-format`、`yuris-value`、`yuris-script`、`yuris-vm` 和 `yuris-tools`。
   桌面播放器、渲染、scenario 播放器和空壳 crate 已移除，渲染与原生命令层将重新编写。
 - YPF 按公开格式重写（旧实现误读了条目布局），name_key 与偏移宽度从封包推断，见 `docs/formats/ypf.md`。
-- 新增 `yuris_format::vfs::GameFs`：松散文件 + 封包 + 存档目录。
+- 新增 `yuris_format::vfs::GameFs`：松散文件 + 封包 + 存档目录，并可叠加汉化补丁的
+  Enigma Virtual Box 启动器（exe 内文件或其外部包，如 Erewhon 的 `erewhon_chs.mys`，
+  包内 YPF 原地读取并替换同名封包）。`evb.rs` 移植自 ethornell-rs，保持 MPL-2.0。
+- 命令下标与参数槽号按本游戏 `ysc.ybn` 的名字换算成 v555 顺序（`yuris_vm::commands`）。
 - 脚本密钥从脚本推断，启动链直接接受游戏目录。
-- `yuris boot <游戏目录>`：无画面跑启动链，报告封包、版本、密钥，以及 VM 停在哪里、哪些命令尚未实现。
+- `yuris boot <游戏目录> [--launcher <exe>]`：无画面跑启动链，报告封包、版本、密钥，
+  以及 VM 停在哪里、哪些命令尚未实现。`yuris evb <exe|包>` 列出 Enigma Virtual Box 文件。
+- 新代码注释使用英文。
 
 许可证仍为 GPL-3.0-or-later。以下为上游原文。
 

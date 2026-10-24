@@ -1,4 +1,5 @@
-//! 启动链:从合成游戏目录(pac/bn.ypf)推断封包名字 key 与脚本密钥并跑到脚本结束。
+//! Boot chain: infer the archive name key and script key from a synthetic
+//! game folder (pac/bn.ypf) and run to the end of the script.
 
 mod common;
 
@@ -42,7 +43,8 @@ fn boots_synthetic_game_with_inferred_keys() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("pac")).unwrap();
 
-    // RETURN(帧空 = 脚本结束),带一个返回值窗口(push 1)供密钥推断
+    // RETURN (empty frame stack = script end) with a return value window
+    // (push 1) for key guessing
     let w_ret: &[u8] = &[0x42, 1, 0, 1];
     let script = make_ystb(KEY, &[(cmd::RETURN, 1, 0)], &[([0, 0, 0, 0], w_ret.len() as u32, 0, w_ret)]);
     let ysl = yslb(&[(b"SYSTEM_START", 0, 0)]);

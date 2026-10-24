@@ -1,18 +1,25 @@
-//! 命令表映射:把各游戏 `ysc.ybn`(YSCM)里的命令下标换成 VM 的规范下标。
+//! Command map: turns the command indices of a game's `ysc.ybn` (YSCM) into
+//! the VM's canonical indices.
 //!
-//! 脚本里的命令下标是**该游戏自己 YSCM 的顺序**,随引擎版本与商业定制版
-//! 变化(例:v555 样本 `00 = ALIAS`、`0d = END`;Erewhon v481 `00 = CDDA`、
-//! 多出 `EMOTEINFO`,`END` 移到 `0e`)。VM 的处理器按 v555 顺序(本文件
-//! [`CANONICAL`],即 [`crate::cmd`] 常量)编写,载入脚本时按**名字**换算。
-//! 规范表里没有的命令换成 `0x80 | 游戏下标`,落入未实现路径,名字仍可查。
+//! Scripts index commands in **the game's own YSCM order**, which changes
+//! with the engine version and custom builds (the v555 sample has
+//! `00 = ALIAS`, `0d = END`; Erewhon v481 has `00 = CDDA`, an extra
+//! `EMOTEINFO`, and `END` at `0e`). The VM's handlers are written against
+//! the v555 order ([`CANONICAL`], the [`crate::cmd`] constants), so scripts
+//! are remapped **by name** when loaded. A command missing from the
+//! canonical table becomes `0x80 | game index`: it takes the unimplemented
+//! path and can still be named.
 //!
-//! 窗口 tag 的低字节是**参数槽号**,同样是游戏 YSCM 里该命令的参数顺序,
-//! 也随版本变化(例:VARINFO 的 `STR`/`NO` 在 v555 为 19/20,在 v481 为 17/18)。
-//! 载入时一并按参数名换成规范槽号;规范表里没有的参数换成 `0x80 | 游戏槽号`。
+//! The low byte of a window tag is the **parameter slot**, again in the
+//! game's YSCM parameter order, which also changes between versions
+//! (VARINFO `STR`/`NO` are 19/20 in v555 and 17/18 in v481). Slots are
+//! remapped by parameter name as well; a parameter missing from the
+//! canonical table becomes `0x80 | game slot`.
 
 use yuris_format::yscm::YscmTable;
 
-/// 规范命令表(v555 样本 `ysc.ybn` 顺序,`docs/opcode/yscm-commands-v555.json`)。
+/// Canonical commands, in the order of the v555 sample's `ysc.ybn`
+/// (`docs/opcode/yscm-commands-v555.json`).
 pub const CANONICAL: [&str; 121] = [
     "ALIAS", "CG", "CGACT", "CGEND", "CGINFO", "CLIPACT", "CLIPINFO", "CSV", "CSVINFO",
     "DEBUGLIST", "DIALOG", "ELSE", "EMOTE", "END", "ERROR", "ERRORINFO", "F_FLT", "F_INT",
@@ -31,7 +38,8 @@ pub const CANONICAL: [&str; 121] = [
     "PROJECTFOLDER",
 ];
 
-/// 规范参数表:`CANONICAL_PARAMS[cmd][slot]`(v555 样本 YSCM 的参数名顺序)。
+/// Canonical parameters, `CANONICAL_PARAMS[cmd][slot]`, in the v555 sample's
+/// YSCM order.
 pub const CANONICAL_PARAMS: [&[&str]; 121] = [
     // ALIAS
     &[],
@@ -421,15 +429,15 @@ pub const CANONICAL_PARAMS: [&[&str]; 121] = [
     &["PROJECTFOLDER"],
 ];
 
-/// 规范表外命令的标记位。
+/// Marks a command (or slot) missing from the canonical table.
 pub const FOREIGN: u8 = 0x80;
 
-/// 游戏下标 → 规范下标。
+/// Game command index -> canonical index, plus parameter slot maps.
 #[derive(Debug, Clone)]
 pub struct CommandMap {
     to_canon: [u8; 256],
     game_names: Vec<String>,
-    /// 游戏下标 → (游戏槽号 → 规范槽号);None = 恒等。
+    /// Per game command: game slot -> canonical slot; None = unchanged.
     slot_maps: Vec<Option<Vec<u8>>>,
 }
 
@@ -440,7 +448,7 @@ impl Default for CommandMap {
 }
 
 impl CommandMap {
-    /// 恒等映射(v555 顺序的游戏,或测试用合成脚本)。
+    /// The identity map (games in v555 order, synthetic test scripts).
     pub fn identity() -> Self {
         let mut to_canon = [0u8; 256];
         for (i, c) in to_canon.iter_mut().enumerate() {
@@ -453,7 +461,7 @@ impl CommandMap {
         }
     }
 
-    /// 由游戏的 YSCM 命令表按名字建立映射。
+    /// Builds the map from a game's YSCM table, by name.
     pub fn from_yscm(t: &YscmTable) -> Self {
         let mut to_canon = [0u8; 256];
         let mut game_names = Vec::with_capacity(t.commands().len());
@@ -466,7 +474,8 @@ impl CommandMap {
             if let Some(k) = CANONICAL.iter().position(|n| n.eq_ignore_ascii_case(&c.name)) {
                 to_canon[i] = k as u8;
                 let canon = CANONICAL_PARAMS[k];
-                // 同名参数(如 PLUG 的多个空名)按出现次序对应
+                // Repeated names (such as PLUG's empty ones) pair up in order;
+                // empty names never match.
                 let map: Vec<u8> = c
                     .params
                     .iter()
@@ -498,12 +507,12 @@ impl CommandMap {
         Self { to_canon, game_names, slot_maps }
     }
 
-    /// 换算一个游戏下标。
+    /// Maps one game command index.
     pub fn canon(&self, game_index: u8) -> u8 {
         self.to_canon[game_index as usize]
     }
 
-    /// 规范下标(或 `0x80 | 游戏下标`)对应的命令名。
+    /// The name of a canonical index (or of `0x80 | game index`).
     pub fn name(&self, code: u8) -> String {
         if code & FOREIGN != 0 {
             let i = (code & 0x7f) as usize;
@@ -519,7 +528,7 @@ impl CommandMap {
             .unwrap_or_else(|| format!("#{code:02x}"))
     }
 
-    /// 游戏 YSCM 里存在、规范表里没有的命令名。
+    /// Commands in the game's YSCM that the canonical table lacks.
     pub fn foreign_names(&self) -> Vec<&str> {
         self.game_names
             .iter()
@@ -529,7 +538,8 @@ impl CommandMap {
             .collect()
     }
 
-    /// 参数槽号有变化的命令(规范名, [(游戏槽, 规范槽)])。诊断用。
+    /// Commands whose parameter slots move: (name, [(game slot, canonical
+    /// slot)]). For diagnostics.
     pub fn slot_changes(&self) -> Vec<(String, Vec<(u8, u8)>)> {
         self.slot_maps
             .iter()
@@ -547,7 +557,8 @@ impl CommandMap {
             .collect()
     }
 
-    /// 原地换算一个脚本上下文:命令下标与窗口参数槽号。每个上下文只能换算一次。
+    /// Remaps a script context in place: command indices and window
+    /// parameter slots. Remap each context only once.
     pub fn remap(&self, ctx: &mut crate::host::ScriptCtx) {
         let crate::host::ScriptCtx { groups, first_slots, script, .. } = ctx;
         let slots = script.slots_mut();
@@ -590,7 +601,7 @@ mod tests {
 
     #[test]
     fn maps_commands_and_slots_by_name() {
-        // v481 风格:CDDA 在首位、VARINFO 少了 STRFIRST/SJISCODE
+        // v481 style: CDDA first, VARINFO without STRFIRST/SJISCODE
         let t = yscm(&[
             ("CDDA", &[]),
             ("END", &[]),

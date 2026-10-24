@@ -4,7 +4,8 @@
 //! 在 `yst%05d.ybn` 之间不断跳转(GOSUB 占语料 27065 组,最高频)。
 //! 本模块提供「按脚本号取脚本上下文」的接口与实现,供 GroupVm 跨脚本切换。
 //!
-//! [`FsScriptHost`] 从游戏文件系统按 script_id 读 `ysbin\yst%05d.ybn`。
+//! [`FsScriptHost`] reads `ysbin\yst%05d.ybn` by script id from the game's
+//! file system.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +43,8 @@ impl ScriptCtx {
 
 /// 脚本加载抽象:按脚本号取 [`ScriptCtx`]。
 ///
-/// 实现方负责读取并解析(如 [`FsScriptHost`]),可缓存。
+/// Implementations read and parse scripts (such as [`FsScriptHost`]) and may
+/// cache them.
 pub trait ScriptHost {
     /// 取脚本号 `id` 的上下文(惰性加载 + 缓存由实现方决定)。
     fn load(&mut self, id: u16) -> Result<ScriptCtx>;
@@ -86,67 +88,56 @@ impl ScriptHost for InMemoryHost {
 }
 
 
-/// 基于游戏文件系统的宿主(真实游戏用):按 script_id 读
-/// `ysbin\yst%05d.ybn`(封包或松散文件),解析结果缓存。
+/// Script host over the game's file system (for real games): reads
+/// `ysbin\yst%05d.ybn` by script id from any layer and caches the result.
 pub struct FsScriptHost {
     fs: Arc<GameFs>,
-    /// 脚本区 XOR 密钥(4 字节循环,随游戏不同)。
+    /// Script XOR key (4 bytes, cyclic; differs per game).
     key: [u8; 4],
     cache: HashMap<u16, ScriptCtx>,
 }
 
 impl FsScriptHost {
-    /// 用给定密钥建宿主。
+    /// Creates a host with the given key.
     pub fn new(fs: Arc<GameFs>, key: [u8; 4]) -> Self {
         Self { fs, key, cache: HashMap::new() }
     }
 
-    /// 脚本密钥。
+    /// The script key.
     pub fn key(&self) -> [u8; 4] {
         self.key
     }
 
-    /// 读文件系统内任一文件(启动链读 YSLB/YSVR 等)。
+    /// Reads any file of the file system (the boot chain reads YSLB, YSVR...).
     pub fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
         self.fs.read(path)
     }
 }
 
-/// 脚本路径。
+/// Path of a script.
 pub fn script_path(id: u16) -> String {
     format!("ysbin\\yst{id:05}.ybn")
 }
 
-/// 列出文件系统里全部 `ysbin\yst%05d.ybn` 的脚本号(升序)。
+/// Ids of every `ysbin\yst%05d.ybn` in the file system, ascending.
 pub fn list_script_ids(fs: &GameFs) -> Vec<u16> {
-    let mut ids: Vec<u16> = Vec::new();
-    let mut take = |name: &[u8]| {
-        let n = yuris_format::ypf::normalize_name(name);
-        let id = n
-            .strip_prefix(b"ysbin\\yst")
-            .and_then(|r| r.strip_suffix(b".ybn"))
-            .filter(|d| d.len() == 5 && d.iter().all(u8::is_ascii_digit))
-            .and_then(|d| std::str::from_utf8(d).ok()?.parse::<u16>().ok());
-        if let Some(id) = id {
-            ids.push(id);
-        }
-    };
-    for pack in fs.packs() {
-        for e in &pack.index().entries {
-            take(&e.name);
-        }
-    }
-    if let Ok(rd) = std::fs::read_dir(fs.root().join("ysbin")) {
-        for e in rd.flatten() {
-            take(format!("ysbin\\{}", e.file_name().to_string_lossy()).as_bytes());
-        }
-    }
+    let mut ids: Vec<u16> = fs
+        .file_names()
+        .iter()
+        .filter_map(|n| {
+            n.strip_prefix(b"ysbin\\yst")
+                .and_then(|r| r.strip_suffix(b".ybn"))
+                .filter(|d| d.len() == 5 && d.iter().all(u8::is_ascii_digit))
+                .and_then(|d| std::str::from_utf8(d).ok()?.parse::<u16>().ok())
+        })
+        .collect();
     ids.sort_unstable();
     ids.dedup();
     ids
 }
 
-/// 推断脚本密钥:对前若干个脚本各自猜,取得票最多者。
+/// Guesses the script key: guesses each of the first scripts and takes the
+/// most common key.
 pub fn guess_script_key(fs: &GameFs) -> Result<[u8; 4]> {
     let mut votes: HashMap<[u8; 4], usize> = HashMap::new();
     for id in list_script_ids(fs).into_iter().take(16) {

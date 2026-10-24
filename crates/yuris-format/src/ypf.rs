@@ -1,33 +1,37 @@
-//! YPF 封包解析。
+//! YPF archives.
 //!
-//! 规格:`docs/formats/ypf.md`(2026-10-24 按公开格式重写)。
+//! Format notes: `docs/formats/ypf.md`.
 //!
 //! ```text
 //! header (0x20)
 //!   u8  magic[4] = "YPF\0"
 //!   u32 version
 //!   u32 file_count
-//!   u32 header_size   // 索引区结束位置;< 300 版本不含 header 自身
+//!   u32 header_size   // end of the index; excludes the header before v300
 //!   u8  pad[16]
 //! entry × file_count
-//!   u32 name_hash     // 解密后小写名的哈希(murmur2 / crc32 / adler32,随版本)
-//!   u8  name_size     // 加密:NAME_SIZE_MAP[v ^ 0xFF]
-//!   u8  name[name_size] // 逐字节 XOR name_key(常见 0xFF,样本 v500 为 0xC9)
+//!   u32 name_hash     // hash of the decrypted lowercase name (murmur2 / crc32 / adler32 by version)
+//!   u8  name_size     // encrypted: NAME_SIZE_MAP[v ^ 0xFF]
+//!   u8  name[name_size] // each byte XOR name_key (usually 0xFF; the v500 sample uses 0xC9)
 //!   u8  file_type
 //!   u8  compression   // 0 = stored, 1 = zlib
 //!   u32 uncompressed_len
 //!   u32 stored_len
-//!   u32|u64 offset    // 新版本(约 477 起)为 u64
+//!   u32|u64 offset    // u64 in newer versions (about 477 on)
 //!   u32 data_hash
 //! ```
 //!
-//! 旧实现把 `name_size` 当作名字首字符、把 `file_type` 当作 NUL 终止符,
-//! 只在单一样本上碰巧成立(名字多出 `$`/`%` 前缀、末条残差 −4 字节)。
-//! 样本 0x20 处的 `0x0033AE52` = `murmur2("ysbin\yst00034.ybn")`,即首条的
-//! name_hash,印证了上述布局。
+//! The upstream reader took `name_size` for the first name character and
+//! `file_type` for a NUL terminator, which happened to work on one sample
+//! only (names gained a `$`/`%` prefix, the last entry was 4 bytes short).
+//! The sample's u32 at 0x20, `0x0033AE52`, is `murmur2("ysbin\yst00034.ybn")`,
+//! the first entry's name_hash, which confirms the layout above.
 //!
-//! 偏移宽度与 name_key 都从封包自身推断,不依赖版本号(商业定制版的版本号
-//! 不可信,见 yuri.md「Special versions」)。
+//! Offset width and name_key are inferred from the archive itself, not from
+//! the version number (custom commercial builds report unreliable versions).
+//!
+//! An archive can also live inside another file (an Enigma Virtual Box
+//! package): [`YpfReader::open_at`] reads it in place at a base offset.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -35,16 +39,17 @@ use std::io::{Read, Seek, SeekFrom};
 use flate2::read::ZlibDecoder;
 use yuris_core::{murmur2, Error, Reader, Result};
 
-/// YPF magic:`YPF\0`。
+/// YPF magic, `YPF\0`.
 pub const YPF_MAGIC: [u8; 4] = *b"YPF\0";
 
-/// header 长度。
+/// Header length.
 pub const HEADER_LEN: usize = 0x20;
 
-/// compression 字段:zlib。
+/// `compression` value for zlib.
 pub const COMPRESSION_ZLIB: u8 = 1;
 
-/// name_size 解密表:`NAME_SIZE_MAP[enc ^ 0xFF]`(自反置换,加密同表)。
+/// name_size table: `NAME_SIZE_MAP[enc ^ 0xFF]`. It is an involution, so
+/// encryption uses the same table.
 pub const NAME_SIZE_MAP: [u8; 256] = {
     let mut m = [0u8; 256];
     let mut i = 0;
@@ -77,32 +82,32 @@ pub const NAME_SIZE_MAP: [u8; 256] = {
     m
 };
 
-/// 解密 name_size 字节。
+/// Decrypts a name_size byte.
 pub fn decrypt_name_size(v: u8) -> u8 {
     NAME_SIZE_MAP[(v ^ 0xFF) as usize]
 }
 
-/// 加密 name_size(测试与打包用)。
+/// Encrypts a name_size byte (for tests and packing).
 pub fn encrypt_name_size(v: u8) -> u8 {
     NAME_SIZE_MAP[v as usize] ^ 0xFF
 }
 
-/// 条目名哈希算法(随版本变化;解析时逐个尝试)。
+/// Entry name hash; it changed between versions, so parsing tries each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameHash {
-    /// 0.477 起。
+    /// From 0.477.
     Murmur2,
-    /// 0.265 起。
+    /// From 0.265.
     Crc32,
-    /// 0.200 起。
+    /// From 0.200.
     Adler32,
 }
 
 impl NameHash {
-    /// 全部候选。
+    /// All candidates.
     pub const ALL: [NameHash; 3] = [NameHash::Murmur2, NameHash::Crc32, NameHash::Adler32];
 
-    /// 计算哈希。
+    /// Hashes `data`.
     pub fn hash(self, data: &[u8]) -> u32 {
         match self {
             NameHash::Murmur2 => murmur2(data),
@@ -125,40 +130,40 @@ fn adler32(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
-/// YPF 文件头。
+/// YPF header.
 #[derive(Debug, Clone, Copy)]
 pub struct YpfHeader {
-    /// 封包版本(如 500)。
+    /// Archive version (such as 500).
     pub version: u32,
-    /// 条目数。
+    /// Number of entries.
     pub file_count: u32,
-    /// 头部字段 header_size(原样)。
+    /// The header_size field, as stored.
     pub header_size: u32,
 }
 
-/// 索引条目。
+/// One index entry.
 #[derive(Debug, Clone)]
 pub struct YpfEntry {
-    /// 解密后的条目名(原始字节,通常 CP932,分隔符 `\`)。
+    /// Decrypted name: raw bytes, usually CP932, `\` separated.
     pub name: Vec<u8>,
-    /// 存储的名字哈希。
+    /// Stored name hash.
     pub name_hash: u32,
-    /// 文件类型码(与扩展名相关)。
+    /// File type code (follows the extension).
     pub file_type: u8,
-    /// 0 = stored,1 = zlib。
+    /// 0 = stored, 1 = zlib.
     pub compression: u8,
-    /// 解压后长度。
+    /// Unpacked length.
     pub uncompressed_len: u32,
-    /// 数据区占用长度。
+    /// Stored length.
     pub stored_len: u32,
-    /// 数据区绝对偏移。
+    /// Data offset from the start of the archive.
     pub offset: u64,
-    /// 数据哈希(原样保留,未校验)。
+    /// Data hash, kept as stored and not checked.
     pub data_hash: u32,
 }
 
 impl YpfEntry {
-    /// 条目名的有损字符串形式(日志/工具用)。
+    /// The name as a lossy string, for logs and tools.
     pub fn name_lossy(&self) -> String {
         let (s, _, _) = encoding_rs::SHIFT_JIS.decode(&self.name);
         s.into_owned()
@@ -188,8 +193,9 @@ impl YpfEntry {
     }
 }
 
-/// 条目名归一:`/` → `\`,ASCII 小写;CP932 双字节字符的尾字节保持不变
-/// (尾字节可落在 `A`..`Z` 与 `\` 上)。
+/// Normalizes a name for lookup: `/` becomes `\` and ASCII is lowercased.
+/// Trail bytes of CP932 double-byte characters stay as they are, since
+/// they can fall on `A`..`Z` and `\`.
 pub fn normalize_name(name: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len());
     let mut i = 0;
@@ -215,26 +221,27 @@ fn is_sjis_lead(b: u8) -> bool {
     matches!(b, 0x81..=0x9F | 0xE0..=0xFC)
 }
 
-/// 封包索引(不含数据区)。
+/// Archive index, without the data.
 #[derive(Debug, Clone)]
 pub struct YpfIndex {
-    /// 头部。
+    /// Header.
     pub header: YpfHeader,
-    /// 名字 XOR key(推断所得)。
+    /// Name XOR key (inferred).
     pub name_key: u8,
-    /// 偏移字段是否为 u64(推断所得)。
+    /// Whether offsets are u64 (inferred).
     pub wide_offsets: bool,
-    /// 与 name_hash 吻合的哈希算法(None = 未能确认)。
+    /// The hash that matches name_hash; None when none could be confirmed.
     pub name_hash: Option<NameHash>,
-    /// 全部条目(索引顺序)。
+    /// All entries, in index order.
     pub entries: Vec<YpfEntry>,
     map: HashMap<Vec<u8>, usize>,
 }
 
 impl YpfIndex {
-    /// 从头部 + 索引区字节解析(`buf` 至少覆盖到索引区末尾)。
+    /// Parses the header and index; `buf` must reach the end of the index.
     ///
-    /// `file_len` = 整个封包长度,用于校验偏移;`name_key` 为 None 时自动推断。
+    /// `file_len` is the archive length, used to check offsets. A `name_key`
+    /// of None is inferred.
     pub fn parse(buf: &[u8], file_len: u64, name_key: Option<u8>) -> Result<Self> {
         let mut r = Reader::new(buf);
         let magic = r.u32_bytes()?;
@@ -250,8 +257,9 @@ impl YpfIndex {
             header_size: r.u32_le()?,
         };
 
-        // 偏移宽度:按版本先试,失败再试另一种;以「恰好走完索引区且偏移
-        // 均落在文件内」为准。
+        // Offset width: try the one the version suggests, then the other.
+        // The right one ends exactly at the index end with every offset
+        // inside the file.
         let prefer_wide = header.version >= 477;
         let mut last_err = None;
         let mut raw = None;
@@ -278,7 +286,7 @@ impl YpfIndex {
         let mut map = HashMap::with_capacity(raw.len());
         for (enc_name, mut e) in raw {
             e.name = enc_name.iter().map(|b| b ^ name_key).collect();
-            // 同名条目:先出现者优先(与旧实现一致;引擎行为未确认)
+            // Duplicate names: the first one wins (engine behaviour unconfirmed)
             map.entry(normalize_name(&e.name)).or_insert(entries.len());
             entries.push(e);
         }
@@ -292,28 +300,42 @@ impl YpfIndex {
         })
     }
 
-    /// 从磁盘文件只读头部与索引区。
+    /// Reads only the header and index of an archive file.
     pub fn from_path(path: &std::path::Path, name_key: Option<u8>) -> Result<Self> {
-        let mut f = std::fs::File::open(path)?;
-        let file_len = f.metadata()?.len();
-        let mut head = [0u8; HEADER_LEN];
-        f.read_exact(&mut head)?;
-        let header_size = u32::from_le_bytes(head[12..16].try_into().unwrap());
-        // 索引区最远到 header_size + 0x20(< 300 版本 header_size 不含头)。
-        let want = (header_size as u64 + HEADER_LEN as u64).min(file_len);
-        let mut buf = vec![0u8; want as usize];
-        f.seek(SeekFrom::Start(0))?;
-        f.read_exact(&mut buf)?;
-        Self::parse(&buf, file_len, name_key)
+        let len = std::fs::metadata(path)?.len();
+        Self::from_range(path, 0, len, name_key)
     }
 
-    /// 按名字查找(归一后比较)。
+    /// Reads the header and index of an archive stored at `base..base+len`
+    /// inside `path`. Entry offsets stay relative to `base`.
+    pub fn from_range(path: &std::path::Path, base: u64, len: u64, name_key: Option<u8>) -> Result<Self> {
+        let mut f = std::fs::File::open(path)?;
+        if base.saturating_add(len) > f.metadata()?.len() {
+            return Err(Error::format(format!("YPF range {base:#x}+{len:#x} beyond {}", path.display())));
+        }
+        if len < HEADER_LEN as u64 {
+            return Err(Error::format("YPF too short"));
+        }
+        let mut head = [0u8; HEADER_LEN];
+        f.seek(SeekFrom::Start(base))?;
+        f.read_exact(&mut head)?;
+        let header_size = u32::from_le_bytes(head[12..16].try_into().unwrap());
+        // The index ends at most at header_size + 0x20 (before v300
+        // header_size excludes the header).
+        let want = (header_size as u64 + HEADER_LEN as u64).min(len);
+        let mut buf = vec![0u8; want as usize];
+        f.seek(SeekFrom::Start(base))?;
+        f.read_exact(&mut buf)?;
+        Self::parse(&buf, len, name_key)
+    }
+
+    /// Finds an entry by name (compared after normalizing).
     pub fn find(&self, name: &[u8]) -> Option<&YpfEntry> {
         self.map.get(&normalize_name(name)).map(|&i| &self.entries[i])
     }
 }
 
-/// 解析结果里尚未解密的名字 + 条目其余字段。
+/// An entry with its name still encrypted.
 type RawEntry = (Vec<u8>, YpfEntry);
 
 fn walk_entries(buf: &[u8], h: &YpfHeader, wide: bool, file_len: u64) -> Result<Vec<RawEntry>> {
@@ -358,7 +380,8 @@ fn walk_entries(buf: &[u8], h: &YpfHeader, wide: bool, file_len: u64) -> Result<
             },
         ));
     }
-    // 索引区终点:>= 300 版本 header_size 含头,< 300 不含;两者择一吻合即可。
+    // Index end: header_size includes the header from v300 and excludes it
+    // before; either match is accepted.
     let end = r.pos() as u64;
     let hs = h.header_size as u64;
     if end != hs && end != hs + HEADER_LEN as u64 {
@@ -380,8 +403,8 @@ fn detect_hash(raw: &[RawEntry], key: u8) -> Option<NameHash> {
     NameHash::ALL.into_iter().find(|&a| hash_matches(raw, key, a))
 }
 
-/// 推断 name_key:先用名字哈希逐 key 验证(最可靠);哈希对不上时退回
-/// 「扩展名前的 `.`」启发(`xxx.ybn` / `.png` / `.ogg`)。
+/// Infers name_key: first by checking the name hash for every key (most
+/// reliable), then by voting on the `.` before a 3-letter extension.
 fn detect_name_key(raw: &[RawEntry]) -> Result<(u8, Option<NameHash>)> {
     if raw.is_empty() {
         return Ok((0xFF, None));
@@ -411,7 +434,7 @@ fn detect_name_key(raw: &[RawEntry]) -> Result<(u8, Option<NameHash>)> {
     Ok((key, None))
 }
 
-/// 内存中的整个封包(脚本包等小封包用)。
+/// A whole archive in memory (for small archives).
 #[derive(Debug)]
 pub struct YpfArchive {
     data: Vec<u8>,
@@ -419,33 +442,33 @@ pub struct YpfArchive {
 }
 
 impl YpfArchive {
-    /// 从内存字节解析;`name_key` 为 None 时自动推断。
+    /// Parses an archive held in memory; a `name_key` of None is inferred.
     pub fn from_bytes(data: Vec<u8>, name_key: Option<u8>) -> Result<Self> {
         let index = YpfIndex::parse(&data, data.len() as u64, name_key)?;
         Ok(Self { data, index })
     }
 
-    /// 索引。
+    /// The index.
     pub fn index(&self) -> &YpfIndex {
         &self.index
     }
 
-    /// 文件头。
+    /// The header.
     pub fn header(&self) -> &YpfHeader {
         &self.index.header
     }
 
-    /// 全部条目。
+    /// All entries.
     pub fn entries(&self) -> &[YpfEntry] {
         &self.index.entries
     }
 
-    /// 按名字查找条目。
+    /// Finds an entry by name.
     pub fn entry(&self, name: &str) -> Option<&YpfEntry> {
         self.index.find(name.as_bytes())
     }
 
-    /// 读取一个条目并解压。
+    /// Reads and unpacks an entry.
     pub fn read(&self, name: &str) -> Result<Vec<u8>> {
         let e = self
             .entry(name)
@@ -453,7 +476,7 @@ impl YpfArchive {
         self.read_entry(e)
     }
 
-    /// 读取给定条目(须属于本封包)。
+    /// Reads an entry of this archive.
     pub fn read_entry(&self, e: &YpfEntry) -> Result<Vec<u8>> {
         let start = e.offset as usize;
         let raw = self
@@ -464,34 +487,68 @@ impl YpfArchive {
     }
 }
 
-/// 基于文件的封包读取器:索引常驻,数据按需 seek(数百 MB 的图像包用)。
+/// An archive read from disk: the index stays in memory and data is read on
+/// demand (image archives run to hundreds of MB).
 #[derive(Debug)]
 pub struct YpfReader {
     path: std::path::PathBuf,
+    base: u64,
+    name: String,
     index: YpfIndex,
 }
 
 impl YpfReader {
-    /// 打开封包并解析索引区。
+    /// Opens an archive file and parses its index.
     pub fn open(path: &std::path::Path, name_key: Option<u8>) -> Result<Self> {
         let index = YpfIndex::from_path(path, name_key)?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         Ok(Self {
             path: path.to_path_buf(),
+            base: 0,
+            name,
             index,
         })
     }
 
-    /// 封包路径。
+    /// Opens an archive stored as is at `base..base+len` inside another file
+    /// (such as an Enigma Virtual Box package). `name` is for display.
+    pub fn open_at(
+        path: &std::path::Path,
+        base: u64,
+        len: u64,
+        name: String,
+        name_key: Option<u8>,
+    ) -> Result<Self> {
+        let index = YpfIndex::from_range(path, base, len, name_key)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            base,
+            name,
+            index,
+        })
+    }
+
+    /// The file holding the archive.
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 
-    /// 索引。
+    /// Offset of the archive in that file (0 for a plain archive file).
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Display name: the file name, or the name inside its package.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The index.
     pub fn index(&self) -> &YpfIndex {
         &self.index
     }
 
-    /// 读取条目并解压。
+    /// Reads and unpacks an entry by name.
     pub fn read(&self, name: &[u8]) -> Result<Vec<u8>> {
         let e = self.index.find(name).ok_or_else(|| {
             Error::format(format!("entry not found: {:?}", String::from_utf8_lossy(name)))
@@ -499,32 +556,33 @@ impl YpfReader {
         self.read_entry(e)
     }
 
-    /// 读取给定条目的前 `n` 字节(未压缩条目;读图像头用)。
+    /// Reads the first `n` bytes of an entry (for image headers); a
+    /// compressed entry is unpacked whole.
     pub fn read_prefix(&self, e: &YpfEntry, n: usize) -> Result<Vec<u8>> {
         if e.compression != 0 {
             let all = self.read_entry(e)?;
             return Ok(all[..n.min(all.len())].to_vec());
         }
         let mut f = std::fs::File::open(&self.path)?;
-        f.seek(SeekFrom::Start(e.offset))?;
+        f.seek(SeekFrom::Start(self.base + e.offset))?;
         let mut raw = vec![0u8; n.min(e.stored_len as usize)];
         f.read_exact(&mut raw)?;
         Ok(raw)
     }
 
-    /// 读取给定条目(须属于本封包)。
+    /// Reads an entry of this archive.
     pub fn read_entry(&self, e: &YpfEntry) -> Result<Vec<u8>> {
         let mut f = std::fs::File::open(&self.path)?;
-        f.seek(SeekFrom::Start(e.offset))?;
+        f.seek(SeekFrom::Start(self.base + e.offset))?;
         let mut raw = vec![0u8; e.stored_len as usize];
         f.read_exact(&mut raw)?;
         e.decode(raw)
     }
 }
 
-/// 构造 YPF 封包(测试与工具用)。
+/// Builds a YPF archive (for tests and tools).
 ///
-/// `entries` = (名字, 文件类型, 是否 zlib, 内容)。
+/// `entries` are (name, file type, zlib?, contents).
 pub fn build(
     version: u32,
     name_key: u8,
@@ -587,19 +645,19 @@ mod tests {
         for v in 0..=255u8 {
             assert_eq!(decrypt_name_size(encrypt_name_size(v)), v);
         }
-        // 样本:0xED → 18 = len("ysbin\yst00034.ybn")
+        // Sample: 0xED -> 18 = len("ysbin\yst00034.ybn")
         assert_eq!(decrypt_name_size(0xED), 18);
     }
 
     #[test]
     fn sample_first_entry_hash() {
-        // 旧文档记录的样本 0x20 处 u32 = 0x0033AE52
+        // The old docs record the sample's u32 at 0x20 as 0x0033AE52
         assert_eq!(murmur2(b"ysbin\\yst00034.ybn"), 0x0033_AE52);
     }
 
     #[test]
     fn normalize_keeps_sjis_trail_bytes() {
-        // 「ソ」= 83 5C:尾字节 0x5C 是 `\`,不能被改动
+        // "ソ" is 83 5C: the trail byte 0x5C is `\` and must not change
         assert_eq!(normalize_name(b"CG/A\x83\x5Cb.PNG"), b"cg\\a\x83\x5Cb.png".to_vec());
     }
 
@@ -641,6 +699,19 @@ mod tests {
         assert_eq!(r.read(b"ysbin\\ysc.ybn").unwrap(), b"YSCM");
         let e = r.index().find(b"A.TXT").unwrap();
         assert_eq!(r.read_prefix(e, 3).unwrap(), b"hel");
+
+        // The same archive inside a bigger file.
+        let inner = build(500, 0xFF, true, NameHash::Murmur2, &files);
+        let mut outer = b"EVB\0 some table".to_vec();
+        let base = outer.len() as u64;
+        outer.extend(&inner);
+        outer.extend(b"trailing data");
+        let p = dir.join("chs.mys");
+        std::fs::write(&p, &outer).unwrap();
+        let r = YpfReader::open_at(&p, base, inner.len() as u64, "chs.mys:bn.ypf".into(), None).unwrap();
+        assert_eq!(r.read(b"a.txt").unwrap(), b"hello");
+        assert_eq!(r.read(b"ysbin\\ysc.ybn").unwrap(), b"YSCM");
+        assert!(YpfReader::open_at(&p, base, outer.len() as u64, String::new(), None).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

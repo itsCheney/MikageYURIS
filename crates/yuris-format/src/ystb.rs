@@ -227,7 +227,7 @@ impl YstbFile {
         &self.slots
     }
 
-    /// 槽位表(可写;命令表映射换算参数槽号用)。
+    /// The slot table, writable (the command map rewrites parameter slots).
     pub fn slots_mut(&mut self) -> &mut [CommandSlot] {
         &mut self.slots
     }

@@ -1,17 +1,20 @@
-//! `yuris` —— YU-RIS 格式检查工具（开发向，无 GUI）。
+//! `yuris`: YU-RIS development tools (no GUI).
 //!
-//! 子命令：
+//! Subcommands:
 //!
 //! ```text
+//! yuris boot     <game dir> [--launcher EXE] [--key-hex HEX] [--max-groups N]
+//! yuris evb      <exe or package>
 //! yuris ypf list     <bn.ypf> [--limit N]
 //! yuris ypf extract  <bn.ypf> (--name NAME | --index N) [-o OUT]
 //! yuris ystb guess-key <bn.ypf> (--name NAME | --index N)
 //! yuris ystb info    <bn.ypf> (--name NAME | --index N) [--key-hex HEX]
 //! yuris ystb slots   <bn.ypf> (--name NAME | --index N) [--key-hex HEX] [--limit N]
+//! yuris ystb groups  <bn.ypf> (--name NAME | --index N) [--from N] [--count N]
 //! yuris yscf         <bn.ypf> --name '$ysbin\yscfg.ybn'
 //! ```
 //!
-//! 所有命令都基于 `docs/formats/` 中 **Confirmed** 的规格实现。
+//! The format notes are in `docs/formats/`.
 
 use std::path::PathBuf;
 
@@ -30,61 +33,73 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 打开游戏目录,无画面跑启动链,报告版本/密钥与未实现的命令。
+    /// Opens a game folder and runs the boot chain headless, reporting
+    /// versions, the script key and unimplemented commands.
     Boot {
-        /// 游戏目录(或其 pac 目录)。
+        /// Game folder (or its pac folder).
         dir: PathBuf,
-        /// 4 字节脚本密钥(hex);缺省从脚本推断。
+        /// Launcher exe packed with Enigma Virtual Box (translation patches);
+        /// its files and external package are mounted over the game.
+        #[arg(long)]
+        launcher: Option<PathBuf>,
+        /// 4-byte script key in hex; inferred from the scripts by default.
         #[arg(long)]
         key_hex: Option<String>,
-        /// 入口标签(缺省 SYSTEM_START)。
+        /// Entry label (SYSTEM_START by default).
         #[arg(long)]
         entry: Option<String>,
-        /// 执行组数上限(主循环每帧让出,无后端时据此停止)。
+        /// Group budget (the main loop yields every frame; without a backend
+        /// this is what stops the run).
         #[arg(long, default_value_t = 200_000)]
         max_groups: usize,
-        /// 把 VM 事件流写成 JSONL。
+        /// Writes the VM event stream as JSONL.
         #[arg(long)]
         jsonl: Option<PathBuf>,
-        /// 遇到未实现的命令即停(缺省记录后继续)。
+        /// Stops at the first unimplemented command (by default it is recorded
+        /// and skipped).
         #[arg(long)]
         strict: bool,
     },
-    /// YPF 封包操作。
+    /// List the files of an Enigma Virtual Box exe or external package.
+    Evb {
+        /// Packed exe or package (e.g. `.mys`).
+        path: PathBuf,
+    },
+    /// YPF archives.
     Ypf {
         #[command(subcommand)]
         sub: YpfCmd,
     },
-    /// YSTB 脚本容器操作。
+    /// YSTB scripts.
     Ystb {
         #[command(subcommand)]
         sub: YstbCmd,
     },
-    /// YSCM 命令字典（脚本命令表）。
+    /// YSCM command table.
     Yscm {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
-        /// 条目名（默认 `%ysbin\ysc.ybn`）。
+        /// Entry name (default `ysbin\ysc.ybn`).
         #[arg(long)]
         name: Option<String>,
-        /// 条目下标。
+        /// Entry index.
         #[arg(long)]
         index: Option<usize>,
-        /// 只列出命令名与参数个数。
+        /// Only list command names and parameter counts.
         #[arg(long)]
         list: bool,
-        /// 只显示某个命令的参数表。
+        /// Only show the parameters of one command.
         #[arg(long)]
         cmd: Option<String>,
     },
-    /// YSCF 工程配置。
+    /// YSCF project config.
     Yscf {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
-        /// 条目名（如 `$ysbin\yscfg.ybn`），或用 --index。
+        /// Entry name (such as `ysbin\yscfg.ybn`), or use --index.
         #[arg(long)]
         name: Option<String>,
-        /// 条目下标。
+        /// Entry index.
         #[arg(long)]
         index: Option<usize>,
     },
@@ -92,28 +107,28 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum YpfCmd {
-    /// 列出全部条目。
+    /// Lists all entries.
     List {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
-        /// 只显示前 N 条。
+        /// Only show the first N.
         #[arg(long)]
         limit: Option<usize>,
-        /// 文件名 XOR key（缺省从封包推断）。
+        /// Name XOR key (inferred from the archive by default).
         #[arg(long)]
         key: Option<u8>,
     },
-    /// 提取条目。
+    /// Extracts an entry.
     Extract {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
-        /// 条目名。
+        /// Entry name.
         #[arg(long)]
         name: Option<String>,
-        /// 条目下标。
+        /// Entry index.
         #[arg(long)]
         index: Option<usize>,
-        /// 输出文件（缺省打到 stdout）。
+        /// Output file (stdout by default).
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -121,30 +136,30 @@ enum YpfCmd {
 
 #[derive(Subcommand)]
 enum YstbCmd {
-    /// 自动猜测 XOR 密钥。
+    /// Guesses the script XOR key.
     GuessKey {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         index: Option<usize>,
     },
-    /// 打印 header 与槽位统计。
+    /// Prints the header and slot statistics.
     Info {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         index: Option<usize>,
-        /// 4 字节密钥（hex，8 个字符）。
+        /// 4-byte key (8 hex characters).
         #[arg(long)]
         key_hex: Option<String>,
     },
-    /// 打印槽位表。
+    /// Prints the slot table.
     Slots {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
@@ -152,13 +167,14 @@ enum YstbCmd {
         index: Option<usize>,
         #[arg(long)]
         key_hex: Option<String>,
-        /// 只显示前 N 条。
+        /// Only show the first N.
         #[arg(long, default_value_t = 24)]
         limit: usize,
     },
-    /// 按命令组列出:组号、命令名(本游戏 ysc.ybn)、窗口与其指令。
+    /// Lists command groups: group number, command name (from this game's
+    /// ysc.ybn), windows and their instructions.
     Groups {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
@@ -166,16 +182,16 @@ enum YstbCmd {
         index: Option<usize>,
         #[arg(long)]
         key_hex: Option<String>,
-        /// 起始组号。
+        /// First group.
         #[arg(long, default_value_t = 0)]
         from: usize,
-        /// 组数。
+        /// Number of groups.
         #[arg(long, default_value_t = 40)]
         count: usize,
     },
-    /// 反汇编 content 窗口为指令(已证实语义;未知保留 raw)。
+    /// Disassembles content windows (unknown opcodes stay raw).
     Disasm {
-        /// bn.ypf 路径。
+        /// Path to bn.ypf.
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
@@ -183,7 +199,7 @@ enum YstbCmd {
         index: Option<usize>,
         #[arg(long)]
         key_hex: Option<String>,
-        /// 只显示前 N 个窗口。
+        /// Only show the first N windows.
         #[arg(long, default_value_t = 12)]
         limit: usize,
     },
@@ -220,9 +236,9 @@ fn parse_key(hex: &str) -> Result<[u8; 4]> {
     Ok([b[0], b[1], b[2], b[3]])
 }
 
-/// 简易 hex 编码（避免额外依赖）。
+/// Minimal hex decoding (avoids a dependency).
 mod hex {
-    /// 解码 4 字节 hex。
+    /// Decodes hex.
     pub fn decode(s: &str) -> anyhow::Result<Vec<u8>> {
         let s = s.trim();
         if s.len() % 2 != 0 {
@@ -240,9 +256,24 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Boot { dir, key_hex, entry, max_groups, jsonl, strict } => {
+        Cmd::Evb { path } => {
+            let pkg = yuris_format::evb::EvbPackage::open(&path)?
+                .with_context(|| format!("{} is not an Enigma Virtual Box exe or package", path.display()))?;
+            if let Some(ext) = std::fs::read(&path)
+                .ok()
+                .and_then(|b| yuris_format::evb::external_package_name(&b))
+            {
+                println!("external package: {ext}");
+            }
+            println!("{:>10} {:>10}  name", "size", "stored");
+            for f in pkg.files() {
+                println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
+            }
+        }
+        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict } => {
             boot::run(boot::BootArgs {
                 dir,
+                launcher,
                 key: key_hex.as_deref().map(parse_key).transpose()?,
                 entry,
                 max_groups,
@@ -415,7 +446,7 @@ fn main() -> Result<()> {
                         break;
                     }
                     let Ok(w) = f.slot_content(s) else {
-                        println!("slot #{i:<4} tag=0x{:08X} off={:<6} len={:<4} <越界特殊记录>", s.tag, s.offset, s.len);
+                        println!("slot #{i:<4} tag=0x{:08X} off={:<6} len={:<4} <out-of-range special record>", s.tag, s.offset, s.len);
                         shown += 1;
                         continue;
                     };
@@ -467,7 +498,7 @@ fn main() -> Result<()> {
                     shown += 1;
                 }
                 if !unknown_ops.is_empty() {
-                    println!("unknown opcodes: {unknown_ops:?}  (见 docs/opcode/opcode-table.md §未解清单)");
+                    println!("unknown opcodes: {unknown_ops:?}  (see docs/opcode/opcode-table.md)");
                 }
             }
         },
@@ -534,7 +565,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 一条指令的紧凑文本。
+/// One instruction as compact text.
 fn fmt_insn(ins: &yuris_script::Instruction) -> String {
     use yuris_script::{Insn, VarSpace};
     match &ins.kind {

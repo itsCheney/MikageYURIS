@@ -1,25 +1,36 @@
-//! 游戏虚拟文件系统:松散文件 + 若干 YPF 封包。
+//! The game's virtual file system: loose files plus YPF archives, with an
+//! optional Enigma Virtual Box overlay from a translation patch's launcher.
 //!
-//! 查找顺序(引擎侧未逆向,以下为约定):
-//! 1. `save\` 前缀 → 存档目录(默认 `<game>\save`,宿主可改);
-//! 2. 游戏根下的松散文件(补丁常以松散文件覆盖);
-//! 3. 封包:文件名以 `update`/`patch` 开头的先挂载,其余按文件名排序;
-//!    同名条目先挂载者优先。
+//! Lookup order (the engine's own order is not reversed yet; this is our
+//! convention):
+//! 1. `save\` paths go to the save folder (`<game>\save` unless the host
+//!    sets another);
+//! 2. files packed into the launcher exe or its external package (Enigma
+//!    Virtual Box shows them ahead of the real files);
+//! 3. loose files below the game folder (patches often ship loose files);
+//! 4. archives: `update*`/`patch*` first, higher numbers first, then the
+//!    rest by name. For duplicate names the first mounted archive wins.
 //!
-//! 脚本里的路径常省略扩展名(如 `cgsys/main/button/type1/tip_meswindow`),
-//! 由引擎补全,见 [`GameFs::resolve_with_ext`]。
+//! A `.ypf` inside the overlay replaces the real archive at the same path
+//! (Erewhon's CHS patch ships `pac\bn.ypf` and `update9.ypf` that way).
+//!
+//! Scripts often leave out extensions (such as
+//! `cgsys/main/button/type1/tip_meswindow`); the engine completes them, see
+//! [`GameFs::resolve_with_ext`].
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use yuris_core::{Error, Result};
 
+use crate::evb::{external_package_name, EvbFile, EvbPackage};
 use crate::ypf::{normalize_name, YpfEntry, YpfReader};
 
-/// 图像扩展名候选(YSCM CG 族的图像类型)。
+/// Image extensions to try (the image types of the YSCM CG commands).
 pub const IMAGE_EXTS: [&str; 4] = ["png", "bmp", "jpg", "gif"];
 
-/// 游戏文件系统。
+/// The game's file system.
 #[derive(Debug)]
 pub struct GameFs {
     root: PathBuf,
@@ -27,14 +38,56 @@ pub struct GameFs {
     packs: Vec<YpfReader>,
     lookup: HashMap<Vec<u8>, (usize, usize)>,
     loose: HashMap<Vec<u8>, PathBuf>,
-    /// 无法解析而跳过的封包(文件名, 原因)。
+    overlay: Vec<EvbPackage>,
+    virtual_files: HashMap<Vec<u8>, (usize, usize)>,
+    /// Archives and packages that were skipped: (name, reason).
     pub skipped: Vec<(String, String)>,
 }
 
+/// Where a path resolved to.
+enum Hit<'a> {
+    Disk(PathBuf),
+    Virtual(&'a EvbPackage, &'a EvbFile),
+    Pack(&'a YpfReader, &'a YpfEntry),
+}
+
+/// An archive to mount: a real file, or one stored inside an overlay package.
+enum PackSource {
+    File(PathBuf),
+    Packed(usize, usize),
+}
+
+/// Lookup key for a name as Unicode text: scripts name files in CP932.
+fn cp932_key(name: &str) -> Vec<u8> {
+    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(name);
+    normalize_name(&bytes)
+}
+
+/// Mount order of an archive by its file name: `update*`/`patch*` first,
+/// higher numbers first (later patches override earlier ones), then by name.
+fn pack_rank(rel: &[u8]) -> (u8, Reverse<u32>, Vec<u8>) {
+    let file = rel.rsplit(|&b| b == b'\\').next().unwrap_or(rel);
+    let stem = file.strip_suffix(b".ypf").unwrap_or(file);
+    for prefix in [&b"update"[..], b"patch"] {
+        if let Some(rest) = stem.strip_prefix(prefix) {
+            let n = std::str::from_utf8(rest).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            return (0, Reverse(n), rel.to_vec());
+        }
+    }
+    (1, Reverse(0), rel.to_vec())
+}
+
 impl GameFs {
-    /// 扫描游戏目录:`<game>\*.ypf` 与 `<game>\pac\*.ypf`。
-    /// 传入 `pac` 目录本身时,上溯一级作为游戏根。
+    /// Scans a game folder: `<game>\*.ypf` and `<game>\pac\*.ypf`. Given the
+    /// `pac` folder itself, its parent is the game folder.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with_launcher(dir, None)
+    }
+
+    /// Like [`GameFs::open`], also mounting the files a launcher exe packed
+    /// with Enigma Virtual Box carries, in the exe itself or in the external
+    /// package it names. Their paths are relative to the game folder.
+    pub fn open_with_launcher(dir: &Path, launcher: Option<&Path>) -> Result<Self> {
         let is_pac = dir
             .file_name()
             .map(|n| n.eq_ignore_ascii_case("pac"))
@@ -47,41 +100,67 @@ impl GameFs {
         if !root.is_dir() {
             return Err(Error::format(format!("not a directory: {}", root.display())));
         }
-        let mut found: Vec<PathBuf> = Vec::new();
-        for sub in [root.clone(), root.join("pac")] {
-            let Ok(rd) = std::fs::read_dir(&sub) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
-                let is_ypf = p
-                    .extension()
-                    .map(|x| x.eq_ignore_ascii_case("ypf"))
-                    .unwrap_or(false);
-                if is_ypf && p.is_file() {
-                    found.push(p);
-                }
-            }
-        }
-        found.sort_by_key(|p| {
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            let patch = name.starts_with("update") || name.starts_with("patch");
-            (!patch, name)
-        });
-
         let mut fs = Self {
             save_dir: root.join("save"),
             root,
             packs: Vec::new(),
             lookup: HashMap::new(),
             loose: HashMap::new(),
+            overlay: Vec::new(),
+            virtual_files: HashMap::new(),
             skipped: Vec::new(),
         };
+        if let Some(exe) = launcher {
+            fs.load_overlay(exe)?;
+        }
+
+        // Archives by their path below the game folder; overlay ones replace
+        // real ones at the same path.
+        let mut found: HashMap<Vec<u8>, (String, PackSource)> = HashMap::new();
+        for (sub, prefix) in [(fs.root.clone(), ""), (fs.root.join("pac"), "pac\\")] {
+            let Ok(rd) = std::fs::read_dir(&sub) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                let is_ypf = p
+                    .extension()
+                    .map(|x| x.eq_ignore_ascii_case("ypf"))
+                    .unwrap_or(false);
+                if is_ypf && p.is_file() {
+                    found.insert(cp932_key(&format!("{prefix}{name}")), (name, PackSource::File(p)));
+                }
+            }
+        }
+        let mut virtual_files = HashMap::new();
+        for (pi, pkg) in fs.overlay.iter().enumerate() {
+            let pkg_name = pkg.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            for (fi, f) in pkg.files().iter().enumerate() {
+                let key = cp932_key(&f.name);
+                if !key.ends_with(b".ypf") {
+                    virtual_files.entry(key).or_insert((pi, fi));
+                } else if !f.is_plain() {
+                    // Compressed archives would have to be unpacked whole first.
+                    fs.skipped.push((format!("{pkg_name}:{}", f.name), "compressed in its package".into()));
+                } else if !found.get(&key).is_some_and(|(_, s)| matches!(s, PackSource::Packed(..))) {
+                    found.insert(key, (format!("{pkg_name}:{}", f.name), PackSource::Packed(pi, fi)));
+                }
+            }
+        }
+        fs.virtual_files = virtual_files;
+
+        let mut found: Vec<_> = found.into_iter().collect();
+        found.sort_by_key(|(rel, _)| pack_rank(rel));
         fs.index_loose();
-        for p in found {
-            let label = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            match YpfReader::open(&p, None) {
+        for (_, (label, source)) in found {
+            let opened = match source {
+                PackSource::File(p) => YpfReader::open(&p, None),
+                PackSource::Packed(pi, fi) => {
+                    let pkg = &fs.overlay[pi];
+                    let f = &pkg.files()[fi];
+                    YpfReader::open_at(pkg.path(), f.offset, f.size, label.clone(), None)
+                }
+            };
+            match opened {
                 Ok(r) => fs.mount(r),
                 Err(e) => fs.skipped.push((label, e.to_string())),
             }
@@ -89,7 +168,30 @@ impl GameFs {
         Ok(fs)
     }
 
-    /// 挂载一个封包(优先级低于已挂载者)。
+    fn load_overlay(&mut self, exe: &Path) -> Result<()> {
+        if let Some(pkg) = EvbPackage::open(exe)? {
+            if !pkg.files().is_empty() {
+                self.overlay.push(pkg);
+            }
+        }
+        let Some(name) = external_package_name(&std::fs::read(exe)?) else {
+            return Ok(());
+        };
+        let folder = exe.parent().unwrap_or(&self.root);
+        let path = folder.join(&name);
+        if !path.is_file() {
+            self.skipped.push((name, "external package missing".into()));
+            return Ok(());
+        }
+        match EvbPackage::open(&path) {
+            Ok(Some(pkg)) => self.overlay.push(pkg),
+            Ok(None) => self.skipped.push((name, "not an Enigma Virtual Box package".into())),
+            Err(e) => self.skipped.push((name, e.to_string())),
+        }
+        Ok(())
+    }
+
+    /// Mounts an archive, below the ones already mounted.
     pub fn mount(&mut self, pack: YpfReader) {
         let pi = self.packs.len();
         for (ei, e) in pack.index().entries.iter().enumerate() {
@@ -98,27 +200,34 @@ impl GameFs {
         self.packs.push(pack);
     }
 
-    /// 游戏根目录。
+    /// The game folder.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// 已挂载的封包。
+    /// Mounted archives, highest priority first.
     pub fn packs(&self) -> &[YpfReader] {
         &self.packs
     }
 
-    /// 设置存档目录(`save\` 前缀映射到此)。
+    /// Mounted Enigma Virtual Box packages (launcher exe, external package).
+    pub fn overlay(&self) -> &[EvbPackage] {
+        &self.overlay
+    }
+
+    /// Sets the save folder that `save\` paths map to.
     pub fn set_save_dir(&mut self, dir: PathBuf) {
         self.save_dir = dir;
     }
 
-    /// 存档目录。
+    /// The save folder.
     pub fn save_dir(&self) -> &Path {
         &self.save_dir
     }
 
-    /// 重新索引游戏根下的松散文件(忽略大小写;存档目录不在索引内,实时查)。
+    /// Re-indexes loose files below the game folder, ignoring case. Names
+    /// are keyed in CP932 like the scripts. The save folder is not indexed;
+    /// it is checked live.
     pub fn index_loose(&mut self) {
         fn walk(dir: &Path, rel: &str, depth: usize, out: &mut HashMap<Vec<u8>, PathBuf>) {
             let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -131,7 +240,7 @@ impl GameFs {
                         walk(&p, &r, depth + 1, out);
                     }
                 } else {
-                    out.insert(normalize_name(r.as_bytes()), p);
+                    out.insert(cp932_key(&r), p);
                 }
             }
         }
@@ -139,39 +248,61 @@ impl GameFs {
         walk(&self.root, "", 0, &mut self.loose);
     }
 
-    fn loose_path(&self, norm: &[u8]) -> Option<PathBuf> {
+    fn locate(&self, norm: &[u8]) -> Option<Hit<'_>> {
         if let Some(rest) = norm.strip_prefix(b"save\\") {
-            let p = self.save_dir.join(String::from_utf8_lossy(rest).replace('\\', "/"));
-            return p.is_file().then_some(p);
+            let (rest, _, _) = encoding_rs::SHIFT_JIS.decode(rest);
+            let p = self.save_dir.join(rest.replace('\\', "/"));
+            if p.is_file() {
+                return Some(Hit::Disk(p));
+            }
         }
-        self.loose.get(norm).cloned()
-    }
-
-    fn pack_entry(&self, norm: &[u8]) -> Option<(&YpfReader, &YpfEntry)> {
+        if let Some(&(pi, fi)) = self.virtual_files.get(norm) {
+            let pkg = &self.overlay[pi];
+            return Some(Hit::Virtual(pkg, &pkg.files()[fi]));
+        }
+        if norm.starts_with(b"save\\") {
+            return None;
+        }
+        if let Some(p) = self.loose.get(norm) {
+            return Some(Hit::Disk(p.clone()));
+        }
         let &(pi, ei) = self.lookup.get(norm)?;
         let pack = &self.packs[pi];
-        Some((pack, &pack.index().entries[ei]))
+        Some(Hit::Pack(pack, &pack.index().entries[ei]))
     }
 
-    /// 文件是否存在(松散或封包内)。
+    /// Every file name visible through the layers above, normalized (see
+    /// [`normalize_name`]), without duplicates; save files are not listed.
+    pub fn file_names(&self) -> Vec<Vec<u8>> {
+        let mut names: Vec<Vec<u8>> = self
+            .virtual_files
+            .keys()
+            .chain(self.loose.keys())
+            .chain(self.lookup.keys())
+            .cloned()
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Whether a file exists (in any layer).
     pub fn exists(&self, path: &str) -> bool {
-        let norm = normalize_name(path.as_bytes());
-        self.loose_path(&norm).is_some() || self.lookup.contains_key(&norm)
+        self.locate(&normalize_name(path.as_bytes())).is_some()
     }
 
-    /// 读取文件(解压后)。
+    /// Reads a file, unpacked.
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let norm = normalize_name(path.as_bytes());
-        if let Some(p) = self.loose_path(&norm) {
-            return Ok(std::fs::read(p)?);
-        }
-        match self.pack_entry(&norm) {
-            Some((pack, e)) => pack.read_entry(e),
+        match self.locate(&normalize_name(path.as_bytes())) {
+            Some(Hit::Disk(p)) => Ok(std::fs::read(p)?),
+            Some(Hit::Virtual(pkg, f)) => pkg.read(f),
+            Some(Hit::Pack(pack, e)) => pack.read_entry(e),
             None => Err(Error::format(format!("file not found: {path}"))),
         }
     }
 
-    /// 补扩展名解析:原名存在则原名,否则依次尝试 `exts`。返回命中的路径。
+    /// Resolves a path that may lack its extension: the path itself if it
+    /// exists, otherwise the first of `exts` that does.
     pub fn resolve_with_ext(&self, path: &str, exts: &[&str]) -> Option<String> {
         if self.exists(path) {
             return Some(path.to_string());
@@ -181,26 +312,27 @@ impl GameFs {
             .find(|c| self.exists(c))
     }
 
-    /// 图像宽高(读文件头;PNG / BMP / JPEG)。路径可省略扩展名。
+    /// Image width and height from the file header (PNG, BMP, JPEG). The
+    /// extension may be left out.
     pub fn image_size(&self, path: &str) -> Option<(u32, u32)> {
         let hit = self.resolve_with_ext(path, &IMAGE_EXTS)?;
-        let norm = normalize_name(hit.as_bytes());
-        let head = if let Some(p) = self.loose_path(&norm) {
-            use std::io::Read;
-            let mut f = std::fs::File::open(p).ok()?;
-            let mut buf = vec![0u8; 64 * 1024];
-            let n = f.read(&mut buf).ok()?;
-            buf.truncate(n);
-            buf
-        } else {
-            let (pack, e) = self.pack_entry(&norm)?;
-            pack.read_prefix(e, 64 * 1024).ok()?
+        let head = match self.locate(&normalize_name(hit.as_bytes()))? {
+            Hit::Disk(p) => {
+                use std::io::Read;
+                let mut f = std::fs::File::open(p).ok()?;
+                let mut buf = vec![0u8; 64 * 1024];
+                let n = f.read(&mut buf).ok()?;
+                buf.truncate(n);
+                buf
+            }
+            Hit::Virtual(pkg, f) => pkg.read(f).ok()?,
+            Hit::Pack(pack, e) => pack.read_prefix(e, 64 * 1024).ok()?,
         };
         image_header_size(&head)
     }
 }
 
-/// 从文件头解析图像宽高。
+/// Image width and height from a file header.
 pub fn image_header_size(h: &[u8]) -> Option<(u32, u32)> {
     if h.len() >= 24 && h[..8] == *b"\x89PNG\r\n\x1a\n" {
         let w = u32::from_be_bytes(h[16..20].try_into().ok()?);
@@ -213,7 +345,7 @@ pub fn image_header_size(h: &[u8]) -> Option<(u32, u32)> {
         return Some((w.unsigned_abs(), hh.unsigned_abs()));
     }
     if h.len() >= 4 && h[..2] == [0xFF, 0xD8] {
-        // 逐段找 SOFn
+        // Walk the segments up to a SOFn marker.
         let mut i = 2;
         while i + 9 < h.len() {
             if h[i] != 0xFF {
@@ -273,6 +405,61 @@ mod tests {
         let mut fs = fs;
         fs.index_loose();
         assert_eq!(fs.read("ysbin\\ysc.ybn").unwrap(), b"loose");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn launcher_package_overlays_the_game() {
+        let dir = std::env::temp_dir().join(format!("gamefs-evb-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pac")).unwrap();
+        let ypf = |files: &[(&[u8], &[u8])]| {
+            let files: Vec<(&[u8], u8, bool, &[u8])> = files.iter().map(|&(n, d)| (n, 0, false, d)).collect();
+            build(481, 0xFF, true, NameHash::Murmur2, &files)
+        };
+        std::fs::write(
+            dir.join("pac/bn.ypf"),
+            ypf(&[(b"ysbin\\ysc.ybn", b"jp"), (b"ysbin\\only_jp.ybn", b"jp")]),
+        )
+        .unwrap();
+        std::fs::write(dir.join("pac/update1.ypf"), ypf(&[(b"ysbin\\x.ybn", b"u1")])).unwrap();
+        let chs_bn = ypf(&[(b"ysbin\\ysc.ybn", b"chs")]);
+        let update9 = ypf(&[(b"ysbin\\x.ybn", b"u9")]);
+        let tip = png(4, 3);
+        let pkg = crate::evb::build_package(&[
+            ("update9.ypf", &update9),
+            ("pac/bn.ypf", &chs_bn),
+            ("save/config.sd", b"default config"),
+            ("cg/tip.png", &tip),
+        ]);
+        std::fs::write(dir.join("chs.mys"), pkg).unwrap();
+        let mut exe = vec![0u8; 0x40];
+        exe[..2].copy_from_slice(b"MZ");
+        for u in " %DEFAULT FOLDER%\\chs.mys".encode_utf16() {
+            exe.extend(u.to_le_bytes());
+        }
+        exe.extend(b"EVB\0");
+        std::fs::write(dir.join("game_chs.exe"), exe).unwrap();
+
+        let fs = GameFs::open_with_launcher(&dir, Some(&dir.join("game_chs.exe"))).unwrap();
+        assert!(fs.skipped.is_empty(), "{:?}", fs.skipped);
+        assert_eq!(fs.overlay().len(), 1);
+        let names: Vec<_> = fs.packs().iter().map(|p| p.name()).collect();
+        assert_eq!(names, ["chs.mys:update9.ypf", "update1.ypf", "chs.mys:pac/bn.ypf"]);
+        // The packaged bn.ypf replaces the real one instead of stacking on it.
+        assert_eq!(fs.read("ysbin\\ysc.ybn").unwrap(), b"chs");
+        assert!(!fs.exists("ysbin\\only_jp.ybn"));
+        assert_eq!(fs.read("ysbin\\x.ybn").unwrap(), b"u9");
+        assert_eq!(fs.image_size("cg/tip"), Some((4, 3)));
+        assert_eq!(fs.read("save\\config.sd").unwrap(), b"default config");
+        std::fs::create_dir_all(dir.join("save")).unwrap();
+        std::fs::write(dir.join("save/config.sd"), b"saved").unwrap();
+        assert_eq!(fs.read("save\\config.sd").unwrap(), b"saved");
+
+        // Without the launcher the real archives are used.
+        let plain = GameFs::open(&dir).unwrap();
+        assert_eq!(plain.read("ysbin\\ysc.ybn").unwrap(), b"jp");
+        assert_eq!(plain.read("ysbin\\x.ybn").unwrap(), b"u1");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

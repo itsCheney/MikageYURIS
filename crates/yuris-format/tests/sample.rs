@@ -39,7 +39,7 @@ fn ypf_parses_309_entries_and_closes_exactly() {
     assert_eq!(ypf.header().file_count, 309);
     assert_eq!(ypf.entries().len(), 309);
     assert_eq!(ypf.header().header_size, 0x3655);
-    // 0x20 处的 u32 = 首条 name_hash = murmur2("ysbin\yst00034.ybn")
+    // The u32 at 0x20 is the first name_hash = murmur2("ysbin\yst00034.ybn")
     assert_eq!(ypf.entries()[0].name_hash, 0x0033_AE52);
     assert_eq!(ypf.index().name_key, 0xC9);
 
@@ -62,7 +62,7 @@ fn ypf_engine_entries_have_expected_magics() {
 
     // 样本实测：5 个引擎数据条目，解压后 magic 各不相同（PROGRESS.md 成果 1）
     let expect: &[(&str, &[u8; 4])] = &[
-        ("ysbin\\ysc.ybn", b"YSCM"), // ★ Opcode/参数名表
+        ("ysbin\\ysc.ybn", b"YSCM"), // command and parameter names
         ("ysbin\\yscfg.ybn", b"YSCF"),
         ("ysbin\\yse.ybn", b"YSER"),
         ("ysbin\\ysl.ybn", b"YSLB"),

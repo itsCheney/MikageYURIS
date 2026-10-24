@@ -1,5 +1,6 @@
-//! `yuris boot`:无画面跑启动链,报告游戏文件、版本、密钥,以及 VM 在
-//! 遇到第一个停点前走了多远、哪些命令还没实现。新游戏接入的第一步。
+//! `yuris boot`: runs the boot chain headless and reports the game files,
+//! versions and key, how far the VM gets before it stops, and which commands
+//! are not implemented yet. The first step when bringing up a new game.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -14,9 +15,10 @@ use yuris_vm::boot::Bootstrap;
 use yuris_vm::host::{list_script_ids, script_path};
 use yuris_vm::{ResumeResponse, VmEvent, VmSuspend};
 
-/// 启动参数。
+/// Options for `yuris boot`.
 pub struct BootArgs {
     pub dir: PathBuf,
+    pub launcher: Option<PathBuf>,
     pub key: Option<[u8; 4]>,
     pub entry: Option<String>,
     pub max_groups: usize,
@@ -29,13 +31,17 @@ fn hex(k: &[u8]) -> String {
 }
 
 pub fn run(args: BootArgs) -> Result<()> {
-    let fs = GameFs::open(&args.dir).with_context(|| format!("open {}", args.dir.display()))?;
+    let fs = GameFs::open_with_launcher(&args.dir, args.launcher.as_deref())
+        .with_context(|| format!("open {}", args.dir.display()))?;
     println!("game root: {}", fs.root().display());
+    for pkg in fs.overlay() {
+        println!("  overlay {} ({} files)", pkg.path().display(), pkg.files().len());
+    }
     for p in fs.packs() {
         let idx = p.index();
         println!(
-            "  pack {:<16} v{} {:>6} entries  name_key={:#04x} wide={} hash={:?}",
-            p.path().file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+            "  pack {:<24} v{} {:>6} entries  name_key={:#04x} wide={} hash={:?}",
+            p.name(),
             idx.header.version,
             idx.entries.len(),
             idx.name_key,
@@ -80,7 +86,7 @@ pub fn run(args: BootArgs) -> Result<()> {
         booted.entry_pc,
         booted.applied_ysvr
     );
-    // 抽查:用该密钥解析所有脚本,报告解析失败数(密钥或版本不对时会大面积失败)
+    // Parse every script with the key; a wrong key or version fails most of them.
     let bad = ids
         .iter()
         .filter(|&&id| {

@@ -1,14 +1,13 @@
-//! 启动链编排器(P0 第3项)。
+//! Boot chain.
 //!
-//! 引擎启动链(成果 25,FUN_0046b63c,Confirmed):
-//! `YSCM 命令表 → 变量描述符分配 → 载 YSVR → 应用初始值 → 哈希查入口标签
-//! → 建任务 → 加载脚本 → 运行`。
+//! The engine boots (FUN_0046b63c): YSCM command table -> variable
+//! descriptors -> load YSVR -> apply initial values -> look up the entry
+//! label by hash -> create the task -> load the script -> run.
 //!
-//! 本模块把现有件串联:[`GameFs`](游戏文件系统) +
-//! [`YslbTable`](标签表查找入口) + [`FsScriptHost`](加载目标脚本) +
-//! [`GroupVm`](执行)。入口标签由调用方给定(缺省从 YSLB 找 `SYSTEM_START`)。
-//!
-//! **铁律**:Unknown 不猜;各步若缺证据则返回 `Error::Unimplemented`。
+//! This module ties the parts together: [`GameFs`] (game files),
+//! [`YslbTable`] (entry label lookup), [`FsScriptHost`] (script loading) and
+//! [`GroupVm`] (execution). The caller may name the entry label; by default
+//! it is `SYSTEM_START` from YSLB.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,36 +22,37 @@ use crate::GroupVm;
 use yuris_value::Value;
 use crate::host::{guess_script_key, ScriptHost, FsScriptHost};
 
-/// 启动配置。
+/// Boot options.
 pub struct Bootstrap {
-    /// 游戏文件系统。
+    /// The game's file system.
     pub fs: Arc<GameFs>,
-    /// 脚本 XOR 密钥;None = 从脚本推断([`guess_script_key`])。
+    /// Script XOR key; None guesses it from the scripts ([`guess_script_key`]).
     pub key: Option<[u8; 4]>,
-    /// 执行入口标签名(缺省从 YSLB 查 `SYSTEM_START`)。
+    /// Entry label (`SYSTEM_START` from YSLB by default).
     pub entry_label: Option<Vec<u8>>,
 }
 
-/// 启动结果:已初始化的 VM(尚未 run)。
+/// Boot result: an initialized VM that has not run yet.
 pub struct Booted {
-    /// 就绪的 GroupVm(已绑定 Host + 标签表 + 入口脚本)。
+    /// The VM, with host, labels and entry script set.
     pub vm: GroupVm,
-    /// 当前脚本号(入口脚本)。
+    /// Entry script id.
     pub script_id: u16,
-    /// 入口组下标。
+    /// Entry group index.
     pub entry_pc: u32,
-    /// 已应用的 YSVR 条目数(若提供了 YSLB/YSVR,否则 0 —— 见 [`Bootstrap::boot`])。
+    /// Number of YSVR initial values applied.
     pub applied_ysvr: usize,
-    /// 实际使用的脚本密钥。
+    /// The script key in use.
     pub key: [u8; 4],
 }
 
 impl Bootstrap {
-    /// 编排启动链,返回就绪的 [`GroupVm`]。
+    /// Runs the boot chain and returns a ready [`GroupVm`].
     ///
-    /// - 从文件系统读 YSLB+脚本;若提供了标签表/初值表则一并接入。
-    /// - 缺省入口标签 = `SYSTEM_START`。
-    /// - 文件系统同时作为 VM 的文件探针(FILEINFO / CGINFO / LOAD)。
+    /// - Reads YSLB, YSVR, YSCM and the scripts from the file system.
+    /// - The default entry label is `SYSTEM_START`.
+    /// - The file system also answers the VM's file queries (FILEINFO,
+    ///   CGINFO, LOAD).
     pub fn boot(self) -> Result<Booted> {
         let key = match self.key {
             Some(k) => k,
@@ -62,44 +62,46 @@ impl Bootstrap {
         let yslb_data = host.read_entry("ysbin\\ysl.ybn")?;
         let yslb = YslbTable::from_bytes(&yslb_data)?;
 
-        // 入口标签名
+        // Entry label
         let entry: &[u8] = self.entry_label.as_deref().unwrap_or(b"SYSTEM_START");
         let entry_idx = yslb.find(entry).ok_or_else(|| {
-            Error::format(format!("入口标签不存在: {:?}", String::from_utf8_lossy(entry)))
+            Error::format(format!("entry label not found: {:?}", String::from_utf8_lossy(entry)))
         })?;
         let label = &yslb.labels()[entry_idx];
         let (entry_pc, script_id) = (label.target_pc, label.script_id);
 
-        // 预读 YSVR(在 host move 进 Box 前完成所有借用)
+        // Read YSVR before the host moves into the VM.
         let ysvr_data = host.read_entry("ysbin\\ysv.ybn")?;
         let ysvr = yuris_format::ysvr::YsvrTable::from_bytes(&ysvr_data)?;
 
         let ctx = host.load(script_id)?;
 
-        // 命令表:脚本里的命令下标是本游戏 ysc.ybn 的顺序,按名字换算成规范下标
+        // Scripts index commands in this game's ysc.ybn order; map them to the
+        // canonical order by name.
         let cmd_map = Arc::new(match host.read_entry("ysbin\\ysc.ybn") {
             Ok(b) => CommandMap::from_yscm(&YscmTable::from_bytes(&b)?),
             Err(_) => CommandMap::identity(),
         });
 
-        // 构建单脚本 VM(装载入口脚本)
+        // VM with the entry script loaded
         let mut vm = GroupVm::load(ctx.script)?;
         vm.set_command_map(cmd_map.clone());
         vm.set_script_id(script_id);
 
-        // 注入标签表(name → (target_pc, script_id))
+        // Labels: name -> (target_pc, script_id)
         let mut labels: HashMap<Vec<u8>, (u32, u16)> = HashMap::new();
         for l in yslb.labels() {
             labels.insert(l.name.clone(), (l.target_pc, l.script_id));
         }
         vm.set_labels(labels);
 
-        // 全量声明消费:引擎变量描述符表全局共享,启动时消费全部脚本的
-        // 标量声明组(INT/FLT/STR;端到端证据:未消费则启动链读 @1417/@6292 报
-        // 「未定义变量」)。声明在前,YSVR 初值在后。(host move 前完成)
-        // 消费后**标记已消费**:运行期 switch_script 不得重消费 —— 重消费会
-        // 用声明期边界(expr+1)重建数组,覆盖 YSVR 终态(如 s47 $2729 YSVR
-        // bounds=[1] 被刷回 [2],按钮表整体错位一槽;成果 59)。
+        // Consume the declarations (INT/FLT/STR) of every script up front:
+        // the engine's variable descriptors are global, and without this the
+        // boot chain reads undefined variables (@1417, @6292). Declarations
+        // come before the YSVR initial values. Each script is marked as
+        // consumed so switch_script does not redo it: redoing it would
+        // rebuild arrays with their declared bounds and overwrite the YSVR
+        // state (s47 $2729 bounds [1] reset to [2] shifts a button table).
         {
             let mut n = 0usize;
             for sid in host.script_ids()? {
@@ -111,19 +113,19 @@ impl Bootstrap {
             let _ = n;
         }
 
-        // 绑定 host(此后跨脚本可用)
+        // The host serves cross-script calls from here on.
         vm.set_host(Box::new(host));
         vm.set_file_probe(self.fs.clone());
 
-        // 应用 YSVR 全局初值(启动链「应用初值」步;须在声明之后,否则覆盖初值)。
-        // kind1+kind3 在此应用;kind2 暂存,由入口脚本/switch_script 首载应用。
+        // YSVR initial values, after the declarations. Kinds 1 and 3 apply
+        // here; kind 2 applies when its script first loads.
         let applied_ysvr = vm.apply_ysvr(&ysvr)?;
         vm.apply_ysvr_for_script(script_id)?;
 
-        // 注:$1045(存档目录串)引擎侧 = $105 = YSVR 空串(引擎经 VFS 原生
-        // 前缀探测命中 save/*.sd,与 $1045 无关;成果 59e)—— 不在此种子。
+        // $1045 (the save folder string) stays the empty YSVR value: the
+        // engine finds save/*.sd through its VFS, not through $1045.
 
-        // 入口组:引擎先取后增,直接设入口组
+        // The engine fetches then increments, so start at the entry group.
         vm.set_pc(entry_pc as usize);
 
         Ok(Booted {

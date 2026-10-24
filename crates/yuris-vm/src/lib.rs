@@ -574,9 +574,10 @@ pub struct IfFrame {
 /// 占位图)、occ2 = 1350.0(= `tip_meswindow_txspace.png`,1350×200 消息窗
 /// 纹理);两图均经封包扫描确认存在(`yuris-resource` dims_probe)。
 /// g1092 IF `SX==1 && SY==1 && COLOR==0x808080` = 「是 1×1 占位图」判定。
-/// 本模型:CG 命令 FILE 槽(46)非空 → 经 `GameFs::image_size` 解析
-/// 图像头填 [`img_w`](CgState::img_w)/[`img_h`](CgState::img_h);
-/// 不可解析(无探针/非 stored PNG)→ 0(偏离引擎处逐项定性)。
+/// Here: when the CG command's FILE slot (46) is set, `GameFs::image_size`
+/// reads the image header into [`img_w`](CgState::img_w) /
+/// [`img_h`](CgState::img_h); an unreadable image (no file probe, or a format
+/// without a parsed header) gives 0.
 /// 缩放乘积(若有)未验证 —— 应答值与图像尺寸逐字节吻合,乘数 = 1。
 ///
 /// sx/sy(CG 槽9/10)与图像尺寸**无关**(旧「默认 SX=1/SY=1 应答」模型
@@ -627,7 +628,7 @@ impl Default for CgState {
 pub struct GroupVm {
     /// 当前脚本上下文(组表 + 窗口起始)。
     ctx: ScriptCtx,
-    /// 游戏命令下标 → 规范下标(见 [`commands`])。
+    /// Game command index -> canonical index (see [`commands`]).
     cmd_map: std::sync::Arc<commands::CommandMap>,
     /// 跨脚本宿主(按脚本号取上下文);None = 单脚本模式。
     host: Option<Box<dyn ScriptHost>>,
@@ -653,7 +654,7 @@ pub struct GroupVm {
     ysvr_kind2: Vec<yuris_format::ysvr::YsvrEntry>,
     /// 已应用 kind2 的脚本号。
     ysvr_kind2_applied: std::collections::HashSet<u16>,
-    /// 游戏虚拟 FS 存在性索引(FILEINFO EXIST;见 `yuris_format::vfs::GameFs`)。
+    /// The game's file system, for FILEINFO EXIST, CGINFO sizes and LOAD.
     file_probe: Option<std::sync::Arc<yuris_format::vfs::GameFs>>,
     /// 命名任务注册表(TASK 创建 → TASKINFO EXIST 查询;引擎 FUN_0040ca7d
     /// 按名查找的等价面。任务的实际执行经 GOSUB 标签链顺序进入 —— 引擎
@@ -725,14 +726,14 @@ impl GroupVm {
         })
     }
 
-    /// 设置命令表映射,并换算当前已载入的脚本(须在载入后、执行前调用一次)。
-    /// 此后跨脚本载入的脚本自动换算。
+    /// Sets the command map and remaps the loaded script (call once, after
+    /// loading and before running). Scripts loaded later are remapped too.
     pub fn set_command_map(&mut self, map: std::sync::Arc<commands::CommandMap>) {
         map.remap(&mut self.ctx);
         self.cmd_map = map;
     }
 
-    /// 命令表映射(事件里的命令码经它转名字)。
+    /// The command map (names the command codes in events).
     pub fn command_map(&self) -> &commands::CommandMap {
         &self.cmd_map
     }
@@ -2843,10 +2844,11 @@ impl GroupVm {
                     // FILEINFO(0x15,引擎 0043eb28):FOLDER(0)/FILE(1)/
                     // CGFILE(2)/SOUNDFILE(3) = 路径源;EXIST(4)/SIZE(5)/
                     // RELATION(6) = 查询项;LET(7) = 写回目标。
-                    // 本实现:EXIST+FILE+LET → 虚拟 FS 存在性
-                    // (`GameFs`;实证 s207 es.R18Check:引擎查
-                    // `cg/thumb_cg/A_HAN_2002_a.png` 得 1)。无 probe → 不写
-                    // 回,事件记 err(诚实缺省)。其余查询项出现时再逆向。
+                    // Implemented: EXIST + FILE + LET asks `GameFs` whether
+                    // the file exists (s207 es.R18Check: the engine finds
+                    // `cg/thumb_cg/A_HAN_2002_a.png` and gets 1). Without a
+                    // file probe nothing is written back and the event
+                    // records an error. Other queries are reversed as needed.
                     if other == 0x15 {
                         let mut path: Option<String> = None;
                         let mut exist = false;
@@ -3336,7 +3338,8 @@ impl GroupVm {
             return Ok(None);
         }
         let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
-            // 溢出窗(池尾外) → 视为损坏(状态由 run 统一处理:部分调用方只记录错误后继续)
+            // A window past the pool end is corrupt. `run` sets the error
+            // state; some callers only record the error and carry on.
             return Err(Error::format(format!(
                 "窗口 {}+{} 越过 content+part4 池尾",
                 w.offset, w.len
@@ -3687,10 +3690,11 @@ impl GroupVm {
             return Err(self.halt_err(
                 self.pc,
                 cmd::LOAD,
-                "LOAD 需要文件源(GameFs 未注入;引擎 VFS 语义)",
+                "LOAD needs a file source (no GameFs set)",
             ));
         };
-        // 引擎 VFS 会在 save\ 下找存档(成果 59e),故原名找不到时再试 save\ 前缀。
+        // The engine's VFS also finds saves under save\, so try that prefix
+        // when the plain name is missing.
         let found = probe.read(&name).or_else(|_| probe.read(&format!("save\\{name}")));
         let Ok(bytes) = found else {
             return Err(self.halt_err(
@@ -4319,13 +4323,13 @@ impl GroupVm {
                 }
             }
             Some(14) => {
-                // SEARCH(引擎 CMDH_004550a0 ae 支):在 SET 数组元素中从
-                // NO(20) 起线性查找 key(INT=17 / FLT=18 / STR=19),返回首个
-                // 匹配下标(0 基);未命中返回 -1。
-                // 等级:Likely(分支汇编逐行,参数槽号取自 YSCM 参数名)。
-                // 未命中值勘误(2026-10-24):旧实现返回元素个数;Erewhon(v481)的
-                // es.BT.NO.GET(yst00010 组 3-4)以 `IF @1728 != -1` 判未命中,
-                // 返回个数会让调用方拿它当下标越界(yst00007 组 79)。
+                // SEARCH (engine CMDH_004550a0, branch ae): searches the SET
+                // array from NO (20) for the key (INT=17 / FLT=18 / STR=19)
+                // and returns the first matching index (0-based), or -1.
+                // The upstream code returned the element count on a miss;
+                // Erewhon's es.BT.NO.GET (yst00010 groups 3-4) tests
+                // `IF @1728 != -1`, and the count was then used as an
+                // out-of-range index (yst00007 group 79).
                 let key = slot_vals
                     .iter()
                     .find(|(s, _)| *s == 17 || *s == 18 || *s == 19)
