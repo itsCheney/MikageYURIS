@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 
 pub mod boot;
+pub mod commands;
 pub mod host;
 
 use yuris_core::{Error, Result};
@@ -626,6 +627,8 @@ impl Default for CgState {
 pub struct GroupVm {
     /// 当前脚本上下文(组表 + 窗口起始)。
     ctx: ScriptCtx,
+    /// 游戏命令下标 → 规范下标(见 [`commands`])。
+    cmd_map: std::sync::Arc<commands::CommandMap>,
     /// 跨脚本宿主(按脚本号取上下文);None = 单脚本模式。
     host: Option<Box<dyn ScriptHost>>,
     /// 程序计数器 = 组下标。
@@ -693,6 +696,7 @@ impl GroupVm {
         let ctx = ScriptCtx::parse(0, script)?;
         Ok(Self {
             ctx,
+            cmd_map: std::sync::Arc::new(commands::CommandMap::identity()),
             host: None,
             pc: 0,
             state: VmState::Idle,
@@ -719,6 +723,18 @@ impl GroupVm {
             tasks: std::collections::HashSet::new(),
             cg_registry: HashMap::new(),
         })
+    }
+
+    /// 设置命令表映射,并换算当前已载入的脚本(须在载入后、执行前调用一次)。
+    /// 此后跨脚本载入的脚本自动换算。
+    pub fn set_command_map(&mut self, map: std::sync::Arc<commands::CommandMap>) {
+        map.remap(&mut self.ctx);
+        self.cmd_map = map;
+    }
+
+    /// 命令表映射(事件里的命令码经它转名字)。
+    pub fn command_map(&self) -> &commands::CommandMap {
+        &self.cmd_map
     }
 
     /// 绑定跨脚本宿主(启用跨脚本 GO/GOSUB)。
@@ -940,6 +956,14 @@ impl GroupVm {
     /// - pc 走完所有组 → [`VmSuspend::Complete`](VmSuspend::Complete)(`Finished`)
     /// - Unsupported(strict)/求值错误 → [`VmSuspend::Error`](VmSuspend::Error)
     pub fn run(&mut self, budget: usize) -> Result<VmSuspend> {
+        let r = self.run_inner(budget);
+        if r.is_err() {
+            self.state = VmState::Error;
+        }
+        r
+    }
+
+    fn run_inner(&mut self, budget: usize) -> Result<VmSuspend> {
         match self.state {
             VmState::Finished => return Ok(VmSuspend::Complete),
             VmState::Error => {
@@ -3170,7 +3194,8 @@ impl GroupVm {
                 "跨脚本跳转到 script {script_id} 但未绑定 ScriptHost"
             )));
         };
-        let new_ctx = host.load(script_id)?;
+        let mut new_ctx = host.load(script_id)?;
+        self.cmd_map.remap(&mut new_ctx);
         self.ctx = new_ctx;
         self.pc = target_pc;
         // 引擎加载脚本时消费其声明组(INT/FLT/STR 建立变量,Confirmed 形态)。
@@ -3311,8 +3336,7 @@ impl GroupVm {
             return Ok(None);
         }
         let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
-            // 溢出窗(池尾外) → 视为损坏
-            self.state = VmState::Error;
+            // 溢出窗(池尾外) → 视为损坏(状态由 run 统一处理:部分调用方只记录错误后继续)
             return Err(Error::format(format!(
                 "窗口 {}+{} 越过 content+part4 池尾",
                 w.offset, w.len
@@ -3321,7 +3345,6 @@ impl GroupVm {
         let instrs = match yuris_script::decode_window(&bytes) {
             Ok(v) => v,
             Err(e) => {
-                self.state = VmState::Error;
                 return Err(Error::format(format!("条件窗口解码失败: {e}")));
             }
         };
@@ -3336,7 +3359,6 @@ impl GroupVm {
         match ev.eval_instructions(&instrs) {
             Ok(stack) => Ok(stack.into_iter().next_back()),
             Err(e) => {
-                self.state = VmState::Error;
                 Err(Error::format(format!(
                     "条件窗口求值失败: {e} s{} pc={}",
                     self.ctx.script_id, self.pc
@@ -3596,7 +3618,6 @@ impl GroupVm {
             Some(Value::Int(n)) if n >= 1 => Ok(Some(n as usize)),
             Some(v) => {
                 let reason = format!("LV 层数非正整数: {v:?}");
-                self.state = VmState::Error;
                 Err(Error::format(reason))
             }
             None => Ok(Some(1)),
@@ -3611,7 +3632,6 @@ impl GroupVm {
         let instrs = match yuris_script::decode_window(window) {
             Ok(v) => v,
             Err(e) => {
-                self.state = VmState::Error;
                 return Err(Error::format(format!("LET 左值解码失败: {e}")));
             }
         };
@@ -3624,7 +3644,6 @@ impl GroupVm {
         match ev.eval_lvalue_window_instrs(&instrs) {
             Ok(l) => Ok(l),
             Err(e) => {
-                self.state = VmState::Error;
                 Err(e)
             }
         }
@@ -4302,8 +4321,11 @@ impl GroupVm {
             Some(14) => {
                 // SEARCH(引擎 CMDH_004550a0 ae 支):在 SET 数组元素中从
                 // NO(20) 起线性查找 key(INT=17 / FLT=18 / STR=19),返回首个
-                // 匹配下标(0 基);未命中返回扫描边界(元素个数)。
+                // 匹配下标(0 基);未命中返回 -1。
                 // 等级:Likely(分支汇编逐行,参数槽号取自 YSCM 参数名)。
+                // 未命中值勘误(2026-10-24):旧实现返回元素个数;Erewhon(v481)的
+                // es.BT.NO.GET(yst00010 组 3-4)以 `IF @1728 != -1` 判未命中,
+                // 返回个数会让调用方拿它当下标越界(yst00007 组 79)。
                 let key = slot_vals
                     .iter()
                     .find(|(s, _)| *s == 17 || *s == 18 || *s == 19)
@@ -4326,7 +4348,7 @@ impl GroupVm {
                             .unwrap_or(0),
                     ),
                 };
-                let mut found = count;
+                let mut found: i64 = -1;
                 if let Some(key) = key {
                     for i in start..count {
                         let Ok(v) = self.store.get_elem(r, &[i as i64]) else {
@@ -4341,13 +4363,13 @@ impl GroupVm {
                             _ => false,
                         };
                         if hit {
-                            found = i;
+                            found = i as i64;
                             break;
                         }
                     }
                 }
                 evaluated.push((14u8, format!("SEARCH={found}(n={count})")));
-                Ok(Some(Value::Int(found as i64)))
+                Ok(Some(Value::Int(found)))
             }
             Some(slot) => Err(Error::format(format!(
                 "VARINFO 查询槽 {slot}(STRFIRST/SJISCODE)未实现(不猜)"

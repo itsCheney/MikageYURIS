@@ -156,6 +156,23 @@ enum YstbCmd {
         #[arg(long, default_value_t = 24)]
         limit: usize,
     },
+    /// 按命令组列出:组号、命令名(本游戏 ysc.ybn)、窗口与其指令。
+    Groups {
+        /// bn.ypf 路径。
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// 起始组号。
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        /// 组数。
+        #[arg(long, default_value_t = 40)]
+        count: usize,
+    },
     /// 反汇编 content 窗口为指令(已证实语义;未知保留 raw)。
     Disasm {
         /// bn.ypf 路径。
@@ -342,6 +359,45 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            YstbCmd::Groups { path, name, index, key_hex, from, count } => {
+                let ypf = open_ypf(&path, None)?;
+                let name = resolve_name(&ypf, &name, &index)?;
+                let blob = get_script(&ypf, &name)?;
+                let key = match key_hex {
+                    Some(h) => parse_key(&h)?,
+                    None => guess_key(&blob)?.0,
+                };
+                let f = YstbFile::from_bytes(&blob, key)?;
+                let yscm = ypf
+                    .read("ysbin\\ysc.ybn")
+                    .ok()
+                    .and_then(|b| yuris_format::yscm::YscmTable::from_bytes(&b).ok());
+                let groups = f.groups()?;
+                let first = f.group_first_slots(&groups);
+                for (pc, g) in groups.iter().enumerate().skip(from).take(count) {
+                    let cmd = yscm.as_ref().and_then(|t| t.commands().get(g.command_type as usize));
+                    println!(
+                        "{pc:>5}  {:<12} param={:#06x}",
+                        cmd.map(|c| c.name.as_str()).unwrap_or("?"),
+                        g.param
+                    );
+                    for w in f.group_windows(first[pc], g) {
+                        let slot = (w.tag & 0xff) as usize;
+                        let pname = cmd
+                            .and_then(|c| c.params.get(slot))
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("");
+                        let text = match f.window_bytes_pooled(w) {
+                            Some(bytes) => match yuris_script::decode_window(bytes) {
+                                Ok(ins) => ins.iter().map(fmt_insn).collect::<Vec<_>>().join(" "),
+                                Err(e) => format!("<{e}>"),
+                            },
+                            None => "<out of pool>".into(),
+                        };
+                        println!("         [{slot:>2} {pname:<8}] tag={:08x} {text}", w.tag);
+                    }
+                }
+            }
             YstbCmd::Disasm { path, name, index, key_hex, limit } => {
                 let ypf = open_ypf(&path, None)?;
                 let name = resolve_name(&ypf, &name, &index)?;
@@ -476,6 +532,34 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 一条指令的紧凑文本。
+fn fmt_insn(ins: &yuris_script::Instruction) -> String {
+    use yuris_script::{Insn, VarSpace};
+    match &ins.kind {
+        Insn::PushInt(v) => format!("{v}"),
+        Insn::PushFloat(v) => format!("{v}f"),
+        Insn::PushStr(p) => {
+            let (t, _, _) = encoding_rs::SHIFT_JIS.decode(p);
+            format!("{t:?}")
+        }
+        Insn::PushVar(r) | Insn::PushVarRef(r) | Insn::PushVarIndexed(r) => {
+            let tag = match r.space {
+                VarSpace::At => "@",
+                VarSpace::Dollar => "$",
+                VarSpace::Hash => "#",
+                VarSpace::Backtick => "`",
+                VarSpace::Unknown(_) => "?",
+            };
+            format!("{}{tag}{}", ins.kind.mnemonic(), r.id)
+        }
+        Insn::Unknown { raw_op, operand } => format!(
+            "op{raw_op:02x}:{}",
+            operand.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ),
+        other => other.mnemonic().to_string(),
+    }
 }
 
 fn kstr(k: &[u8; 4]) -> String {

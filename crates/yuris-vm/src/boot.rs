@@ -15,8 +15,10 @@ use std::sync::Arc;
 
 use yuris_core::{Error, Result};
 use yuris_format::vfs::GameFs;
+use yuris_format::yscm::YscmTable;
 use yuris_format::yslb::YslbTable;
 
+use crate::commands::CommandMap;
 use crate::GroupVm;
 use yuris_value::Value;
 use crate::host::{guess_script_key, ScriptHost, FsScriptHost};
@@ -74,8 +76,15 @@ impl Bootstrap {
 
         let ctx = host.load(script_id)?;
 
+        // 命令表:脚本里的命令下标是本游戏 ysc.ybn 的顺序,按名字换算成规范下标
+        let cmd_map = Arc::new(match host.read_entry("ysbin\\ysc.ybn") {
+            Ok(b) => CommandMap::from_yscm(&YscmTable::from_bytes(&b)?),
+            Err(_) => CommandMap::identity(),
+        });
+
         // 构建单脚本 VM(装载入口脚本)
         let mut vm = GroupVm::load(ctx.script)?;
+        vm.set_command_map(cmd_map.clone());
         vm.set_script_id(script_id);
 
         // 注入标签表(name → (target_pc, script_id))
@@ -94,7 +103,8 @@ impl Bootstrap {
         {
             let mut n = 0usize;
             for sid in host.script_ids()? {
-                let ctx = host.load(sid)?;
+                let mut ctx = host.load(sid)?;
+                cmd_map.remap(&mut ctx);
                 n += crate::consume_declarations_into(vm.store_mut(), &ctx)?;
                 vm.mark_declarations_consumed(sid);
             }

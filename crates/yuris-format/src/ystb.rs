@@ -227,6 +227,11 @@ impl YstbFile {
         &self.slots
     }
 
+    /// 槽位表(可写;命令表映射换算参数槽号用)。
+    pub fn slots_mut(&mut self) -> &mut [CommandSlot] {
+        &mut self.slots
+    }
+
     /// 内容区（变长 VM 字节码）。
     pub fn content(&self) -> &[u8] {
         &self.content

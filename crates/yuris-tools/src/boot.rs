@@ -64,12 +64,6 @@ pub fn run(args: BootArgs) -> Result<()> {
         Some(t) => println!("YSCM version: {}, {} commands", t.version(), t.commands().len()),
         None => println!("YSCM: ysbin\\ysc.ybn missing or unreadable"),
     }
-    let cmd_name = |c: u8| -> String {
-        yscm.as_ref()
-            .and_then(|t| t.commands().get(c as usize))
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| format!("#{c:02x}"))
-    };
 
     let fs = Arc::new(fs);
     let booted = Bootstrap {
@@ -101,6 +95,19 @@ pub fn run(args: BootArgs) -> Result<()> {
 
     let mut vm = booted.vm;
     vm.set_strict(args.strict);
+    let foreign = vm.command_map().foreign_names();
+    if !foreign.is_empty() {
+        println!("commands not in the v555 table: {}", foreign.join(", "));
+    }
+    for (cmd, pairs) in vm.command_map().slot_changes() {
+        let moved: Vec<String> = pairs
+            .iter()
+            .map(|(g, c)| if c & 0x80 != 0 { format!("{g}->new") } else { format!("{g}->{c}") })
+            .collect();
+        println!("  {cmd} parameter slots: {}", moved.join(" "));
+    }
+    let names = vm.command_map().clone();
+    let cmd_name = |c: u8| names.name(c);
     let mut out = match &args.jsonl {
         Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
         None => None,
