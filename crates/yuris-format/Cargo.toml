@@ -13,3 +13,4 @@ tracing = { workspace = true }
 byteorder = { workspace = true }
 flate2 = { workspace = true }
 encoding_rs = { workspace = true }
+png = { workspace = true }

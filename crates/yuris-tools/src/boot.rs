@@ -26,6 +26,14 @@ pub struct BootArgs {
     pub strict: bool,
     pub trace: bool,
     pub tail: usize,
+    /// Clicks, `X,Y@MS`.
+    pub clicks: Vec<String>,
+    /// CG name filter for the end report.
+    pub cgs: Option<String>,
+    /// Global @ variables for the end report.
+    pub vars: Vec<u16>,
+    /// Watch points, `script:pc`.
+    pub watch: Vec<String>,
 }
 
 fn hex(k: &[u8]) -> String {
@@ -123,6 +131,30 @@ pub fn run(args: BootArgs) -> Result<()> {
         None => None,
     };
 
+    // Scripted input: the cursor moves to each click's point when the
+    // clock reaches it, and the left button is down for that one frame.
+    let mut clicks: Vec<(i64, i64, u64)> = Vec::new();
+    for c in &args.clicks {
+        let parsed = c.split_once('@').and_then(|(xy, t)| {
+            let (x, y) = xy.split_once(',')?;
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?, t.trim().parse().ok()?))
+        });
+        match parsed {
+            Some(p) => clicks.push(p),
+            None => anyhow::bail!("--click wants X,Y@MS, got {c:?}"),
+        }
+    }
+    clicks.sort_by_key(|c| c.2);
+    let mut watch = Vec::new();
+    for w in &args.watch {
+        match w.split_once(':').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))) {
+            Some(p) => watch.push(p),
+            None => anyhow::bail!("--watch wants script:pc, got {w:?}"),
+        }
+    }
+    vm.set_watch(&watch);
+    let mut next_click = 0usize;
+    let mut button_down = false;
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut frames = 0usize;
     let mut kinds = [0usize; KINDS.len()];
@@ -166,6 +198,17 @@ pub fn run(args: BootArgs) -> Result<()> {
                 frames += 1;
                 let step = time_ms.unwrap_or(0).max(counter.unwrap_or(1) * 1000 / 60).max(1);
                 vm.set_clock_ms(vm.clock_ms() + step);
+                if let Some(&(x, y, t)) = clicks.get(next_click) {
+                    if vm.clock_ms() >= t {
+                        println!("click at {x},{y} ({:.1} s)", vm.clock_ms() as f64 / 1000.0);
+                        vm.set_input_cursor(x, y);
+                        button_down = true;
+                        next_click += 1;
+                    }
+                }
+                // A click holds the left button for one frame.
+                vm.update_mouse_buttons(button_down, false, false)?;
+                button_down = false;
                 if let Err(e) = vm.resume(ResumeResponse::Continue) {
                     break format!("resume error: {e}");
                 }
@@ -208,6 +251,30 @@ pub fn run(args: BootArgs) -> Result<()> {
             None => format!("yst{sid:05} pc {pc}"),
         }
     };
+    for (sid, pc, n) in vm.watch_counts() {
+        println!("watch {}: {n}", place(sid, pc));
+    }
+    if !args.vars.is_empty() {
+        let vals: Vec<String> = args
+            .vars
+            .iter()
+            .map(|&id| match vm.global_int(id) {
+                Some(n) => format!("@{id}={n}"),
+                None => format!("@{id}=?"),
+            })
+            .collect();
+        println!("vars: {}", vals.join(" "));
+    }
+    if let Some(filter) = &args.cgs {
+        println!("CGs matching {filter:?} (name x y w h file):");
+        for (name, x, y, w, h, file) in vm.cg_list() {
+            let name = String::from_utf8_lossy(&name).into_owned();
+            if name.contains(filter.as_str()) {
+                let file = file.map(|f| decode_cp932(&f)).unwrap_or_default();
+                println!("  {name:<40} {x:>5} {y:>5} {w:>5} {h:>5} {file}");
+            }
+        }
+    }
     if !tail.is_empty() {
         println!("last {} events:", tail.len());
         for line in &tail {
@@ -293,4 +360,9 @@ fn kind(e: &VmEvent) -> usize {
         VmEvent::Unsupported { .. } => 14,
         VmEvent::Subsystem { .. } => 15,
     }
+}
+
+/// CP932 bytes as text (file names in scripts are CP932).
+fn decode_cp932(b: &[u8]) -> String {
+    encoding_rs::SHIFT_JIS.decode(b).0.into_owned()
 }

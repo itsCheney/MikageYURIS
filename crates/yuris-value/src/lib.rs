@@ -493,8 +493,32 @@ impl VariableStore {
     }
 
     /// 写入(LET / 命令参数求值的结果)。
+    ///
+    /// A scalar write to a variable that has array storage lands on element
+    /// 0, the element a scalar read (0x48) loads. YSVR declares many plain
+    /// scalars with bounds [1] (Erewhon's es.BT.MOUSECHECK `INT @1663 = -1`),
+    /// so writing the scalar map instead left reads stuck at 0. If element 0
+    /// cannot take the value (empty array, string into a number array) the
+    /// variable becomes a scalar.
     pub fn set(&mut self, r: &VarRef, v: Value) {
-        self.vars.insert((r.space.prefix(), r.id), v);
+        let key = (r.space.prefix(), r.id);
+        if let Some(a) = self.arrays.get_mut(&key) {
+            let cv = match (&a.elem, v) {
+                (ElemType::Float, Value::Int(i)) => Value::Float(i as f64),
+                (ElemType::Int, Value::Float(f)) => Value::Int(f.round() as i64),
+                (_, other) => other,
+            };
+            let zeros = vec![0i64; a.bounds.len()];
+            match a.set(&zeros, cv.clone()) {
+                Ok(()) => return,
+                Err(_) => {
+                    self.arrays.remove(&key);
+                    self.vars.insert(key, cv);
+                    return;
+                }
+            }
+        }
+        self.vars.insert(key, v);
     }
 
     /// 声明/重置数组(YSVR 消费或 GOSUB 帧局部)。
@@ -521,6 +545,14 @@ impl VariableStore {
                     r.id
                 ))
             })?;
+        // No indices = element 0 (scalar access, see `set`).
+        let zeros;
+        let indices = if indices.is_empty() {
+            zeros = vec![0i64; a.bounds.len()];
+            &zeros[..]
+        } else {
+            indices
+        };
         a.get(indices).map_err(|e| {
             Error::format(format!("{} (array {}{})", e, r.space.prefix(), r.id))
         })
@@ -537,6 +569,13 @@ impl VariableStore {
                     (ElemType::Float, Value::Int(i)) => Value::Float(i as f64),
                     (ElemType::Int, Value::Float(f)) => Value::Int(f.round() as i64),
                     (_, other) => other,
+                };
+                let zeros;
+                let indices = if indices.is_empty() {
+                    zeros = vec![0i64; a.bounds.len()];
+                    &zeros[..]
+                } else {
+                    indices
                 };
                 a.set(indices, cv).map_err(|e| {
                     Error::format(format!("{} (array {}{})", e, r.space.prefix(), r.id))

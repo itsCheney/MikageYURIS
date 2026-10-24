@@ -696,6 +696,10 @@ pub struct GroupVm {
     frame_done: bool,
     /// CG 状态注册表(CG 名(SJIS 字节)→ 状态;P7.1,成果 62)。
     cg_registry: HashMap<Vec<u8>, CgState>,
+    /// Watch points (script, pc, times reached), for diagnostics.
+    watch: Vec<(u16, usize, u64)>,
+    /// Decoded CG images by file, for CGINFO ONMOUSE (None = unreadable).
+    cg_images: HashMap<Vec<u8>, Option<std::sync::Arc<yuris_format::vfs::RgbaImage>>>,
 }
 
 impl GroupVm {
@@ -767,6 +771,8 @@ impl GroupVm {
             frame_pos: 0,
             frame_done: false,
             cg_registry: HashMap::new(),
+            watch: Vec::new(),
+            cg_images: HashMap::new(),
         })
     }
 
@@ -792,6 +798,75 @@ impl GroupVm {
     /// 注入光标逻辑坐标(@133/@138;播放器每帧调用,P9.2)。
     pub fn set_input_cursor(&mut self, x: i64, y: i64) {
         self.input_cursor = (x, y);
+    }
+
+    /// Writes a global integer variable `@id` (scalar, or element 0 of an
+    /// array), as the engine does for its input variables each frame.
+    pub fn set_global_int(&mut self, id: u16, v: i64) -> Result<()> {
+        let r = yuris_value::VarRef { space: yuris_value::VarSpace::At, id };
+        if self.store.has_array(&r) {
+            let dims = self.store.array_dims(&r).unwrap_or_default();
+            return self.store.set_elem(&r, &vec![0; dims.len()], Value::Int(v));
+        }
+        self.store.set(&r, Value::Int(v));
+        Ok(())
+    }
+
+    /// The engine's per-frame update of the mouse button variables, for the
+    /// host to call before each frame with the physical button states.
+    ///
+    /// Read from Erewhon's scripts: `@147` is the left button (es.BT.MOUSECHECK
+    /// takes `@147 == 1` as a click on the hovered button and sets it to 2
+    /// to consume it); `@244` and `@245` sit next to it in every "any
+    /// button" test (ES.SCENARIO.SubLoop), so they are taken as the right
+    /// and middle buttons. After a scene change the scripts write 5 to
+    /// mean "ignore until released". So: up -> 0; down -> 1 on the first
+    /// frame, 2 while held, and 5 stays 5 until the button is released.
+    /// The engine's handler is not reversed.
+    pub fn update_mouse_buttons(&mut self, left: bool, right: bool, middle: bool) -> Result<()> {
+        for (id, down) in [(147u16, left), (244, right), (245, middle)] {
+            let prev = self.global_int(id).unwrap_or(0);
+            let next = match (down, prev) {
+                (false, _) => 0,
+                (true, 5) => 5,
+                (true, 1 | 2) => 2,
+                (true, _) => 1,
+            };
+            if next != prev {
+                self.set_global_int(id, next)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Counts how often each (script, pc) is reached (see [`Self::watch_counts`]).
+    pub fn set_watch(&mut self, points: &[(u16, usize)]) {
+        self.watch = points.iter().map(|&(s, p)| (s, p, 0)).collect();
+    }
+
+    /// Watch points with the number of times each was reached.
+    pub fn watch_counts(&self) -> Vec<(u16, usize, u64)> {
+        self.watch.clone()
+    }
+
+    /// Reads a global integer variable `@id` (scalar, or element 0).
+    pub fn global_int(&self, id: u16) -> Option<i64> {
+        let r = yuris_value::VarRef { space: yuris_value::VarSpace::At, id };
+        match self.read_var_value(&r, &[]) {
+            Some(Value::Int(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// The registered CGs: (name, x, y, image width, image height, file).
+    pub fn cg_list(&self) -> Vec<(Vec<u8>, i64, i64, i64, i64, Option<Vec<u8>>)> {
+        let mut v: Vec<_> = self
+            .cg_registry
+            .iter()
+            .map(|(k, s)| (k.clone(), s.x, s.y, s.img_w, s.img_h, s.file.clone()))
+            .collect();
+        v.sort();
+        v
     }
 
     pub fn set_file_probe(&mut self, probe: std::sync::Arc<yuris_format::vfs::GameFs>) {
@@ -1100,6 +1175,14 @@ impl GroupVm {
             self.executed_groups += 1;
 
             let g = self.ctx.groups[self.pc];
+            if !self.watch.is_empty() {
+                let here = (self.ctx.script_id, self.pc);
+                for w in &mut self.watch {
+                    if (w.0, w.1) == here {
+                        w.2 += 1;
+                    }
+                }
+            }
             let first = self.ctx.first_slots[self.pc];
             // 克隆窗口切片(12B 结构),避免 script 借用与 &mut self 冲突
             let windows: Vec<yuris_format::ystb::CommandSlot> = self.ctx.script.slots()
@@ -2670,7 +2753,12 @@ impl GroupVm {
                     // 槽13/14 = 装载图像真实宽/高(引擎 watch oracle 实证:
                     // occ1 dummy.png 1×1 → 1.0;occ2 txspace → 1350.0)。
                     let mut answer: Option<i64> = None;
-                    if let (Some(name), Some(q)) = (&id_bytes, query) {
+                    if let (Some(name), Some(q @ 21..=23)) = (&id_bytes, query) {
+                        if self.cg_registry.contains_key(name) {
+                            answer = Some(self.cg_onmouse(name, q));
+                        }
+                    }
+                    if let (Some(name), Some(q), None) = (&id_bytes, query, answer) {
                         match self.cg_registry.get(name) {
                             Some(st) => match q {
                                 2 => answer = Some(1),       // EXIST
@@ -2937,25 +3025,17 @@ impl GroupVm {
                             }
                         }
                     }
+                    // `SAVE DNO=n SET=@var` registers @var in save data
+                    // block n; a later `SAVE FILE="config.sd"` writes the
+                    // registered blocks. The engine's 1/0 store goes to the
+                    // variable descriptor's save flag (desc+0x30/+0x34), not
+                    // to the variable: writing it into the value wiped
+                    // Erewhon's whole config array (@1146) on its first save.
+                    // Nothing is persisted yet; the event carries the target.
+                    let _ = set_flag;
                     let mut set_target = None;
                     if let Some(bytes) = set_ref {
-                        let target = extract_var_target(&bytes)?;
-                        set_target = Some(target.summary());
-                        // 引擎 a0 分支:INT → 1/0;FLT → 1.0/0.0;STR → 无写入
-                        let cur_type = self.var_target_elem(&target);
-                        let v = match cur_type {
-                            Some(yuris_value::ElemType::Float) => {
-                                Value::Float(if set_flag { 1.0 } else { 0.0 })
-                            }
-                            Some(yuris_value::ElemType::Int) => {
-                                Value::Int(set_flag as i64)
-                            }
-                            _ => {
-                                // STR 目标:引擎走显示层,不写存储(不猜)
-                                Value::Int(set_flag as i64)
-                            }
-                        };
-                        self.write_var_target(&target, v)?;
+                        set_target = Some(extract_var_target(&bytes)?.summary());
                     }
                     self.events.push(VmEvent::Save {
                         pc: self.pc,
@@ -4244,6 +4324,19 @@ impl GroupVm {
         if r.space == yuris_value::VarSpace::At && r.id == 116 {
             return Some(Value::Int(1080));
         }
+        // A scalar read of an array variable loads element 0, as 0x48 does.
+        let zeros: Vec<i64>;
+        let indices = if indices.is_empty() {
+            let dims = self
+                .frames
+                .last()
+                .and_then(|fr| fr.locals.array_dims(r))
+                .or_else(|| self.store.array_dims(r));
+            zeros = vec![0; dims.map(|d| d.len()).unwrap_or(0)];
+            &zeros[..]
+        } else {
+            indices
+        };
         let out: Option<Value> = (|| {
             if let Some(fr) = self.frames.last() {
                 if fr.locals.has_array(r) {
@@ -4534,6 +4627,37 @@ impl GroupVm {
                 None => None,
             },
             VarTarget::Indexed(r, _) => self.store.array_elem_type(r),
+        }
+    }
+
+    /// CGINFO ONMOUSE (21) / ONMOUSE2 (22) / ONMOUSE3 (23): what the CG's
+    /// image holds under the cursor, or -1 when the cursor is outside it.
+    ///
+    /// Read from Erewhon's button code (es.BT.MOUSECHECK): after a bounds
+    /// check it asks ONMOUSE2 of the button image, or ONMOUSE of its mask
+    /// image, and counts a hit when the answer is >= the button's threshold
+    /// (es.BT.TH.SET / es.BT.CG.SET, 1 in every button). So ONMOUSE2 and
+    /// ONMOUSE3 answer the pixel's alpha, and ONMOUSE (masks are opaque
+    /// black and white) its red value scaled by alpha. The engine's own
+    /// handler is not reversed; scaling and rotation are ignored.
+    fn cg_onmouse(&mut self, name: &[u8], query: u8) -> i64 {
+        let Some(st) = self.cg_registry.get(name) else { return -1 };
+        let (x, y) = (self.input_cursor.0 - st.x, self.input_cursor.1 - st.y);
+        let Some(file) = st.file.clone() else { return -1 };
+        let probe = self.file_probe.clone();
+        let img = self
+            .cg_images
+            .entry(file.clone())
+            .or_insert_with(|| {
+                probe
+                    .and_then(|p| p.image_rgba(&String::from_utf8_lossy(&file)))
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        match img.and_then(|i| i.pixel(x, y)) {
+            Some([r, _, _, a]) if query == 21 => i64::from(r) * i64::from(a) / 255,
+            Some([_, _, _, a]) => i64::from(a),
+            None => -1,
         }
     }
 

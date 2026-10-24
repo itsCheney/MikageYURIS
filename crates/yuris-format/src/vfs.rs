@@ -312,6 +312,13 @@ impl GameFs {
             .find(|c| self.exists(c))
     }
 
+    /// Decodes an image to RGBA (PNG or YCG). The extension may be left
+    /// out.
+    pub fn image_rgba(&self, path: &str) -> Option<RgbaImage> {
+        let hit = self.resolve_with_ext(path, &IMAGE_EXTS)?;
+        decode_image_rgba(&self.read(&hit).ok()?)
+    }
+
     /// Image width and height from the file header (PNG, BMP, JPEG). The
     /// extension may be left out.
     pub fn image_size(&self, path: &str) -> Option<(u32, u32)> {
@@ -332,8 +339,120 @@ impl GameFs {
     }
 }
 
+/// A decoded image, 8-bit RGBA, rows top to bottom.
+#[derive(Debug, Clone)]
+pub struct RgbaImage {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// `width * height * 4` bytes.
+    pub data: Vec<u8>,
+}
+
+impl RgbaImage {
+    /// The pixel at (x, y), or None outside the image.
+    pub fn pixel(&self, x: i64, y: i64) -> Option<[u8; 4]> {
+        if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
+            return None;
+        }
+        let i = (y as usize * self.width as usize + x as usize) * 4;
+        self.data.get(i..i + 4).map(|p| [p[0], p[1], p[2], p[3]])
+    }
+}
+
+/// Decodes a PNG into RGBA8 (palette, gray and 16-bit inputs are expanded).
+pub fn decode_png_rgba(bytes: &[u8]) -> Option<RgbaImage> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let channels = match info.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => return None,
+    };
+    let mut data = Vec::with_capacity(w * h * 4);
+    for row in buf.chunks(info.line_size).take(h) {
+        for px in row[..w * channels].chunks(channels) {
+            data.extend_from_slice(&match channels {
+                1 => [px[0], px[0], px[0], 255],
+                2 => [px[0], px[0], px[0], px[1]],
+                3 => [px[0], px[1], px[2], 255],
+                _ => [px[0], px[1], px[2], px[3]],
+            });
+        }
+    }
+    Some(RgbaImage { width: info.width, height: info.height, data })
+}
+
+/// Decodes a YCG image, the engine's own format (Erewhon's CHS patch
+/// stores its translated UI images as YCG under `.png` names).
+///
+/// ```text
+/// u8  magic[4] = "YCG\0"
+/// u32 width, height, bpp (32)
+/// u32 method          // 1 = zlib (the only one seen)
+/// u32 strips
+/// strip × strips: u32 first_row, last_row, unpacked_len, packed_len
+/// packed strip data, in order: BGRA rows, top to bottom
+/// ```
+pub fn decode_ycg_rgba(b: &[u8]) -> Option<RgbaImage> {
+    use std::io::Read;
+    let u32_at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    if b.get(..4)? != b"YCG\0" {
+        return None;
+    }
+    let (w, h, bpp, method, strips) = (u32_at(4)?, u32_at(8)?, u32_at(12)?, u32_at(16)?, u32_at(20)?);
+    if method != 1 || !(bpp == 32 || bpp == 24) || w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return None;
+    }
+    let src_px = (bpp / 8) as usize;
+    let mut data = vec![0u8; w as usize * h as usize * 4];
+    let mut pos = 24 + strips as usize * 16;
+    for i in 0..strips as usize {
+        let t = 24 + i * 16;
+        let (first, last, unpacked, packed) = (u32_at(t)?, u32_at(t + 4)?, u32_at(t + 8)?, u32_at(t + 12)?);
+        let packed = b.get(pos..pos + packed as usize)?;
+        pos += packed.len();
+        let mut out = Vec::with_capacity(unpacked as usize);
+        flate2::read::ZlibDecoder::new(packed).read_to_end(&mut out).ok()?;
+        let row_len = w as usize * src_px;
+        for (k, row) in out.chunks(row_len).enumerate() {
+            let y = first as usize + k;
+            if y > last as usize || y >= h as usize || row.len() < row_len {
+                break;
+            }
+            for (x, px) in row.chunks(src_px).enumerate() {
+                let o = (y * w as usize + x) * 4;
+                let a = if src_px == 4 { px[3] } else { 255 };
+                data[o..o + 4].copy_from_slice(&[px[2], px[1], px[0], a]);
+            }
+        }
+    }
+    Some(RgbaImage { width: w, height: h, data })
+}
+
+/// Decodes a PNG or YCG image into RGBA8.
+pub fn decode_image_rgba(bytes: &[u8]) -> Option<RgbaImage> {
+    if bytes.starts_with(b"YCG\0") {
+        decode_ycg_rgba(bytes)
+    } else {
+        decode_png_rgba(bytes)
+    }
+}
+
 /// Image width and height from a file header.
 pub fn image_header_size(h: &[u8]) -> Option<(u32, u32)> {
+    if h.len() >= 12 && h[..4] == *b"YCG\0" {
+        let w = u32::from_le_bytes(h[4..8].try_into().ok()?);
+        let hh = u32::from_le_bytes(h[8..12].try_into().ok()?);
+        return Some((w, hh));
+    }
     if h.len() >= 24 && h[..8] == *b"\x89PNG\r\n\x1a\n" {
         let w = u32::from_be_bytes(h[16..20].try_into().ok()?);
         let hh = u32::from_be_bytes(h[20..24].try_into().ok()?);

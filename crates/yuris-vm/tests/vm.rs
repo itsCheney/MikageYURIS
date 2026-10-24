@@ -1279,11 +1279,12 @@ fn apply_ysvr_kind2_applies_matching_script_entries() {
     assert_eq!(vm.apply_ysvr_for_script(23).unwrap(), 0);
 }
 
-/// SAVE(0x56):SET 引用 ← 位图置位/清零(引擎 CMDH_00451838 a0 分支:
-/// INT desc → 1/0,FLT desc → 1.0/0.0;语料 298 组 [DNO,SET]×284)。
-/// 真实语料形态:script25 `SAVE[DNO=1, SET=$1042]`。
+/// SAVE(0x56) `DNO=n SET=@var` registers the variable in save block n. The
+/// engine's 1/0 write (CMDH_00451838 a0 branch) targets the variable
+/// descriptor's save flag, so the variable's value must stay untouched.
+/// Real form: script25 `SAVE[DNO=1, SET=$1042]`.
 #[test]
-fn save_sets_bitmap_target() {
+fn save_registers_target_without_writing_it() {
     use yuris_value::{ElemType, VarRef, VarSpace, Value};
     let key = [0x2b, 0x90, 0x4f, 0x93];
     // DNO(槽2):pushint8 7
@@ -1302,13 +1303,13 @@ fn save_sets_bitmap_target() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     // 语料中 SET 目标是标量 INT(位图) — 预置 @6001 = 0
-    vm.store_mut().set(&VarRef { space: VarSpace::At, id: 6001 }, Value::Int(0));
+    vm.store_mut().set(&VarRef { space: VarSpace::At, id: 6001 }, Value::Int(42));
     let s = vm.run(100).unwrap();
     assert_eq!(s, VmSuspend::Complete);
     // 引擎 a0:desc INT → SET 求值(缺省无值窗)位图写 1(语料 [DNO,SET] 全部置位)
     // 注:SET 值窗未给 → set_flag=false → 写 0(清零路径;语料亦存在)
     let v = vm.store().get(&VarRef { space: VarSpace::At, id: 6001 }).unwrap();
-    assert_eq!(v, &Value::Int(0), "SET 窗无值 → 清零路径写 0");
+    assert_eq!(v, &Value::Int(42), "SAVE leaves the registered variable alone");
     // 事件断言
     assert!(vm.events().iter().any(|e| matches!(
         e,
@@ -1335,8 +1336,8 @@ fn save_sets_bitmap_target() {
     assert_eq!(s2, VmSuspend::Complete);
     assert_eq!(
         vm2.store().get_elem(&VarRef { space: VarSpace::At, id: 6002 }, &[0]).unwrap(),
-        &Value::Float(1.0),
-        "FLT 位图置位 = 1.0(引擎 0x3ff0000000000000)"
+        &Value::Float(0.0),
+        "SAVE leaves the registered array alone"
     );
 }
 

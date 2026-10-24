@@ -65,6 +65,19 @@ enum Cmd {
         /// Prints the last N events (control flow included) when the run stops.
         #[arg(long, default_value_t = 0)]
         tail: usize,
+        /// Clicks the left mouse button at X,Y once the game clock reaches
+        /// MS milliseconds (`--click 640,360@30000`); repeat for more clicks.
+        #[arg(long = "click", value_name = "X,Y@MS")]
+        clicks: Vec<String>,
+        /// Lists the CGs whose name contains this text when the run stops.
+        #[arg(long)]
+        cgs: Option<String>,
+        /// Prints these global @ variables when the run stops (`--vars 147,1199`).
+        #[arg(long, value_delimiter = ',')]
+        vars: Vec<u16>,
+        /// Counts how often groups are reached (`--watch 12:19,6:74`).
+        #[arg(long, value_delimiter = ',')]
+        watch: Vec<String>,
     },
     /// List the files of an Enigma Virtual Box exe or external package.
     Evb {
@@ -276,7 +289,7 @@ fn main() -> Result<()> {
                 println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
             }
         }
-        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail } => {
+        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch } => {
             boot::run(boot::BootArgs {
                 dir,
                 launcher,
@@ -287,6 +300,10 @@ fn main() -> Result<()> {
                 strict,
                 trace,
                 tail,
+                clicks,
+                cgs,
+                vars,
+                watch,
             })?;
         }
         Cmd::Ypf { sub } => match sub {
