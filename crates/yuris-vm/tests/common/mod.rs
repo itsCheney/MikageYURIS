@@ -65,3 +65,35 @@ pub const SAMPLE_KEY: [u8; 4] = [0x2b, 0x90, 0x4f, 0x93];
 
 /// 占位 tag(len/offset 由 make_ystb 布局重算)。
 pub const DUMMY: [u8; 4] = [0; 4];
+
+/// A native host that records each call: (command name, [(param, value)]).
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct Recorder {
+    pub calls: Vec<(String, Vec<(String, yuris_value::Value)>)>,
+}
+
+impl yuris_vm::native::Native for Recorder {
+    fn call(
+        &mut self,
+        c: &yuris_vm::native::NativeCall<'_>,
+    ) -> yuris_core::Result<Option<yuris_value::Value>> {
+        let args = c.args.iter().map(|a| (a.param.to_string(), a.value.clone())).collect();
+        self.calls.push((c.name.to_string(), args));
+        Ok(None)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// The calls a [`Recorder`] host saw.
+#[allow(dead_code)]
+pub fn recorded(vm: &yuris_vm::GroupVm) -> Vec<(String, Vec<(String, yuris_value::Value)>)> {
+    vm.native_as::<Recorder>().map(|r| r.calls.clone()).unwrap_or_default()
+}

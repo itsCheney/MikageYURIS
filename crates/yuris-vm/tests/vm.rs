@@ -564,9 +564,9 @@ fn text_emits_text_event() {
     )));
 }
 
-/// SOUND:ID(FILE 字符串)+ PLAY(int) → Sound 事件。
+/// SOUND: ID and PLAY reach the native host by name.
 #[test]
-fn sound_emits_sound_event() {
+fn sound_goes_to_native_host() {
     let key = [0x2b, 0x90, 0x4f, 0x93];
     let w_file: &[u8] = &[0x4d, 7, 0, b'"', b'b', b'g', b'm', b'0', b'1', b'"'];
     let w_play: &[u8] = &[0x42, 1, 0, 1];
@@ -578,17 +578,24 @@ fn sound_emits_sound_event() {
     let bytes = make_ystb(key, groups, windows);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
+    vm.set_native(Box::new(common::Recorder::default()));
     let s = vm.run(100).unwrap();
     assert_eq!(s, VmSuspend::Complete);
-    assert!(vm.events().iter().any(|e| matches!(
-        e,
-        VmEvent::Sound { id: Some(_), play: Some(1), .. }
-    )));
+    let calls = common::recorded(&vm);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "SOUND");
+    assert_eq!(
+        calls[0].1,
+        vec![
+            ("ID".to_string(), yuris_value::Value::Str(b"bgm01".to_vec())),
+            ("PLAY".to_string(), yuris_value::Value::Int(1)),
+        ]
+    );
 }
 
-/// CG:ID(FILE 串)+ X/Y int → Cg 事件带位置;无窗口 → 直接事件。
+/// CG: ID, X and Y reach the native host by name.
 #[test]
-fn cg_emits_cg_event_with_position() {
+fn cg_goes_to_native_host() {
     let key = [0x2b, 0x90, 0x4f, 0x93];
     let w_id: &[u8] = &[0x4d, 6, 0, b'"', b'b', b'g', b'0', b'1', b'"'];
     let w_x: &[u8] = &[0x42, 1, 0, 100];
@@ -602,12 +609,14 @@ fn cg_emits_cg_event_with_position() {
     let bytes = make_ystb(key, groups, windows);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
+    vm.set_native(Box::new(common::Recorder::default()));
     let s = vm.run(100).unwrap();
     assert_eq!(s, VmSuspend::Complete);
-    assert!(vm.events().iter().any(|e| matches!(
-        e,
-        VmEvent::Cg { id: Some(_), position: Some((100, 200, _)), .. }
-    )));
+    let calls = common::recorded(&vm);
+    assert_eq!(calls[0].0, "CG");
+    let names: Vec<&str> = calls[0].1.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(names, ["ID", "X", "Y"]);
+    assert_eq!(calls[0].1[2].1, yuris_value::Value::Int(200));
 }
 
 /// GOSUB 帧局部:子程序内 LET 帧局部(id=0x32)读写 → 帧局部值可读回;
@@ -1020,9 +1029,9 @@ fn sample_script190_varinfo_group_executes() {
     let _ = vm; // 完整链验收见 bootstrap_system_start_reaches_end
 }
 
-/// CGACT:ID 字符串(B0=0)+ 数值参数摘要;事件化,不挂起。
+/// CGACT: ID and SET reach the native host by name.
 #[test]
-fn cgact_emits_cgact_event() {
+fn cgact_goes_to_native_host() {
     use yuris_value::Value;
     let key = [0x2b, 0x90, 0x4f, 0x93];
     let w_id: &[u8] = &[0x4d, 7, 0, b'"', b'l', b'a', b'y', b'e', b'r', b'"'];
@@ -1030,17 +1039,17 @@ fn cgact_emits_cgact_event() {
     let groups: &[(u8, u8, u16)] = &[(cmd::CGACT, 2, 0), (cmd::RETURN, 0, 0)];
     let windows = &[
         ([0x00, 0x00, 0x00, 0x00], w_id.len() as u32, 0, w_id), // B0=0(ID)
-        ([0x08, 0x00, 0x00, 0x00], w_set.len() as u32, 0, w_set), // B0=8(SET;YSCM 第8参)LE
+        ([0x09, 0x00, 0x00, 0x00], w_set.len() as u32, 0, w_set), // slot 9 = SET
     ];
     let bytes = make_ystb(key, groups, windows);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
+    vm.set_native(Box::new(common::Recorder::default()));
     let s = vm.run(100).unwrap();
     assert_eq!(s, VmSuspend::Complete);
-    assert!(vm.events().iter().any(|e| matches!(
-        e,
-        VmEvent::CgAct { id: Some(_), .. }
-    )));
+    let calls = common::recorded(&vm);
+    assert_eq!(calls[0].0, "CGACT");
+    assert_eq!(calls[0].1[1], ("SET".to_string(), Value::Int(1)));
 }
 
 /// LOAD:FILE 路径字符串记录;不实现装载(写回目标未逆向)。
@@ -1341,10 +1350,10 @@ fn save_registers_target_without_writing_it() {
     );
 }
 
-/// CGEND(0x03):ID 字符串记录(引擎 LAB_0043ad14;无图形后端 → 事件化)。
+/// CGEND (0x03): ID reaches the native host.
 /// 真实语料形态:script1 `CGEND[ID="BT.OFF"]`(ID 窗为拼接表达式)。
 #[test]
-fn cgend_emits_event_with_id() {
+fn cgend_goes_to_native_host() {
     use yuris_value::Value;
     let key = [0x2b, 0x90, 0x4f, 0x93];
     // ID(槽0):pushstr "BT.OFF"
@@ -1356,12 +1365,9 @@ fn cgend_emits_event_with_id() {
     let bytes = make_ystb(key, groups, windows);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
+    vm.set_native(Box::new(common::Recorder::default()));
     let s = vm.run(100).unwrap();
     assert_eq!(s, VmSuspend::Complete);
-    let hit = vm.events().iter().any(|e| matches!(
-        e,
-        yuris_vm::VmEvent::CgEnd { id: Some(txt), .. } if txt.contains("BT.OFF")
-    ));
-    assert!(hit, "应有 CgEnd 事件且 ID 含 BT.OFF");
-    let _ = Value::Int(0);
+    let calls = common::recorded(&vm);
+    assert_eq!(calls[0], ("CGEND".to_string(), vec![("ID".to_string(), Value::Str(b"BT.OFF".to_vec()))]));
 }

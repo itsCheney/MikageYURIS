@@ -1,24 +1,21 @@
-//! P7.1 CG 状态注册表测试(成果 62;P1 收尾定稿)。
+//! CG / CGINFO / CGEND through the VM and [`yuris_host::Host`] (moved
+//! from yuris-vm's P7.1 tests when the CG state left the VM).
 //!
-//! 引擎语义(反编译 0x423864 CMD_CG + 0x43b084 CGINFO + watch oracle 实证):
-//! - CG 命令:FILE 槽(46)非空字符串 → 创建(注册);无 FILE / FILE="" →
-//!   静默不创建(处理器 return 0);
-//! - CGINFO:槽13/14 = **装载图像真实宽/高**(引擎 watch oracle:occ1 =
-//!   1.0 = `cgsys\dummy.png` 1×1 占位图、occ2 = 1350.0 = 消息窗纹理
-//!   1350×200;两图经封包扫描确认);COLOR(槽24)= 0x808080(occ1 实证);
-//!   未注册名 → 全部查询写 0(「不存在」路径);
-//!   本测试无 VFS 探针 → 图像头不可解析 → 槽13/14 = 0(诚实降级);
-//! - CGEND:按名移除。
-//!
-//! 真实样本:s9 g1072 CG(BT.OFF, FILE=$1227[@1704]) → g1089-91 CGINFO;
-//! occ1 引擎真值 (1,1,8421504) = dummy.png(1×1)+ COLOR 缺省 —— 旧
-//! 「静态默认 SX=1/SY=1」模型系巧合命中,已作废(见 CgState 文档)。
+//! - CG with a FILE creates the layer; without FILE, or `FILE=""`, an
+//!   unknown layer is not created (kemonomichi2 0x423864 returns 0).
+//! - CGINFO SX/SY answer the loaded image's size (engine watch oracle:
+//!   `cgsys\dummy.png` 1×1 → 1, the 1350×200 message window → 1350).
+//!   These tests have no file system, so images load as 0×0.
+//! - A layer that does not exist answers 0 to every query.
+//! - CGEND removes the layer.
 
+#[path = "../../yuris-vm/tests/common/mod.rs"]
 mod common;
 
 use common::{make_ystb, SAMPLE_KEY};
 use yuris_format::ystb::YstbFile;
 use yuris_value::{Value, VarRef, VarSpace};
+use yuris_host::Host;
 use yuris_vm::{GroupVm, VmSuspend, cmd};
 
 fn var(id: u16) -> VarRef {
@@ -64,11 +61,13 @@ fn build(groups: &[(u8, u8, u16)], wins: &[W]) -> GroupVm {
         .collect();
     let bytes = make_ystb(key, groups, &refs);
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
-    GroupVm::load(script).unwrap()
+    let mut vm = GroupVm::load(script).unwrap();
+    vm.set_native(Box::new(Host::new(None, (640, 480))));
+    vm
 }
 
-/// CG(FILE=非空) 创建 → CGINFO COLOR = 0x808080;槽13/14 无探针 = 0
-/// (图像头不可解析,诚实降级;引擎真值 = 图像尺寸)。
+/// CG with a FILE creates the layer; with no file system its image is 0×0,
+/// so SX, SY and the COLOR at (0, 0) answer 0, and EXIST answers 1.
 #[test]
 fn cginfo_sx_sy_color_defaults() {
     let vm = build(
@@ -77,6 +76,7 @@ fn cginfo_sx_sy_color_defaults() {
             (cmd::CGINFO, 3, 0),
             (cmd::CGINFO, 3, 0),
             (cmd::CGINFO, 5, 0),
+            (cmd::CGINFO, 3, 0),
             (cmd::RETURN, 0, 0),
         ],
         &[
@@ -94,6 +94,9 @@ fn cginfo_sx_sy_color_defaults() {
             W { slot: 34, bytes: vec![0x42, 1, 0, 0] }, // SET=0
             W { slot: 35, bytes: vec![0x42, 1, 0, 0] }, // SET2=0
             W { slot: 33, bytes: w_var(9002) },
+            W { slot: 0, bytes: w_str("btnA") },
+            W { slot: 2, bytes: w_push1() }, // EXIST
+            W { slot: 33, bytes: w_var(9003) },
         ],
     );
     let mut vm = vm;
@@ -102,21 +105,18 @@ fn cginfo_sx_sy_color_defaults() {
     assert_eq!(
         vm.store().get(&var(9000)).unwrap(),
         &Value::Int(0),
-        "槽13 = 图像宽;无 VFS 探针不可解析 → 0"
+        "SX = image width (0×0 without files)"
     );
     assert_eq!(
         vm.store().get(&var(9001)).unwrap(),
         &Value::Int(0),
-        "槽14 = 图像高;无 VFS 探针不可解析 → 0"
+        "SY = image height"
     );
-    assert_eq!(
-        vm.store().get(&var(9002)).unwrap(),
-        &Value::Int(8421504),
-        "COLOR 默认 0x808080"
-    );
+    assert_eq!(vm.store().get(&var(9002)).unwrap(), &Value::Int(0), "no pixel at (0, 0)");
+    assert_eq!(vm.store().get(&var(9003)).unwrap(), &Value::Int(1), "EXIST");
 }
 
-/// CG 无 FILE / FILE="" → 不创建 → CGINFO = 0(BT.OVER 族行为)。
+/// CG without FILE, or with `FILE=""`, does not create → CGINFO = 0.
 #[test]
 fn cginfo_no_file_not_created() {
     // CG(btnB, X) —— 无 FILE 槽
@@ -158,7 +158,7 @@ fn cginfo_no_file_not_created() {
     );
 }
 
-/// CGEND 按名移除 → 后续 CGINFO = 0。
+/// CGEND removes the layer → CGINFO = 0.
 #[test]
 fn cgend_unregisters() {
     let mut vm = build(
@@ -186,7 +186,7 @@ fn cgend_unregisters() {
     );
 }
 
-/// 已注册 CG 的 X/Y 写入与查询(模型 Likely,引擎槽位 +0x70/+0x78)。
+/// X/Y set by CG are answered by CGINFO.
 #[test]
 fn cginfo_x_y_roundtrip() {
     let mut vm = build(

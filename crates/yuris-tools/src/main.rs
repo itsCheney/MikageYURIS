@@ -78,6 +78,16 @@ enum Cmd {
         /// Counts how often groups are reached (`--watch 12:19,6:74`).
         #[arg(long, value_delimiter = ',')]
         watch: Vec<String>,
+        /// Saves the main window as PNG once the clock reaches MS
+        /// (`--shot title.png@60000`); repeat for more.
+        #[arg(long = "shot", value_name = "FILE@MS")]
+        shots: Vec<String>,
+        /// Registers a font file for text drawing (repeatable).
+        #[arg(long = "font")]
+        fonts: Vec<PathBuf>,
+        /// Text encoding of the game's strings: sjis (default), gbk, utf8.
+        #[arg(long, default_value = "sjis")]
+        encoding: String,
     },
     /// List the files of an Enigma Virtual Box exe or external package.
     Evb {
@@ -289,7 +299,7 @@ fn main() -> Result<()> {
                 println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
             }
         }
-        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch } => {
+        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch, shots, fonts, encoding } => {
             boot::run(boot::BootArgs {
                 dir,
                 launcher,
@@ -304,6 +314,9 @@ fn main() -> Result<()> {
                 cgs,
                 vars,
                 watch,
+                shots,
+                fonts,
+                encoding,
             })?;
         }
         Cmd::Ypf { sub } => match sub {

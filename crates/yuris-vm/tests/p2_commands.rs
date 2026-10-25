@@ -125,8 +125,8 @@ fn runtime_str_copy_real_sample() {
     );
 }
 
-/// script45 g26/g28 真实窗口:FONTINFO(B0=18 LET 目标 / B0=11、B0=13 参数)。
-/// 未声明目标读取 → 引擎容忍(实测),VM 事件记录 err,不挂起。
+/// script45 g26 real windows: FONTINFO (slot 18 LET target, slot 11 NUM).
+/// The query goes to the native host; the VM stores the host's answer.
 #[test]
 fn subsystem_fontinfo_real_sample() {
     let w0: &[u8] = &[0x48, 3, 0, 0x40, 0x7c, 0x0a]; // var @2684
@@ -139,22 +139,12 @@ fn subsystem_fontinfo_real_sample() {
     let bytes = make_ystb(SAMPLE_KEY, groups, windows);
     let script = YstbFile::from_bytes(&bytes, SAMPLE_KEY).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
+    vm.set_native(Box::new(common::Recorder::default()));
     vm.run(100).unwrap();
-    let ev = vm.events().iter().find_map(|e| match e {
-        VmEvent::Subsystem { command, evaluated, .. } if *command == 0x1b => {
-            Some(evaluated.clone())
-        }
-        _ => None,
-    });
-    let evaluated = ev.expect("FONTINFO 应产生 Subsystem 事件");
-    // NUM 查询写回 @2684 = oracle 字体数(环境依赖常量,与 lib.rs 同步;
-    // 2026-09-05 采集 = 783)
-    const FONTS: i64 = 783;
-    assert_eq!(evaluated.len(), 2, "两个窗口都应记录");
-    assert_eq!(evaluated[0], (18, format!("int:{FONTS}")));
-    assert_eq!(evaluated[1], (11, "int:1".to_string()));
-    let r = VarRef { space: VarSpace::At, id: 2684 };
-    assert_eq!(vm.store().get(&r).unwrap(), &Value::Int(FONTS));
+    let calls = common::recorded(&vm);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "FONTINFO");
+    assert_eq!(calls[0].1, vec![("NUM".to_string(), Value::Int(1))], "LET is not passed as a value");
 }
 
 /// script190 g342 真实窗口:MATH(函数选择 B0=20 + 操作数 @53[1]/@53[2]
@@ -203,12 +193,13 @@ fn subsystem_math_real_sample() {
     );
 }
 
-/// 子系统族全量:0x0e/0x14/0x15/0x1a/0x1c/0x31/0x45/0x5d/0x6b 各命令事件化
-/// (反编译引用:004699cc/0043da80/0043eb28/00441338/004426a4/00443480/
-/// 0044955c/0044f968/004583bc —— 引擎侧均为子系统状态操作,无 VM 状态)。
+/// 子系统族全量:0x0e/0x14/0x15/0x1c/0x31/0x5d 各命令事件化
+/// (反编译引用:004699cc/0043da80/0043eb28/004426a4/00443480/0044f968
+/// —— 引擎侧均为子系统状态操作,无 VM 状态)。FONT (0x1a), MOUSE (0x45)
+/// and WINDOWINFO (0x6b) go to the native host instead.
 #[test]
 fn subsystem_family_events() {
-    let cmds = [0x0eu8, 0x14, 0x15, 0x1a, 0x1c, 0x31, 0x45, 0x5d, 0x6b];
+    let cmds = [0x0eu8, 0x14, 0x15, 0x1c, 0x31, 0x5d];
     let w: &[u8] = &[0x42, 1, 0, 3]; // push 3
     for c in cmds {
         let groups: &[(u8, u8, u16)] = &[(c, 1, 0), (cmd::RETURN, 0, 0)];

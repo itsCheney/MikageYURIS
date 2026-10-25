@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use yuris_format::vfs::GameFs;
+use yuris_host::Host;
 use yuris_format::yscm::YscmTable;
 use yuris_format::ystb::YstbFile;
 use yuris_vm::boot::Bootstrap;
@@ -34,6 +35,12 @@ pub struct BootArgs {
     pub vars: Vec<u16>,
     /// Watch points, `script:pc`.
     pub watch: Vec<String>,
+    /// Screenshots, `FILE.png@MS`.
+    pub shots: Vec<String>,
+    /// Font files to register (TTF/OTF/TTC, first face).
+    pub fonts: Vec<PathBuf>,
+    /// Text encoding of the scripts' strings (`sjis` or `gbk`).
+    pub encoding: String,
 }
 
 fn hex(k: &[u8]) -> String {
@@ -110,6 +117,32 @@ pub fn run(args: BootArgs) -> Result<()> {
     println!("scripts failing to parse with this key: {bad}");
 
     let mut vm = booted.vm;
+    let cfg = fs
+        .read("ysbin\\yscfg.ybn")
+        .ok()
+        .and_then(|b| yuris_format::yscf::YscfFile::from_bytes(&b).ok());
+    let screen = match &cfg {
+        Some(c) if c.screen_width > 0 && c.screen_height > 0 => (c.screen_width, c.screen_height),
+        _ => (1280, 720),
+    };
+    println!("screen: {}x{}", screen.0, screen.1);
+    let mut host = Host::new(Some(fs.clone()), screen);
+    host.encoding = match args.encoding.to_ascii_lowercase().as_str() {
+        "gbk" | "gb2312" | "cp936" => encoding_rs::GBK,
+        "utf8" | "utf-8" => encoding_rs::UTF_8,
+        _ => encoding_rs::SHIFT_JIS,
+    };
+    if let Some(c) = &cfg {
+        host.caption = host.encoding.encode(&c.caption).0.into_owned();
+    }
+    for f in &args.fonts {
+        let bytes = std::fs::read(f).with_context(|| format!("read {}", f.display()))?;
+        let name = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if !host.fonts.add_face(&name, bytes, 0) {
+            anyhow::bail!("{} is not a font", f.display());
+        }
+    }
+    vm.set_native(Box::new(host));
     vm.set_strict(args.strict);
     // Control-flow events cost most of a run; record them only if asked.
     vm.set_trace(args.trace || args.tail > 0);
@@ -153,6 +186,15 @@ pub fn run(args: BootArgs) -> Result<()> {
         }
     }
     vm.set_watch(&watch);
+    let mut shots: Vec<(PathBuf, u64)> = Vec::new();
+    for sh in &args.shots {
+        match sh.rsplit_once('@').and_then(|(f, t)| Some((PathBuf::from(f), t.trim().parse().ok()?))) {
+            Some(p) => shots.push(p),
+            None => anyhow::bail!("--shot wants FILE.png@MS, got {sh:?}"),
+        }
+    }
+    shots.sort_by_key(|s| s.1);
+    let mut next_shot = 0usize;
     let mut next_click = 0usize;
     let mut button_down = false;
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -198,6 +240,16 @@ pub fn run(args: BootArgs) -> Result<()> {
                 frames += 1;
                 let step = time_ms.unwrap_or(0).max(counter.unwrap_or(1) * 1000 / 60).max(1);
                 vm.set_clock_ms(vm.clock_ms() + step);
+                while let Some((file, t)) = shots.get(next_shot) {
+                    if vm.clock_ms() < *t {
+                        break;
+                    }
+                    if let Some(h) = vm.native_as::<Host>() {
+                        save_png(file, &h.render())?;
+                        println!("screenshot {} ({:.1} s)", file.display(), vm.clock_ms() as f64 / 1000.0);
+                    }
+                    next_shot += 1;
+                }
                 if let Some(&(x, y, t)) = clicks.get(next_click) {
                     if vm.clock_ms() >= t {
                         println!("click at {x},{y} ({:.1} s)", vm.clock_ms() as f64 / 1000.0);
@@ -265,13 +317,35 @@ pub fn run(args: BootArgs) -> Result<()> {
             .collect();
         println!("vars: {}", vals.join(" "));
     }
-    if let Some(filter) = &args.cgs {
-        println!("CGs matching {filter:?} (name x y w h file):");
-        for (name, x, y, w, h, file) in vm.cg_list() {
-            let name = String::from_utf8_lossy(&name).into_owned();
-            if name.contains(filter.as_str()) {
-                let file = file.map(|f| decode_cp932(&f)).unwrap_or_default();
-                println!("  {name:<40} {x:>5} {y:>5} {w:>5} {h:>5} {file}");
+    if let Some(h) = vm.native_as::<Host>() {
+        // Shots asked for after the run stopped are taken at the end.
+        for (file, _) in &shots[next_shot..] {
+            save_png(file, &h.render())?;
+            println!("screenshot {} (end of run)", file.display());
+        }
+        if let Some(filter) = &args.cgs {
+            println!("layers matching {filter:?} (path E A x y z w h file):");
+            for (id, l) in h.tree.iter() {
+                let path = h.encoding.decode(&h.tree.path_of(id)).0.into_owned();
+                if path.contains(filter.as_str()) {
+                    let file = h.encoding.decode(&l.file).0.into_owned();
+                    println!(
+                        "  {path:<44} {} {:>3} {:>5} {:>5} {:>8} {:>5} {:>5} {file}",
+                        u8::from(l.enabled),
+                        l.alpha,
+                        l.x,
+                        l.y,
+                        l.z,
+                        l.width(),
+                        l.height()
+                    );
+                }
+            }
+        }
+        if !h.notes.is_empty() {
+            println!("host notes ({}):", h.notes.len());
+            for n in h.notes.iter().take(40) {
+                println!("  {n}");
             }
         }
     }
@@ -335,9 +409,9 @@ pub fn run(args: BootArgs) -> Result<()> {
     Ok(())
 }
 
-const KINDS: [&str; 16] = [
-    "GroupExecuted", "Jump", "Call", "Text", "Cg", "Sound", "VarQuery", "Declaration", "CgAct",
-    "CgInfo", "Load", "Save", "CgEnd", "ScriptSwitch", "Unsupported", "Subsystem",
+const KINDS: [&str; 12] = [
+    "GroupExecuted", "Jump", "Call", "Text", "Native", "VarQuery", "Declaration", "Load", "Save",
+    "ScriptSwitch", "Unsupported", "Subsystem",
 ];
 
 /// Index into [`KINDS`].
@@ -347,22 +421,23 @@ fn kind(e: &VmEvent) -> usize {
         VmEvent::Jump { .. } => 1,
         VmEvent::Call { .. } => 2,
         VmEvent::Text { .. } => 3,
-        VmEvent::Cg { .. } => 4,
-        VmEvent::Sound { .. } => 5,
-        VmEvent::VarQuery { .. } => 6,
-        VmEvent::Declaration { .. } => 7,
-        VmEvent::CgAct { .. } => 8,
-        VmEvent::CgInfo { .. } => 9,
-        VmEvent::Load { .. } => 10,
-        VmEvent::Save { .. } => 11,
-        VmEvent::CgEnd { .. } => 12,
-        VmEvent::ScriptSwitch { .. } => 13,
-        VmEvent::Unsupported { .. } => 14,
-        VmEvent::Subsystem { .. } => 15,
+        VmEvent::Native { .. } => 4,
+        VmEvent::VarQuery { .. } => 5,
+        VmEvent::Declaration { .. } => 6,
+        VmEvent::Load { .. } => 7,
+        VmEvent::Save { .. } => 8,
+        VmEvent::ScriptSwitch { .. } => 9,
+        VmEvent::Unsupported { .. } => 10,
+        VmEvent::Subsystem { .. } => 11,
     }
 }
 
-/// CP932 bytes as text (file names in scripts are CP932).
-fn decode_cp932(b: &[u8]) -> String {
-    encoding_rs::SHIFT_JIS.decode(b).0.into_owned()
+/// Writes an RGBA image as PNG.
+fn save_png(path: &std::path::Path, img: &yuris_format::vfs::RgbaImage) -> Result<()> {
+    let f = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?);
+    let mut enc = png::Encoder::new(f, img.width, img.height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(&img.data)?;
+    Ok(())
 }

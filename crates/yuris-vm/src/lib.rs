@@ -29,6 +29,7 @@ use std::collections::HashMap;
 pub mod boot;
 pub mod commands;
 pub mod host;
+pub mod native;
 mod tasks;
 pub use tasks::TaskReport;
 
@@ -215,35 +216,6 @@ pub enum VmEvent {
         /// CLEAR 参数(=1 先清空)。
         clear_flag: bool,
     },
-    /// CG:立绘/背景操作(ID,+ X/Y/Z 位置等关键参数)。
-    Cg {
-        /// 组下标。
-        pc: usize,
-        /// 发出命令的脚本号(yst%05d;素材请求源定位用,成果 75)。
-        script_id: u16,
-        /// ID(名称,若为字符串)。
-        id: Option<String>,
-        /// X/Y/Z 位置(若提供)。
-        position: Option<(i64, i64, i64)>,
-        /// 其他已提供参数计数(按 B0 下标)。
-        param_count: usize,
-        /// FILE 槽(46;带图像装载的 CG 命令非空;渲染驱动按此加载资源;
-        /// 无 FILE = 位置/状态更新,沿用手头资源)。
-        file: Option<Vec<u8>>,
-    },
-    /// SOUND:音频操作(ID/FILE/PLAY/LOOP/VOLUME 等)。
-    Sound {
-        /// 组下标。
-        pc: usize,
-        /// ID(名称,若给定)。
-        id: Option<String>,
-        /// FILE(路径,若为字符串)。
-        file: Option<String>,
-        /// PLAY(是否播放;引擎非零=播放)。
-        play: Option<i64>,
-        /// 其他参数计数。
-        param_count: usize,
-    },
     /// VARACT/VARINFO 只读查询结果(字符串长度/维度/类型查询等)。
     /// 只读槽求值记录;**写回类槽(赋值/裁剪/大小写/PUSH/POP)走 Unsupported**——
     /// 未逆向写回目标前不猜(铁律)。
@@ -264,25 +236,6 @@ pub enum VmEvent {
         command: u8,
         /// 参数窗口数。
         windows: u8,
-    },
-    /// CGACT:CGM 图层操作(合成/变换等;71 参,运行期图形管线,只记录已求值参数摘要)。
-    CgAct {
-        /// 组下标。
-        pc: usize,
-        /// ID(B0=0,字符串,若给定)。
-        id: Option<String>,
-        /// 已求值参数摘要:(B0 槽, 值摘要)。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// CGINFO:CG 图层属性查询(引擎 CMDH_0043b084)。
-    /// 无图形后端 ⇒ CG 必然不存在 ⇒ 引擎「不存在」路径(结果缓冲清零,LET=0)。
-    CgInfo {
-        /// 组下标。
-        pc: usize,
-        /// ID(槽 0,CG 名)。
-        id: Option<String>,
-        /// 已求值参数摘要((槽, 值摘要);255 = 写回目标记录)。
-        evaluated: Vec<(u8, String)>,
     },
     /// LOAD:YSSD 系统数据装载(FILE + DNO + 写回目标;引擎 CMDH_00444648)。
     /// 装载路径 = 松散文件 + SNP 解压 + `FUN_0044564d` 写回(见 `load_yssd`);
@@ -311,16 +264,6 @@ pub enum VmEvent {
         /// 已求值参数摘要。
         evaluated: Vec<(u8, String)>,
     },
-    /// CGEND:CG 显示结束通知(ID 字符串;引擎 LAB_0043ad14)。
-    /// 无图形后端 → 事件化记录,不触碰图形状态。
-    CgEnd {
-        /// 组下标。
-        pc: usize,
-        /// ID(字符串)。
-        id: Option<String>,
-        /// 已求值参数摘要。
-        evaluated: Vec<(u8, String)>,
-    },
     /// 跨脚本上下文切换。
     ScriptSwitch {
         /// 源脚本号(0 表示未知/未初始化 —— 仅诊断)。
@@ -338,8 +281,18 @@ pub enum VmEvent {
         /// 原因描述。
         reason: String,
     },
-    /// 后端子系统配置/查询族(P2):FONTINFO/MATH/FILEINFO/FILEACT/WINDOWINFO/
-    /// MOUSE/FONT/SYSTEM/ERROR/FPS/INPUT。引擎处理器做子系统状态操作
+    /// A native command (CG family, FONT, SOUND family, WINDOWEND/INFO,
+    /// MOUSE) handed to the native host; recorded only when tracing.
+    Native {
+        /// Group index.
+        pc: usize,
+        /// Canonical command index.
+        command: u8,
+        /// Evaluated parameters as `PARAM=value`; slot 255 = the LET answer.
+        evaluated: Vec<(u8, String)>,
+    },
+    /// 后端子系统配置/查询族(P2):MATH/FILEINFO/FILEACT/SYSTEM/ERROR/FPS/
+    /// INPUT。引擎处理器做子系统状态操作
     /// (字体层/文件/输入模式/数学函数),无后端 → 事件化记录已求值参数。
     Subsystem {
         /// 组下标。
@@ -429,44 +382,11 @@ pub fn event_json(e: &VmEvent) -> String {
                 r#"{{"ev":"text","pc":{pc},"file":{f},"let":{let_flag},"clear":{clear_flag}}}"#
             )
         }
-        VmEvent::Cg { pc, script_id, id, position, param_count, file } => {
-            let idj = id.clone()
-                .map(|i| "{\"s\":\"".to_string() + &json_escape(&i) + "\"}")
-                .unwrap_or_else(|| "null".to_string());
-            let posj = position.map(|(x, y, z)| format!(r#"{{"x":{x},"y":{y},"z":{z}}}"#)).unwrap_or_else(|| "null".to_string());
-            let fj = file.clone().map(|f| {
-                let hex: Vec<String> = f.iter().map(|b| format!("{b:02x}")).collect();
-                format!(r#"{{"hex":"{}"}}"#, hex.join(""))
-            }).unwrap_or_else(|| "null".to_string());
-            format!(r#"{{"ev":"cg","sid":{script_id},"pc":{pc},"id":{idj},"pos":{posj},"n":{param_count},"file":{fj}}}"#)
-        }
-        VmEvent::Sound { pc, id, file, play, param_count } => {
-            let idj = id.clone()
-                .map(|i| "{\"s\":\"".to_string() + &json_escape(&i) + "\"}")
-                .unwrap_or_else(|| "null".to_string());
-            let fj = file.clone()
-                .map(|i| "{\"s\":\"".to_string() + &json_escape(&i) + "\"}")
-                .unwrap_or_else(|| "null".to_string());
-            let pj = play.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string());
-            format!(r#"{{"ev":"sound","pc":{pc},"id":{idj},"file":{fj},"play":{pj},"n":{param_count}}}"#)
-        }
         VmEvent::ScriptSwitch { from_script, to_script } => {
             format!(r#"{{"ev":"switch","from":{from_script},"to":{to_script}}}"#)
         }
         VmEvent::Declaration { pc, command, windows } => {
             format!(r#"{{"ev":"decl","pc":{pc},"cmd":{command},"w":{windows}}}"#)
-        }
-        VmEvent::CgAct { pc, id, evaluated } => {
-            let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
-            let ev: Vec<String> = evaluated.iter().map(|(b, v)| format!("{b}:{}", json_escape(v))).collect();
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"cgact","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
-        }
-        VmEvent::CgInfo { pc, id, evaluated } => {
-            let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
-            let ev: Vec<String> = evaluated.iter().map(|(b, v)| format!("{b}:{}", json_escape(v))).collect();
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"cginfo","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
         }
         VmEvent::Load { pc, file, evaluated } => {
             let fj = file.as_ref().map(|b| {
@@ -495,10 +415,9 @@ pub fn event_json(e: &VmEvent) -> String {
                 r#"{{"ev":"save","pc":{pc},"file":{fj},"dno":{dj},"set":{sj},"ev_":{ev}}}"#
             )
         }
-        VmEvent::CgEnd { pc, id, evaluated } => {
-            let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
+        VmEvent::Native { pc, command, evaluated } => {
             let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"cgend","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
+            format!(r#"{{"ev":"native","pc":{pc},"cmd":{command},"ev_":{ev}}}"#)
         }
         VmEvent::Subsystem { pc, command, evaluated } => {
             let ev = ev_arr(&evaluated);
@@ -576,65 +495,6 @@ pub struct IfFrame {
 
 /// CG 状态注册表条目(P7.1,成果 62;P1 收尾定稿)。
 ///
-/// 引擎侧 CG 对象(kemonomichi2.exe 处理器 0x423864 写 X→+0x70 /
-/// Y→+0x78 / E→+0xab 等)的最小语义模型:CG 命令按名 upsert,
-/// CGINFO 查询 SX(槽13)/SY(槽14)/COLOR(槽24)。
-///
-/// **槽13/14 = 装载图像的真实宽/高(Confirmed,引擎 watch oracle)**:
-/// script9 g1089 CGINFO 写 @1705:occ1 = 1.0(= `cgsys\dummy.png`,1×1
-/// 占位图)、occ2 = 1350.0(= `tip_meswindow_txspace.png`,1350×200 消息窗
-/// 纹理);两图均经封包扫描确认存在(`yuris-resource` dims_probe)。
-/// g1092 IF `SX==1 && SY==1 && COLOR==0x808080` = 「是 1×1 占位图」判定。
-/// Here: when the CG command's FILE slot (46) is set, `GameFs::image_size`
-/// reads the image header into [`img_w`](CgState::img_w) /
-/// [`img_h`](CgState::img_h); an unreadable image (no file probe, or a format
-/// without a parsed header) gives 0.
-/// 缩放乘积(若有)未验证 —— 应答值与图像尺寸逐字节吻合,乘数 = 1。
-///
-/// sx/sy(CG 槽9/10)与图像尺寸**无关**(旧「默认 SX=1/SY=1 应答」模型
-/// 作废:那只是 occ1 恰好命中 1×1 占位图的巧合)。语义 = Likely(缩放),
-/// 不参与 CGINFO 应答。
-///
-/// COLOR(槽24)= 0x808080:occ1 实证(引擎写回 0x808080);「新建 CG
-/// 未指定 COLOR 槽 ⇒ 取 0x808080」的一般化规则为 Likely。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CgState {
-    /// X(CG 槽 4;引擎 +0x70)。未执行查询,模型 Likely。
-    pub x: i64,
-    /// Y(CG 槽 5;引擎 +0x78)。未执行查询,模型 Likely。
-    pub y: i64,
-    /// Z(CG 槽 6)。未执行查询,模型 Likely。
-    pub z: i64,
-    /// 缩放 X(CG 槽 9;引擎语义 Likely,不参与 CGINFO 应答)。
-    pub sx: i64,
-    /// 缩放 Y(CG 槽 10;引擎语义 Likely,不参与 CGINFO 应答)。
-    pub sy: i64,
-    /// 装载图像宽(CGINFO 槽 13 应答;watch oracle 实证)。
-    pub img_w: i64,
-    /// 装载图像高(CGINFO 槽 14 应答;watch oracle 实证)。
-    pub img_h: i64,
-    /// 最近一次非空 FILE 槽(纹理路径;P8.2b 重放按路径分 z 带用)。
-    pub file: Option<Vec<u8>>,
-    /// 色(COLOR;CGINFO 槽 24 查询,CG 命令无对应槽)。
-    pub color: i64,
-}
-
-impl Default for CgState {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            z: 0,
-            sx: 1,
-            sy: 1,
-            img_w: 0,
-            img_h: 0,
-            file: None,
-            color: 0x80_80_80,
-        }
-    }
-}
-
 /// YU-RIS 组级 VM(单脚本)。
 pub struct GroupVm {
     /// 当前脚本上下文(组表 + 窗口起始)。
@@ -694,37 +554,13 @@ pub struct GroupVm {
     frame_pos: usize,
     /// A frame was handed to the host; the next `run` starts a new one.
     frame_done: bool,
-    /// CG 状态注册表(CG 名(SJIS 字节)→ 状态;P7.1,成果 62)。
-    cg_registry: HashMap<Vec<u8>, CgState>,
+    /// The native command host (layers, fonts, sound, windows).
+    native: Box<dyn native::Native>,
     /// Watch points (script, pc, times reached), for diagnostics.
     watch: Vec<(u16, usize, u64)>,
-    /// Decoded CG images by file, for CGINFO ONMOUSE (None = unreadable).
-    cg_images: HashMap<Vec<u8>, Option<std::sync::Arc<yuris_format::vfs::RgbaImage>>>,
 }
 
 impl GroupVm {
-    /// CG 注册表快照(P8.2b 重放:名称 SJIS 字节 + 注册 x/y + 最近 FILE)。
-    /// 播放器进游戏时按此重建 VM UI 层(纹理已在播放器侧按 fnv(名) 预载)。
-    pub fn cg_registry_snapshot(&self) -> Vec<(Vec<u8>, i64, i64, Option<Vec<u8>>)> {
-        self.cg_registry
-            .iter()
-            .map(|(k, v)| (k.clone(), v.x, v.y, v.file.clone()))
-            .collect()
-    }
-
-    /// 按名称查注册表当前 x/y(es.BT.XY.SET 经 CGACT 落库后的权威位置;
-    /// ASCII 名精确匹配,SJIS 名经 lossy 往返可能失配 → None)。
-    pub fn cg_position(&self, name: &str) -> Option<(i64, i64)> {
-        self.cg_registry
-            .get(name.as_bytes())
-            .map(|st| (st.x, st.y))
-    }
-
-    /// 注册表条数(诊断日志用)。
-    pub fn cg_registry_len(&self) -> usize {
-        self.cg_registry.len()
-    }
-
     /// 装载脚本。组模型校验失败(非 v555 形态)→ `Err`。
     ///
     /// 帧栈预置**基帧**(引擎 record[0],GOSUB 反编译 004428c0/0044b418
@@ -770,9 +606,8 @@ impl GroupVm {
             frame_order: Vec::new(),
             frame_pos: 0,
             frame_done: false,
-            cg_registry: HashMap::new(),
+            native: Box::new(native::NullNative),
             watch: Vec::new(),
-            cg_images: HashMap::new(),
         })
     }
 
@@ -858,15 +693,24 @@ impl GroupVm {
         }
     }
 
-    /// The registered CGs: (name, x, y, image width, image height, file).
-    pub fn cg_list(&self) -> Vec<(Vec<u8>, i64, i64, i64, i64, Option<Vec<u8>>)> {
-        let mut v: Vec<_> = self
-            .cg_registry
-            .iter()
-            .map(|(k, s)| (k.clone(), s.x, s.y, s.img_w, s.img_h, s.file.clone()))
-            .collect();
-        v.sort();
-        v
+    /// Sets the native command host.
+    pub fn set_native(&mut self, native: Box<dyn native::Native>) {
+        self.native = native;
+    }
+
+    /// The native command host.
+    pub fn native(&self) -> &dyn native::Native {
+        self.native.as_ref()
+    }
+
+    /// The native command host, as its concrete type.
+    pub fn native_as<T: native::Native>(&self) -> Option<&T> {
+        self.native.as_any().downcast_ref::<T>()
+    }
+
+    /// The native command host, as its concrete type.
+    pub fn native_as_mut<T: native::Native>(&mut self) -> Option<&mut T> {
+        self.native.as_any_mut().downcast_mut::<T>()
     }
 
     pub fn set_file_probe(&mut self, probe: std::sync::Arc<yuris_format::vfs::GameFs>) {
@@ -1965,6 +1809,11 @@ impl GroupVm {
                         None => continue,
                     }
                 }
+                cmd::CG | cmd::CGACT | cmd::CGEND | cmd::CGINFO | cmd::SOUND => {
+                    self.exec_native(g.command_type, &windows)?;
+                    self.pc += 1;
+                    continue;
+                }
                 cmd::TEXT => {
                     // 引擎 CMDH_00452888:FILE 参数为字符串(UTF-8/SJIS)→ 显示层;
                     // LET/CLEAR 为布尔。事件化;不阻塞(点击等待在文本层,非本 VM)。
@@ -1999,134 +1848,6 @@ impl GroupVm {
                         file,
                         let_flag,
                         clear_flag,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CG => {
-                    // 引擎处理器 = 0x423864(表初始化 DAT_0078b024 实锤;
-                    // 勘误:0x43c984 是 cmd 0x0a DIALOG,此前误标为 CG)。
-                    // 求值全部参数,按 B0 槽填入;
-                    // 事件化记录 ID(槽 0)/X,Y,Z(槽 4/5/6),其余计数。
-                    // 槽位映射草案见 bridge 模块文档(成果 48)。
-                    // P7.1(成果 62):按名 upsert CG 状态注册表(引擎仅写
-                    // 已指定槽,未指定字段保持原值/新建默认 —— 反编译
-                    // 0x423864 逐槽 if(DAT_006624xx) 写,实证)。
-                    let mut id = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let (mut cx, mut cy, mut cz) = (None, None, None);
-                    let (mut csx, mut csy) = (None, None);
-                    let mut file: Option<Vec<u8>> = None;
-                    let mut count = 0usize;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            count += 1;
-                            match (slot, &v) {
-                                (0, Value::Str(bytes)) => {
-                                    id = Some(v.str_as_string());
-                                    id_bytes = Some(bytes.clone());
-                                }
-                                (4, Value::Int(n)) => cx = Some(*n),
-                                (5, Value::Int(n)) => cy = Some(*n),
-                                (6, Value::Int(n)) => cz = Some(*n),
-                                (9, Value::Int(n)) => csx = Some(*n),
-                                (10, Value::Int(n)) => csy = Some(*n),
-                                (46, Value::Str(bytes)) => file = Some(bytes.clone()),
-                                _ => {}
-                            }
-                        }
-                    }
-                    let position = match (cx, cy) {
-                        (Some(x), Some(y)) => Some((x, y, cz.unwrap_or(0))),
-                        _ => None,
-                    };
-                    // 注册表维护(成果 62,引擎 0x423864 + watch oracle 实证):
-                    // FILE 槽(46)非空 → 创建(注册;已存在则按已指定槽 patch);
-                    // 无 FILE / FILE="" → 静默不创建(处理器 return 0 路径),
-                    // 已注册者仅 patch —— 后续 CGINFO 查未注册名走「不存在」
-                    // 路径写 0(BT.OVER/ON/ONOV/MASK vs BT.OFF/NA 对拍实证)。
-                    // P1 收尾:FILE 非空时经 VFS 探针解析图像头,填
-                    // img_w/img_h(CGINFO 槽13/14 真值应答源)。
-                    let image_dims = match (&file, &self.file_probe) {
-                        (Some(f), Some(probe)) => {
-                            probe
-                                .image_size(&String::from_utf8_lossy(f))
-                                .map(|(w, h)| (w as i64, h as i64))
-                        }
-                        _ => None,
-                    };
-                    if let Some(bytes) = &id_bytes {
-                        let create = matches!(&file, Some(f) if !f.is_empty());
-                        let exists = self.cg_registry.contains_key(bytes);
-                        if create || exists {
-                            let st = self.cg_registry.entry(bytes.clone()).or_default();
-                            if let Some(x) = cx {
-                                st.x = x;
-                            }
-                            if let Some(y) = cy {
-                                st.y = y;
-                            }
-                            if let Some(z) = cz {
-                                st.z = z;
-                            }
-                            if let Some(sx) = csx {
-                                st.sx = sx;
-                            }
-                            if let Some(sy) = csy {
-                                st.sy = sy;
-                            }
-                            if let Some((w, h)) = image_dims {
-                                st.img_w = w;
-                                st.img_h = h;
-                            }
-                            if let Some(f) = &file {
-                                if !f.is_empty() {
-                                    st.file = Some(f.clone());
-                                }
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::Cg {
-                        pc: self.pc,
-                        script_id: self.ctx.script_id,
-                        id,
-                        position,
-                        param_count: count,
-                        file: file.clone(),
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::SOUND => {
-                    let mut id = None;
-                    let mut file = None;
-                    let mut play = None;
-                    let mut count = 0usize;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            count += 1;
-                            match (slot, &v) {
-                                (0, Value::Str(_)) => id = Some(v.str_as_string()),
-                                (2, Value::Str(_)) => file = Some(v.str_as_string()),
-                                (3, Value::Int(n)) => play = Some(*n),
-                                _ => {}
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::Sound {
-                        pc: self.pc,
-                        id,
-                        file,
-                        play,
-                        param_count: count,
                     });
                     self.pc += 1;
                     continue;
@@ -2693,183 +2414,6 @@ impl GroupVm {
                     self.pc += 1;
                     continue;
                 }
-                cmd::CGINFO => {
-                    // 引擎 CMDH_0043b084(Confirmed 结构):
-                    // ID(槽0,k1)=CG 名;IDNO(1)=名字后缀拼接;LET(槽33)=结果写回目标;
-                    // 其余槽(EXIST/X/Y/SX/SY/ONMOUSE…)=查询项(非零启用)。
-                    // 全部查询汇入结果缓冲(函数头清零 DAT_005c0840=0)→ 接收器写 LET。
-                    // P7.1(成果 62):按 CG 状态注册表应答已建模查询
-                    //   (EXIST(2)=1 / X(5)/Y(6)/SX(13)/SY(14)/COLOR(24));
-                    // **CG 未注册(名不存在)⇒ 引擎「不存在」路径 ⇒ 恒写 Int(0)**
-                    //   (iVar6==0 → 接收器以清零缓冲写 LET,Confirmed);
-                    // 未建模查询(ONMOUSE/TRIM/LINT 族)在 CG 存在时不写回
-                    //   (语义 Unknown,不猜;boot trace 未执行到)。
-                    let mut id: Option<String> = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let mut let_target: Option<VarTarget> = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    let mut pending_let: Option<yuris_format::ystb::CommandSlot> = None;
-                    let mut query: Option<u8> = None;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            0 => {
-                                if let Some(v) = self.eval_window_condition(Some(w))? {
-                                    if let Value::Str(bytes) = &v {
-                                        id = Some(v.str_as_string());
-                                        id_bytes = Some(bytes.clone());
-                                    }
-                                    if self.trace {
-                                        evaluated.push((slot, value_summary(&v)));
-                                    }
-                                }
-                            }
-                            33 => pending_let = Some(w.clone()),
-                            _ => {
-                                if let Some(v) = self.eval_window_condition(Some(w))? {
-                                    if self.trace {
-                                        evaluated.push((slot, value_summary(&v)));
-                                    }
-                                    if query.is_none() {
-                                        query = Some(slot);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(w) = pending_let {
-                        let bytes = self
-                            .ctx
-                            .script
-                            .window_bytes_pooled_copy(&w)
-                            .ok_or_else(|| Error::format("CGINFO LET 引用窗越过池尾"))?;
-                        let_target = Some(extract_var_target(&bytes)?);
-                    }
-                    // 查询应答:注册命中 → 状态字段;未命中 → 0(引擎
-                    // 「不存在」路径);已建模查询之外的槽不写回(Unknown)。
-                    // 槽13/14 = 装载图像真实宽/高(引擎 watch oracle 实证:
-                    // occ1 dummy.png 1×1 → 1.0;occ2 txspace → 1350.0)。
-                    let mut answer: Option<i64> = None;
-                    if let (Some(name), Some(q @ 21..=23)) = (&id_bytes, query) {
-                        if self.cg_registry.contains_key(name) {
-                            answer = Some(self.cg_onmouse(name, q));
-                        }
-                    }
-                    if let (Some(name), Some(q), None) = (&id_bytes, query, answer) {
-                        match self.cg_registry.get(name) {
-                            Some(st) => match q {
-                                2 => answer = Some(1),       // EXIST
-                                5 => answer = Some(st.x),    // X
-                                6 => answer = Some(st.y),     // Y
-                                13 => answer = Some(st.img_w), // 图像宽
-                                14 => answer = Some(st.img_h), // 图像高
-                                24 => answer = Some(st.color), // COLOR
-                                _ => {}                      // 未建模:不写
-                            },
-                            None => answer = Some(0),
-                        }
-                    }
-                    if let (Some(target), Some(v)) = (&let_target, answer) {
-                        self.write_var_target(target, Value::Int(v))?;
-                        let note = match (&id, query) {
-                            (Some(n), Some(q)) => {
-                                format!("→ {} (cg {n:?} q{q} = {v})", target.summary())
-                            }
-                            _ => format!("→ {}", target.summary()),
-                        };
-                        if self.trace {
-                            evaluated.push((255u8, note));
-                        }
-                    } else if let (Some(target), Some(name_bytes)) = (&let_target, &id_bytes) {
-                        // 未建模查询且 CG 存在:不写回(变量保持原值)。
-                        if self.cg_registry.contains_key(name_bytes) {
-                            if self.trace {
-                                evaluated.push((
-                                    254u8,
-                                    format!("→ {} (未建模查询,不写回)", target.summary()),
-                                ));
-                            }
-                        } else {
-                            self.write_var_target(target, Value::Int(0))?;
-                            let name = id.as_deref().unwrap_or("?");
-                            if self.trace {
-                                evaluated.push((
-                                    255u8,
-                                    format!("→ {} (cg {name:?} 不存在路径=0)", target.summary()),
-                                ));
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::CgInfo {
-                        pc: self.pc,
-                        id,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CGACT => {
-                    // 引擎 CMDH_0042607c(12466B):71 参,运行期图形管线合成。
-                    // ID(B0=0,字符串)记录;B0=0x0c/0x0d = X/Y(成果 82 勘误 4:
-                    // es.BT.XY.SET 宏体实证 —— yst00009 组1083 将 XY.SET(531,10)
-                    // 的实参转发给 CGACT 槽 0x0c=531/0x0d=10)→ 命中已注册
-                    // CG 即 patch 注册表 x/y(后续 CGINFO 查询/重放可见)。
-                    let mut id = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let mut act_x = None;
-                    let mut act_y = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            match slot {
-                                0 => {
-                                    if let Value::Str(b) = &v {
-                                        id_bytes = Some(b.clone());
-                                        id = Some(v.str_as_string());
-                                    }
-                                }
-                                0x0c => {
-                                    if let Value::Int(n) = v {
-                                        act_x = Some(n);
-                                    }
-                                }
-                                0x0d => {
-                                    if let Value::Int(n) = v {
-                                        act_y = Some(n);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            if self.trace {
-                                evaluated.push((slot, value_summary(&v)));
-                            }
-                        }
-                    }
-                    if let Some(b) = id_bytes {
-                        if let Some(st) = self.cg_registry.get_mut(&b) {
-                            if let Some(x) = act_x {
-                                st.x = x;
-                            }
-                            if let Some(y) = act_y {
-                                st.y = y;
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::CgAct {
-                        pc: self.pc,
-                        id,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
                 cmd::LOAD => {
                     // 引擎 CMDH_00444648(文件分支,反编译 p5_sysvar/):
                     // 槽 0 = FILE(求值;无扩展名 → 补 ".sd";'/'→'\')、
@@ -3042,41 +2586,6 @@ impl GroupVm {
                         file,
                         dno,
                         set_target,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CGEND => {
-                    // 引擎 LAB_0043ad14(cmd 0x03;命令表 slot 11):ID(槽0,字符串)
-                    // = 结束显示的 CG 名。P7.1(成果 62):同步从 CG 状态
-                    // 注册表移除(显示结束 ⇒ 后续 CGINFO 查询走「不存在」路径)。
-                    let mut id = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            if slot == 0 {
-                                if let Value::Str(bytes) = &v {
-                                    id = Some(v.str_as_string());
-                                    id_bytes = Some(bytes.clone());
-                                }
-                            }
-                            if self.trace {
-                                evaluated.push((slot, value_summary(&v)));
-                            }
-                        }
-                    }
-                    if let Some(bytes) = &id_bytes {
-                        self.cg_registry.remove(bytes);
-                    }
-                    self.events.push(VmEvent::CgEnd {
-                        pc: self.pc,
-                        id,
                         evaluated,
                     });
                     self.pc += 1;
@@ -3329,6 +2838,11 @@ impl GroupVm {
                         self.pc += 1;
                         continue;
                     }
+                    if native::is_native(other) {
+                        self.exec_native(other, &windows)?;
+                        self.pc += 1;
+                        continue;
+                    }
                     // TASK (0x5f) / TASKEND (0x60) / TASKINFO (0x61): see
                     // `tasks`. TASK slots: 0 ID, 1 E, 2 A, 3 Z, 4-13 TINT,
                     // 14-23 TFLT, 24-33 TSTR, 34 '#', 35 SCRIPTPOS,
@@ -3448,79 +2962,8 @@ impl GroupVm {
                     }
                     if matches!(
                         other,
-                        0x0A | 0x0E | 0x14 | 0x15 | 0x1A | 0x1B | 0x1C | 0x31
-                            | 0x3C | 0x45 | 0x5D | 0x6B
+                        0x0A | 0x0E | 0x14 | 0x15 | 0x1C | 0x31 | 0x3C | 0x5D
                     ) {
-                        // 子系统查询输出写回(P5.2,引擎 FUN_0045baf8 族
-                        // 查询→LET 写回;反编译 00457d64/00441c08):
-                        // - WINDOWINFO(0x6b):SX(槽10)/SY(槽11)查询 → 窗口宽/高
-                        //   写入 LET(槽1)目标(s24 g133/134 → @1074/@1075);
-                        // - FONTINFO(0x1b):NUM(槽11,值=1)查询 → 注册字体数
-                        //   写入 LET(槽18)目标(s45 g26 → @2684,LOOP 计数)。
-                        // oracle 环境(引擎 trace 采集时刻)常量:全屏 1920×1080
-                        // (s41 g77 范围检查 ±32/±18 反推);713 字体(引擎
-                        // s45 循环圈数实测)。同 @114=32bpp 先例(成果 59c)。
-                        if other == 0x6b || other == 0x1b {
-                            let let_slot = if other == 0x6b { 1u8 } else { 18u8 };
-                            let mut target: Option<VarTarget> = None;
-                            let mut query_a = false;
-                            let mut query_b = false;
-                            for w in &windows {
-                                if w.len == 0 {
-                                    continue;
-                                }
-                                let slot = (w.tag & 0xff) as u8;
-                                if slot == let_slot {
-                                    if let Ok(bytes) = self
-                                        .ctx
-                                        .script
-                                        .window_bytes_pooled_copy(w)
-                                        .ok_or_else(|| {
-                                            Error::format("子系统 LET 引用窗越过池尾")
-                                        })
-                                    {
-                                        target = extract_var_target(&bytes).ok();
-                                    }
-                                } else if other == 0x6b && slot == 10 {
-                                    query_a = true;
-                                } else if other == 0x6b && slot == 11 {
-                                    query_b = true;
-                                } else if other == 0x1b && slot == 11 {
-                                    // NUM 查询须值为 1(引擎 slot11==1 检查)
-                                    query_a = matches!(
-                                        self.eval_window_condition(Some(w)),
-                                        Ok(Some(Value::Int(1)))
-                                    );
-                                } else if other == 0x1b && slot == 13 {
-                                    // LANG 查询(须值 1;s45 g28 FONTINFO(NO,LANG→LET)):
-                                    // 引擎 713 字体全部非零(pc29 IF 真 → LOOPCONT×713
-                                    // 实测)→ oracle 常量 1。
-                                    query_b = matches!(
-                                        self.eval_window_condition(Some(w)),
-                                        Ok(Some(Value::Int(1)))
-                                    );
-                                }
-                            }
-                            if let Some(t) = &target {
-                                if other == 0x6b {
-                                    if query_a {
-                                        self.write_var_target(t, Value::Int(1920))?;
-                                    }
-                                    if query_b {
-                                        self.write_var_target(t, Value::Int(1080))?;
-                                    }
-                                } else if query_a {
-                                    // 注册字体数 = oracle 常量(环境依赖:
-                                    // 2026-09-04 采集 = 713,2026-09-05 采集 = 783
-                                    // —— 字体注册数随运行环境变化,对拍基线
-                                    // 须与引擎 trace 同批采集;当前以 400k trace
-                                    // 为准 = 783)
-                                    self.write_var_target(t, Value::Int(783))?;
-                                } else if query_b {
-                                    self.write_var_target(t, Value::Int(1))?;
-                                }
-                            }
-                        }
                         let mut evaluated: Vec<(u8, String)> = Vec::new();
                         for w in &windows {
                             if w.len == 0 {
@@ -4630,35 +4073,77 @@ impl GroupVm {
         }
     }
 
-    /// CGINFO ONMOUSE (21) / ONMOUSE2 (22) / ONMOUSE3 (23): what the CG's
-    /// image holds under the cursor, or -1 when the cursor is outside it.
-    ///
-    /// Read from Erewhon's button code (es.BT.MOUSECHECK): after a bounds
-    /// check it asks ONMOUSE2 of the button image, or ONMOUSE of its mask
-    /// image, and counts a hit when the answer is >= the button's threshold
-    /// (es.BT.TH.SET / es.BT.CG.SET, 1 in every button). So ONMOUSE2 and
-    /// ONMOUSE3 answer the pixel's alpha, and ONMOUSE (masks are opaque
-    /// black and white) its red value scaled by alpha. The engine's own
-    /// handler is not reversed; scaling and rotation are ignored.
-    fn cg_onmouse(&mut self, name: &[u8], query: u8) -> i64 {
-        let Some(st) = self.cg_registry.get(name) else { return -1 };
-        let (x, y) = (self.input_cursor.0 - st.x, self.input_cursor.1 - st.y);
-        let Some(file) = st.file.clone() else { return -1 };
-        let probe = self.file_probe.clone();
-        let img = self
-            .cg_images
-            .entry(file.clone())
-            .or_insert_with(|| {
-                probe
-                    .and_then(|p| p.image_rgba(&String::from_utf8_lossy(&file)))
-                    .map(std::sync::Arc::new)
-            })
-            .clone();
-        match img.and_then(|i| i.pixel(x, y)) {
-            Some([r, _, _, a]) if query == 21 => i64::from(r) * i64::from(a) / 255,
-            Some([_, _, _, a]) => i64::from(a),
-            None => -1,
+    /// Evaluates a native command's parameters, runs it on the native host
+    /// and stores its answer in the `LET` target, if any. A host error is
+    /// recorded as an Unsupported event; the script goes on.
+    fn exec_native(
+        &mut self,
+        command: u8,
+        windows: &[yuris_format::ystb::CommandSlot],
+    ) -> Result<()> {
+        let params = commands::CANONICAL_PARAMS
+            .get(command as usize)
+            .copied()
+            .unwrap_or(&[]);
+        let mut args: Vec<native::NativeArg> = Vec::new();
+        let mut let_target: Option<VarTarget> = None;
+        for w in windows {
+            if w.len == 0 {
+                continue;
+            }
+            let slot = (w.tag & 0xff) as u8;
+            let param = params.get(slot as usize).copied().unwrap_or("?");
+            if param == "LET" {
+                let bytes = self
+                    .ctx
+                    .script
+                    .window_bytes_pooled_copy(w)
+                    .ok_or_else(|| Error::format("native LET window past the pool end"))?;
+                let_target = Some(extract_var_target(&bytes)?);
+                continue;
+            }
+            if let Some(value) = self.eval_window_condition(Some(w))? {
+                args.push(native::NativeArg { slot, param, value });
+            }
         }
+        let name = commands::CANONICAL.get(command as usize).copied().unwrap_or("?");
+        let call = native::NativeCall {
+            command,
+            name,
+            args: &args,
+            has_let: let_target.is_some(),
+            cursor: self.input_cursor,
+            clock_ms: self.clock_ms as i64,
+        };
+        let answer = match self.native.call(&call) {
+            Ok(a) => a,
+            Err(e) => {
+                self.events.push(VmEvent::Unsupported {
+                    pc: self.pc,
+                    command,
+                    reason: format!("{name}: {e} s{} pc={}", self.ctx.script_id, self.pc),
+                });
+                None
+            }
+        };
+        if let (Some(t), Some(v)) = (&let_target, &answer) {
+            self.write_var_target(t, v.clone())?;
+        }
+        if self.trace {
+            let mut evaluated: Vec<(u8, String)> = args
+                .iter()
+                .map(|a| (a.slot, format!("{}={}", a.param, value_summary(&a.value))))
+                .collect();
+            if let (Some(t), Some(v)) = (&let_target, &answer) {
+                evaluated.push((255, format!("{} -> {}", value_summary(v), t.summary())));
+            }
+            self.events.push(VmEvent::Native {
+                pc: self.pc,
+                command,
+                evaluated,
+            });
+        }
+        Ok(())
     }
 
     /// SYSTEMINFO: script list queries. Slots (YSCM order): 0 SCRIPTFILE,

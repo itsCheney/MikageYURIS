@@ -6,6 +6,7 @@ members = [
     "crates/yuris-value",
     "crates/yuris-script",
     "crates/yuris-vm",
+    "crates/yuris-host",
     "crates/yuris-tools",
 ]
 
@@ -23,6 +24,7 @@ yuris-format   = { path = "crates/yuris-format" }
 yuris-value    = { path = "crates/yuris-value" }
 yuris-script   = { path = "crates/yuris-script" }
 yuris-vm       = { path = "crates/yuris-vm" }
+yuris-host     = { path = "crates/yuris-host" }
 
 # --- externals ---
 thiserror          = "2"
@@ -39,6 +41,7 @@ smallvec           = "1"
 lru                = "0.12"
 clap               = { version = "4", features = ["derive"] }
 png                = "0.18"
+ab_glyph           = "0.2"
 
 [profile.release]
 opt-level = 3

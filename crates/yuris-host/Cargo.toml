@@ -1,0 +1,19 @@
+[package]
+name = "yuris-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native command host: CG layer tree, compositor, fonts, sound and window state."
+
+[dependencies]
+yuris-core = { workspace = true }
+yuris-value = { workspace = true }
+yuris-format = { workspace = true }
+yuris-vm = { workspace = true }
+ab_glyph = { workspace = true }
+encoding_rs = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+yuris-script = { workspace = true }
