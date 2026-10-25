@@ -45,6 +45,29 @@ pub struct NativeArg {
     pub param: &'static str,
     /// The evaluated value.
     pub value: Value,
+    /// Assignment operator from the window tag, as in LET: 0 `=`, 1 `+=`,
+    /// 2 `-=`, ... (Erewhon fades with `CG[ID=.. A-=8]`). See
+    /// [`NativeArg::apply`].
+    pub op: u8,
+}
+
+impl NativeArg {
+    /// The parameter's new value for a current value `cur`: the value
+    /// itself for `=`, otherwise `cur` combined with it.
+    pub fn apply(&self, cur: i64) -> i64 {
+        let n = match &self.value {
+            Value::Int(n) => *n,
+            Value::Float(f) => *f as i64,
+            Value::Str(_) => 0,
+        };
+        if self.op == 0 {
+            return n;
+        }
+        match yuris_value::compound_assign(self.op, &Value::Int(cur), &Value::Int(n)) {
+            Ok(Value::Int(v)) => v,
+            _ => n,
+        }
+    }
 }
 
 /// A native command call, as handed to [`Native::call`].

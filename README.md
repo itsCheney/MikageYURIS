@@ -17,14 +17,14 @@ config screen to the title, starts a new game and plays the opening and the
 first scenes: text with its glow, backgrounds, event CGs, sprites placed by
 `MATH3D`, BGM and sound effects. Clicks advance the text. Saving into a
 slot (with its date and thumbnail) and loading it back from the title work;
-the story goes on from the saved line.
+the story goes on from the saved line. The backlog and skip mode work.
 
 Not done yet:
 
 - a GPU renderer (frames are composed on the CPU) and a real audio output
   (the mixer is pulled by the caller);
 - the player-facing C ABI for the iOS app;
-- VARINFO STRTYPE, PRODUCT, IFBREAK, CGACT TRANSITION, movies;
+- PRODUCT, IFBREAK, CGACT TRANSITION, movies;
 - other games and engine versions: the format readers handle 481 and 555,
   but only Erewhon has been run this far.
 

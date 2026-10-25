@@ -4578,7 +4578,8 @@ impl GroupVm {
                 continue;
             }
             if let Some(value) = self.eval_window_condition(Some(w))? {
-                args.push(native::NativeArg { slot, param, value });
+                let op = ((w.tag >> 24) & 0xff) as u8;
+                args.push(native::NativeArg { slot, param, value, op });
             }
         }
         let name = commands::CANONICAL.get(command as usize).copied().unwrap_or("?");
@@ -4816,11 +4817,24 @@ impl GroupVm {
                 Ok(Some(Value::Int(code)))
             }
             Some(3) => {
-                // STRTYPE:被查串 = STRTYPE 槽自身的字符串参数(引擎取最近串求值)
-                // 判定首字符 SJIS 宽度 → 1=半角 2=全角(处理器直接证据:写 LET 元素)
-                Err(Error::Unimplemented(
-                    "VARINFO STRTYPE:串参数传递路径待核(槽值未达本方法)",
-                ))
+                // STRTYPE: the width of the SET string's first character,
+                // 1 = single byte (half width), 2 = double byte (full
+                // width), 0 for an empty string. Not in the manual; the
+                // value is from the reversed v555 handler. Erewhon's
+                // es._strtype takes it mod 10 and the backlog advances
+                // each character by size / (3 - type).
+                let code = match self.read_var_target(target)? {
+                    Value::Str(b) => match b.first() {
+                        None => 0i64,
+                        Some(&c) if self.codepage.is_lead(c) => 2,
+                        Some(_) => 1,
+                    },
+                    _ => 0,
+                };
+                if self.trace {
+                    evaluated.push((3u8, format!("STRTYPE={code}")));
+                }
+                Ok(Some(Value::Int(code)))
             }
             Some(4) => {
                 // DIMNUM:维数。裸引用(Scalar)= 整数组(s37 g50/g51 实证,

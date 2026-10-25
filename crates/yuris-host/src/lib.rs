@@ -158,22 +158,17 @@ impl Host {
             l.file = file.unwrap_or_default();
         }
         for a in c.args {
-            let n = || match &a.value {
-                Value::Int(n) => *n,
-                Value::Float(f) => *f as i64,
-                Value::Str(_) => 0,
-            };
             match a.param {
-                "E" => l.enabled = n() != 0,
-                "A" => l.alpha = n(),
-                "X" => l.x = n(),
-                "Y" => l.y = n(),
-                "Z" => l.z = n(),
-                "SX" => l.sx = n(),
-                "SY" => l.sy = n(),
-                "MODE" => l.mode = n(),
-                "T" => l.t = n(),
-                "TA" => l.ta = n(),
+                "E" => l.enabled = a.apply(l.enabled as i64) != 0,
+                "A" => l.alpha = a.apply(l.alpha),
+                "X" => l.x = a.apply(l.x),
+                "Y" => l.y = a.apply(l.y),
+                "Z" => l.z = a.apply(l.z),
+                "SX" => l.sx = a.apply(l.sx),
+                "SY" => l.sy = a.apply(l.sy),
+                "MODE" => l.mode = a.apply(l.mode),
+                "T" => l.t = a.apply(l.t),
+                "TA" => l.ta = a.apply(l.ta),
                 "MID" => l.mid = str_of(&a.value),
                 "TID" => l.tid = str_of(&a.value),
                 _ => {}
@@ -719,7 +714,7 @@ mod tests {
     }
 
     fn arg(param: &'static str, value: Value) -> NativeArg {
-        NativeArg { slot: 0, param, value }
+        NativeArg { slot: 0, param, value, op: 0 }
     }
 
     #[test]
