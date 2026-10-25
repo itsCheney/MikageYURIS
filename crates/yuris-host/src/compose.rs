@@ -2,12 +2,13 @@
 //!
 //! Canvases are premultiplied RGBA8; layer images are straight alpha.
 //! Supported modes: 0 normal, 1 add, 2 subtract, 3 multiply, 5 screen,
-//! 6 lighten, 7 darken, 8 difference. The other modes (and masks, MID, and
-//! transitions, TID/T) draw as normal for now.
+//! 6 lighten, 7 darken, 8 difference. The other modes (and masks, MID)
+//! draw as normal for now. Rule transitions (TID/T/TA) scale each pixel's
+//! opacity by its [`Transition`] coverage.
 
 use yuris_format::vfs::RgbaImage;
 
-use crate::layers::{LayerId, LayerTree};
+use crate::layers::{LayerId, LayerTree, Transition};
 
 /// A premultiplied RGBA8 buffer.
 #[derive(Debug, Clone)]
@@ -94,8 +95,21 @@ fn blend_px(d: &mut [u8], s: [u32; 4], mode: i64) {
     d[3] = (sa + mul255(da, inv)).min(255) as u8;
 }
 
+/// A transition and the screen position of the canvas's origin.
+type Rule<'a> = Option<(&'a Transition, i64, i64)>;
+
+/// Scales opacity `a` by the rule's coverage at canvas pixel (x, y).
+#[inline]
+fn through(rule: Rule<'_>, a: u32, x: i64, y: i64) -> u32 {
+    match rule {
+        Some((t, ox, oy)) => (a as f32 * t.coverage(x + ox, y + oy) + 0.5) as u32,
+        None => a,
+    }
+}
+
 /// Draws a straight-alpha image at (dx, dy) with opacity `alpha` (0..=256).
-fn draw_image(dst: &mut Canvas, src: &RgbaImage, dx: i64, dy: i64, alpha: i64, mode: i64, clip: Clip) {
+#[allow(clippy::too_many_arguments)]
+fn draw_image(dst: &mut Canvas, src: &RgbaImage, dx: i64, dy: i64, alpha: i64, mode: i64, clip: Clip, rule: Rule<'_>) {
     let k = alpha.clamp(0, 256) as u32;
     if k == 0 || src.width == 0 || src.height == 0 {
         return;
@@ -112,7 +126,7 @@ fn draw_image(dst: &mut Canvas, src: &RgbaImage, dx: i64, dy: i64, alpha: i64, m
         for x in area.x0..area.x1 {
             let si = (srow + (x - dx) as usize) * 4;
             let p = &src.data[si..si + 4];
-            let a = (u32::from(p[3]) * k) >> 8;
+            let a = through(rule, (u32::from(p[3]) * k) >> 8, x, y);
             if a == 0 {
                 continue;
             }
@@ -124,7 +138,8 @@ fn draw_image(dst: &mut Canvas, src: &RgbaImage, dx: i64, dy: i64, alpha: i64, m
 }
 
 /// Draws a premultiplied canvas at (dx, dy) with opacity `alpha`.
-fn draw_canvas(dst: &mut Canvas, src: &Canvas, dx: i64, dy: i64, alpha: i64, mode: i64, clip: Clip) {
+#[allow(clippy::too_many_arguments)]
+fn draw_canvas(dst: &mut Canvas, src: &Canvas, dx: i64, dy: i64, alpha: i64, mode: i64, clip: Clip, rule: Rule<'_>) {
     let k = alpha.clamp(0, 256) as u32;
     if k == 0 {
         return;
@@ -144,6 +159,7 @@ fn draw_canvas(dst: &mut Canvas, src: &Canvas, dx: i64, dy: i64, alpha: i64, mod
             if p[3] == 0 {
                 continue;
             }
+            let k = through(rule, k, x, y);
             let s = [
                 (u32::from(p[0]) * k) >> 8,
                 (u32::from(p[1]) * k) >> 8,
@@ -157,16 +173,18 @@ fn draw_canvas(dst: &mut Canvas, src: &Canvas, dx: i64, dy: i64, alpha: i64, mod
 }
 
 /// Draws the children of `set` into `dst`, with the set's origin at
-/// (ox, oy) in `dst`.
-fn draw_children(tree: &LayerTree, set: LayerId, dst: &mut Canvas, ox: i64, oy: i64, clip: Clip) {
+/// (ox, oy) in `dst`, whose own origin is at `at` on screen.
+fn draw_children(tree: &LayerTree, set: LayerId, dst: &mut Canvas, ox: i64, oy: i64, clip: Clip, at: (i64, i64)) {
     for id in tree.draw_order(set) {
         let Some(l) = tree.get(id) else { continue };
         if !l.enabled || l.alpha <= 0 {
             continue;
         }
         let (x, y) = (ox + l.x, oy + l.y);
+        let tr = tree.transition(l);
+        let rule = tr.as_ref().map(|t| (t, at.0, at.1));
         if !l.is_set {
-            draw_image(dst, &l.image, x, y, l.alpha, l.mode, clip);
+            draw_image(dst, &l.image, x, y, l.alpha, l.mode, clip, rule);
             continue;
         }
         let set_clip = if l.sx > 0 && l.sy > 0 {
@@ -174,10 +192,10 @@ fn draw_children(tree: &LayerTree, set: LayerId, dst: &mut Canvas, ox: i64, oy: 
         } else {
             clip
         };
-        if l.alpha >= 256 && l.mode == 0 {
+        if l.alpha >= 256 && l.mode == 0 && tr.is_none() {
             // Opaque normal set: drawing straight into the parent gives
             // the same pixels as composing it first.
-            draw_children(tree, id, dst, x, y, set_clip);
+            draw_children(tree, id, dst, x, y, set_clip, at);
             continue;
         }
         // Compose the set on its own, then draw it with its opacity/mode.
@@ -189,8 +207,8 @@ fn draw_children(tree: &LayerTree, set: LayerId, dst: &mut Canvas, ox: i64, oy: 
         let (bx, by) = if l.sx > 0 && l.sy > 0 { (x, y) } else { (0, 0) };
         let mut tmp = Canvas::new(w, h);
         let full = Clip { x0: 0, y0: 0, x1: i64::from(w), y1: i64::from(h) };
-        draw_children(tree, id, &mut tmp, x - bx, y - by, full);
-        draw_canvas(dst, &tmp, bx, by, l.alpha, l.mode, set_clip);
+        draw_children(tree, id, &mut tmp, x - bx, y - by, full, (at.0 + bx, at.1 + by));
+        draw_canvas(dst, &tmp, bx, by, l.alpha, l.mode, set_clip, rule);
     }
 }
 
@@ -199,7 +217,7 @@ fn draw_children(tree: &LayerTree, set: LayerId, dst: &mut Canvas, ox: i64, oy: 
 pub fn compose_set(tree: &LayerTree, set: LayerId, width: u32, height: u32) -> Canvas {
     let mut c = Canvas::new(width, height);
     let clip = Clip { x0: 0, y0: 0, x1: i64::from(width), y1: i64::from(height) };
-    draw_children(tree, set, &mut c, 0, 0, clip);
+    draw_children(tree, set, &mut c, 0, 0, clip, (0, 0));
     c
 }
 
@@ -212,7 +230,7 @@ pub fn render_window(tree: &LayerTree, n: u32, width: u32, height: u32) -> RgbaI
     if let Some(set) = tree.window_set(n) {
         let clip = Clip { x0: 0, y0: 0, x1: i64::from(width), y1: i64::from(height) };
         let (x, y) = tree.get(set).map_or((0, 0), |l| (l.x, l.y));
-        draw_children(tree, set, &mut c, x, y, clip);
+        draw_children(tree, set, &mut c, x, y, clip, (0, 0));
     }
     c.to_image()
 }

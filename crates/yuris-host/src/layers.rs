@@ -306,6 +306,24 @@ impl LayerTree {
         (x, y)
     }
 
+    /// The rule transition layer `l` is drawn through: TID names an image
+    /// layer (the rule, usually hidden), T is the progress (0 hidden, 256
+    /// shown) and TA the softness of the edge. None when there is none or
+    /// it has finished (T 256).
+    pub fn transition(&self, l: &Layer) -> Option<Transition> {
+        if l.tid.is_empty() || l.t >= 256 {
+            return None;
+        }
+        let id = self.find(&l.tid)?;
+        let rule = self.get(id)?;
+        if rule.is_set || rule.image.width == 0 || rule.image.height == 0 {
+            return None;
+        }
+        let (x, y) = self.absolute_pos(id);
+        let vague = l.ta.max(1) as f32;
+        Some(Transition { rule: rule.image.clone(), x, y, t: l.t.max(0) as f32 / 256.0 * (255.0 + vague), vague })
+    }
+
     /// Full path of a layer (`:/W0/ABC`), for listings.
     pub fn path_of(&self, id: LayerId) -> Vec<u8> {
         let mut parts = Vec::new();
@@ -370,5 +388,40 @@ mod tests {
         t.remove(set);
         assert_eq!(t.find(b"S/CG1"), None);
         assert_eq!(t.find(b"ABC"), Some(a));
+    }
+}
+
+/// A rule ("universal") transition: a pixel shows where the rule image is
+/// darker than the progress, with an edge `vague` levels wide, so dark
+/// areas of the rule appear first as T rises. Not reversed from the
+/// engine: the direction and the meaning of TA are the usual ones of
+/// such transitions.
+#[derive(Debug, Clone)]
+pub struct Transition {
+    /// The rule image (its red channel is read).
+    pub rule: Arc<RgbaImage>,
+    /// The rule's position on screen.
+    pub x: i64,
+    /// The rule's position on screen.
+    pub y: i64,
+    /// Progress in rule levels: T / 256 · (255 + vague).
+    pub t: f32,
+    /// Edge width in rule levels (TA, at least 1).
+    pub vague: f32,
+}
+
+impl Transition {
+    /// How much of the pixel at screen (sx, sy) shows, 0..=1. The rule's
+    /// edge pixels extend past it.
+    pub fn coverage(&self, sx: i64, sy: i64) -> f32 {
+        let (w, h) = (i64::from(self.rule.width), i64::from(self.rule.height));
+        let rx = (sx - self.x).clamp(0, w - 1) as usize;
+        let ry = (sy - self.y).clamp(0, h - 1) as usize;
+        self.coverage_of(self.rule.data[(ry * w as usize + rx) * 4])
+    }
+
+    /// Coverage for a rule level.
+    pub fn coverage_of(&self, level: u8) -> f32 {
+        ((self.t - f32::from(level)) / self.vague).clamp(0.0, 1.0)
     }
 }

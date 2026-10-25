@@ -11,13 +11,14 @@
 //! mode is drawn into a texture of its own first, as the CPU compositor
 //! composes it into a canvas. Normal, add, subtract and screen are blend
 //! states; multiply, lighten, darken and difference read a copy of the
-//! destination in the shader.
+//! destination in the shader. A layer or set in a rule transition (TID)
+//! samples its rule image in the shader too.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use yuris_format::vfs::RgbaImage;
-use yuris_host::layers::{LayerId, LayerTree};
+use yuris_host::layers::{LayerId, LayerTree, Transition};
 
 /// The format of the frame and of composed sets.
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -33,6 +34,8 @@ struct Vertex {
     k: f32,
     premul: f32,
     mode: f32,
+    ruv: [f32; 2],
+    rule: [f32; 2],
 }
 
 /// A clip rectangle in target pixels: [x0, x1) × [y0, y1).
@@ -70,6 +73,8 @@ struct Draw {
     first: u32,
     mode: i64,
     scissor: Clip,
+    /// The rule image of a transition (key into `images`).
+    rule: Option<usize>,
 }
 
 /// One render target's draws.
@@ -79,6 +84,8 @@ struct Pass {
     target: Option<usize>,
     width: u32,
     height: u32,
+    /// Where the target's origin is on screen.
+    origin: (i64, i64),
     draws: Vec<Draw>,
 }
 
@@ -86,6 +93,8 @@ struct CachedImage {
     image: Weak<RgbaImage>,
     _texture: wgpu::Texture,
     bind: wgpu::BindGroup,
+    /// Bound as a rule image.
+    rule_bind: wgpu::BindGroup,
     used: u64,
 }
 
@@ -114,6 +123,9 @@ pub struct Renderer {
     dst_layout: wgpu::BindGroupLayout,
     nearest: wgpu::Sampler,
     linear: wgpu::Sampler,
+    /// A 1x1 texture bound where no destination copy or rule is read.
+    _blank: wgpu::Texture,
+    blank_bind: wgpu::BindGroup,
     pipe_normal: wgpu::RenderPipeline,
     pipe_add: wgpu::RenderPipeline,
     pipe_subtract: wgpu::RenderPipeline,
@@ -167,17 +179,17 @@ impl Renderer {
             label: Some("yuris destination"),
             entries: &[tex_entry(0)],
         });
+        // Source, destination copy, rule.
         let simple = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("yuris quads"),
-            bind_group_layouts: &[&src_layout],
+            bind_group_layouts: &[&src_layout, &dst_layout, &dst_layout],
             push_constant_ranges: &[],
         });
-        let with_dst = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("yuris quads with destination"),
-            bind_group_layouts: &[&src_layout, &dst_layout],
-            push_constant_ranges: &[],
-        });
-        let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32, 4 => Float32, 5 => Float32];
+        let with_dst = &simple;
+        let attrs = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32, 4 => Float32, 5 => Float32,
+            6 => Float32x2, 7 => Float32x2
+        ];
         let pipeline = |layout: &wgpu::PipelineLayout, fs: &str, format, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
@@ -225,7 +237,7 @@ impl Renderer {
             CANVAS_FORMAT,
             Some(blend(C { src_factor: F::One, dst_factor: F::OneMinusSrc, operation: O::Add })),
         );
-        let pipe_dst = pipeline(&with_dst, "fs_dst", CANVAS_FORMAT, None);
+        let pipe_dst = pipeline(with_dst, "fs_dst", CANVAS_FORMAT, None);
         let pipe_present = pipeline(&simple, "fs", out_format, None);
         let sampler = |filter| {
             device.create_sampler(&wgpu::SamplerDescriptor {
@@ -246,6 +258,28 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let max_texture = device.limits().max_texture_dimension_2d;
+        let blank = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("yuris blank"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: CANVAS_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            blank.as_image_copy(),
+            &[255; 4],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let blank_view = blank.create_view(&Default::default());
+        let blank_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuris blank"),
+            layout: &dst_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&blank_view) }],
+        });
         Self {
             device,
             queue,
@@ -255,6 +289,8 @@ impl Renderer {
             dst_layout,
             nearest,
             linear,
+            _blank: blank,
+            blank_bind,
             pipe_normal,
             pipe_add,
             pipe_subtract,
@@ -315,7 +351,7 @@ impl Renderer {
         self.encode_frame(&mut encoder, tree, screen);
         let rect = fit(screen, out_size);
         let first = self.vertices.len() as u32;
-        quad(&mut self.vertices, out_size, rect, [0.0, 0.0, 1.0, 1.0], 1.0, true, 0);
+        quad(&mut self.vertices, out_size, rect, [0.0, 0.0, 1.0, 1.0], 1.0, true, 0, None);
         self.upload_vertices();
         let frame = self.frame.as_ref().expect("frame target");
         let present_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -331,6 +367,8 @@ impl Renderer {
             rp.set_pipeline(&self.pipe_present);
             rp.set_vertex_buffer(0, self.vbuf.slice(..));
             rp.set_bind_group(0, &present_bind, &[]);
+            rp.set_bind_group(1, &self.blank_bind, &[]);
+            rp.set_bind_group(2, &self.blank_bind, &[]);
             rp.draw(first..first + 6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -386,7 +424,7 @@ impl Renderer {
         if self.frame.as_ref().is_none_or(|f| f.width != w || f.height != h) {
             self.frame = Some(self.make_target(w, h));
         }
-        let mut passes = vec![Pass { target: None, width: w, height: h, draws: Vec::new() }];
+        let mut passes = vec![Pass { target: None, width: w, height: h, origin: (0, 0), draws: Vec::new() }];
         if let Some(set) = tree.window_set(0) {
             let (x, y) = tree.get(set).map_or((0, 0), |l| (l.x, l.y));
             let clip = Clip { x0: 0, y0: 0, x1: i64::from(w), y1: i64::from(h) };
@@ -411,6 +449,9 @@ impl Renderer {
                 continue;
             }
             let (x, y) = (ox + l.x, oy + l.y);
+            let tr = tree.transition(l);
+            let rule = tr.as_ref().and_then(|t| Some((self.image(&t.rule)?, t)));
+            let at = passes[p].origin;
             if !l.is_set {
                 let (iw, ih) = (l.image.width, l.image.height);
                 if iw == 0 || ih == 0 {
@@ -427,8 +468,15 @@ impl Renderer {
                     k(l.alpha),
                     false,
                     l.mode,
+                    rule.map(|(_, t)| (t, at)),
                 );
-                passes[p].draws.push(Draw { source: Source::Image(key), first, mode: l.mode, scissor: clip });
+                passes[p].draws.push(Draw {
+                    source: Source::Image(key),
+                    first,
+                    mode: l.mode,
+                    scissor: clip,
+                    rule: rule.map(|(r, _)| r),
+                });
                 continue;
             }
             let set_clip = if l.sx > 0 && l.sy > 0 {
@@ -436,7 +484,7 @@ impl Renderer {
             } else {
                 clip
             };
-            if l.alpha >= 256 && l.mode == 0 {
+            if l.alpha >= 256 && l.mode == 0 && rule.is_none() {
                 self.walk(tree, id, p, x, y, set_clip, passes);
                 continue;
             }
@@ -451,7 +499,7 @@ impl Renderer {
             let (bx, by) = if l.sx > 0 && l.sy > 0 { (x, y) } else { (0, 0) };
             let t = self.take_target(w, h);
             let child = passes.len();
-            passes.push(Pass { target: Some(t), width: w, height: h, draws: Vec::new() });
+            passes.push(Pass { target: Some(t), width: w, height: h, origin: (at.0 + bx, at.1 + by), draws: Vec::new() });
             let full = Clip { x0: 0, y0: 0, x1: i64::from(w), y1: i64::from(h) };
             self.walk(tree, id, child, x - bx, y - by, full, passes);
             let size = (passes[p].width, passes[p].height);
@@ -464,8 +512,15 @@ impl Renderer {
                 k(l.alpha),
                 true,
                 l.mode,
+                rule.map(|(_, t)| (t, at)),
             );
-            passes[p].draws.push(Draw { source: Source::Target(t), first, mode: l.mode, scissor: set_clip });
+            passes[p].draws.push(Draw {
+                source: Source::Target(t),
+                first,
+                mode: l.mode,
+                scissor: set_clip,
+                rule: rule.map(|(r, _)| r),
+            });
         }
     }
 
@@ -490,6 +545,8 @@ impl Renderer {
                         _ => &self.pipe_normal,
                     });
                     rp.set_bind_group(0, self.source_bind(d.source), &[]);
+                    rp.set_bind_group(1, &self.blank_bind, &[]);
+                    rp.set_bind_group(2, self.rule_bind(d.rule), &[]);
                     rp.set_scissor_rect(s[0], s[1], s[2], s[3]);
                     rp.draw(d.first..d.first + 6, 0..1);
                 }
@@ -517,6 +574,7 @@ impl Renderer {
             rp.set_pipeline(&self.pipe_dst);
             rp.set_bind_group(0, self.source_bind(d.source), &[]);
             rp.set_bind_group(1, &self.targets[copy].dst_bind, &[]);
+            rp.set_bind_group(2, self.rule_bind(d.rule), &[]);
             rp.set_scissor_rect(s[0], s[1], s[2], s[3]);
             rp.draw(d.first..d.first + 6, 0..1);
         }
@@ -527,6 +585,10 @@ impl Renderer {
             Some(i) => &self.targets[i],
             None => self.frame.as_ref().expect("frame target"),
         }
+    }
+
+    fn rule_bind(&self, rule: Option<usize>) -> &wgpu::BindGroup {
+        rule.and_then(|key| self.images.get(&key)).map_or(&self.blank_bind, |c| &c.rule_bind)
     }
 
     fn source_bind(&self, s: Source) -> &wgpu::BindGroup {
@@ -576,7 +638,13 @@ impl Renderer {
         );
         let view = texture.create_view(&Default::default());
         let bind = self.source_bind_group(&view);
-        self.images.insert(key, CachedImage { image: Arc::downgrade(img), _texture: texture, bind, used: self.frame_no });
+        let rule_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuris rule"),
+            layout: &self.dst_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
+        });
+        self.images
+            .insert(key, CachedImage { image: Arc::downgrade(img), _texture: texture, bind, rule_bind, used: self.frame_no });
         Some(key)
     }
 
@@ -672,16 +740,41 @@ fn reads_dst(mode: i64) -> bool {
 
 /// Two triangles for the rectangle `r` (x, y, w, h, in pixels of a
 /// `size` target), sampling `uv` (u0, v0, u1, v1). The destination
-/// coordinates are the same rectangle in a copy of the target.
-fn quad(out: &mut Vec<Vertex>, size: (u32, u32), r: [f32; 4], uv: [f32; 4], k: f32, premul: bool, mode: i64) {
+/// coordinates are the same rectangle in a copy of the target. A rule
+/// transition comes with the screen position of the target's origin.
+#[allow(clippy::too_many_arguments)]
+fn quad(
+    out: &mut Vec<Vertex>,
+    size: (u32, u32),
+    r: [f32; 4],
+    uv: [f32; 4],
+    k: f32,
+    premul: bool,
+    mode: i64,
+    rule: Option<(&Transition, (i64, i64))>,
+) {
     let (tw, th) = (size.0 as f32, size.1 as f32);
-    let corner = |px: f32, py: f32, u: f32, v: f32| Vertex {
-        pos: [px / tw * 2.0 - 1.0, 1.0 - py / th * 2.0],
-        uv: [u, v],
-        duv: [px / tw, py / th],
-        k,
-        premul: if premul { 1.0 } else { 0.0 },
-        mode: mode as f32,
+    let corner = |px: f32, py: f32, u: f32, v: f32| {
+        let (ruv, params) = match rule {
+            Some((t, at)) => (
+                [
+                    (px + (at.0 - t.x) as f32) / t.rule.width as f32,
+                    (py + (at.1 - t.y) as f32) / t.rule.height as f32,
+                ],
+                [t.t, t.vague],
+            ),
+            None => ([0.0; 2], [0.0; 2]),
+        };
+        Vertex {
+            pos: [px / tw * 2.0 - 1.0, 1.0 - py / th * 2.0],
+            uv: [u, v],
+            duv: [px / tw, py / th],
+            k,
+            premul: if premul { 1.0 } else { 0.0 },
+            mode: mode as f32,
+            ruv,
+            rule: params,
+        }
     };
     let (x0, y0, x1, y1) = (r[0], r[1], r[0] + r[2], r[1] + r[3]);
     let a = corner(x0, y0, uv[0], uv[1]);

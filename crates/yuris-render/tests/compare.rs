@@ -90,6 +90,40 @@ fn gpu_matches_cpu() {
     let off = t.find(b"OFF").unwrap();
     t.get_mut(off).unwrap().enabled = false;
     compare(&mut r, &t, screen, "unsized set");
+    // Rule transitions: a horizontal ramp as the rule (hidden), on a layer
+    // and on a translucent set, part way and with a soft edge.
+    let ramp = RgbaImage {
+        width: 96,
+        height: 64,
+        data: (0..96 * 64).flat_map(|i| {
+            let v = ((i % 96) * 255 / 95) as u8;
+            [v, v, v, 255]
+        }).collect(),
+    };
+    layer(&mut t, "RULE", ramp, 0, 0, 0, 256, 0);
+    let rule = t.find(b"RULE").unwrap();
+    t.get_mut(rule).unwrap().enabled = false;
+    layer(&mut t, "TR", pattern(60, 40, 17), 20, 12, 120, 256, 0);
+    let tr = t.find(b"TR").unwrap();
+    for (tv, ta) in [(0, 1), (96, 1), (160, 64), (256, 1)] {
+        let l = t.get_mut(tr).unwrap();
+        (l.tid, l.t, l.ta) = (b"RULE".to_vec(), tv, ta);
+        compare(&mut r, &t, screen, &format!("layer transition T={tv} TA={ta}"));
+    }
+    let s2 = t.find(b"S2/").unwrap();
+    {
+        let l = t.get_mut(s2).unwrap();
+        (l.tid, l.t, l.ta) = (b"RULE".to_vec(), 128, 32);
+    }
+    compare(&mut r, &t, screen, "set transition");
+    // The coverage itself: dark rule levels show first.
+    let cover = t.transition(t.get(tr).unwrap());
+    assert!(cover.is_none(), "T=256 is a finished transition");
+    t.get_mut(tr).unwrap().t = 128;
+    let c = t.transition(t.get(tr).unwrap()).unwrap();
+    assert_eq!(c.coverage(0, 0), 1.0);
+    assert_eq!(c.coverage(95, 0), 0.0);
+
     // Changing an image in place uploads it again.
     let a = t.find(b"S1/A").unwrap();
     Arc::make_mut(&mut t.get_mut(a).unwrap().image).data.fill(255);
