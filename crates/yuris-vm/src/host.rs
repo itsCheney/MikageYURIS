@@ -1,8 +1,8 @@
-//! 跨脚本上下文:多脚本执行宿主(P0)。
+//! Script loading across scripts.
 //!
-//! 单脚本 [`GroupVm`](crate::GroupVm) 是引擎执行单元的核心;但真实游戏流程
-//! 在 `yst%05d.ybn` 之间不断跳转(GOSUB 占语料 27065 组,最高频)。
-//! 本模块提供「按脚本号取脚本上下文」的接口与实现,供 GroupVm 跨脚本切换。
+//! A game jumps between `yst%05d.ybn` files all the time (GOSUB is the most
+//! common command), so [`GroupVm`](crate::GroupVm) gets scripts by number
+//! from a [`ScriptHost`].
 //!
 //! [`FsScriptHost`] reads `ysbin\yst%05d.ybn` by script id from the game's
 //! file system.

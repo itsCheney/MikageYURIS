@@ -1,16 +1,16 @@
-//! YSCF 工程配置（`yscfg.ybn`）。
+//! YSCF project config (`ysbin\yscfg.ybn`).
 //!
-//! 规格来源：`arcusmaximus/VNTranslationTools` 的 Notes.txt 字段布局 + 本仓库样本实测。
-//! 证据等级：**部分确认** —— 见下表。
+//! Field layout from VNTranslationTools' Notes.txt, checked on the samples;
+//! see `docs/formats/ysbin.md`.
 //!
-//! | 字段 | 偏移 | 等级 | 说明 |
-//! |---|---|---|---|
-//! | `magic` / `version` | 0x00 / 0x04 | Confirmed | 样本 `YSCF` / 555 |
-//! | `screen_width/height` | 0x10 / 0x14 | Confirmed | 样本 1920 × 1080 |
-//! | `image_type_slots` | 0x1C | Likely | 样本 `01 02 03 04 05 06 00 00` |
-//! | `sound_type_slots` | 0x24 | Likely | 样本 `01 02 00 00` |
-//! | `file_priority_*` ×3 | 0x3C/0x40/0x44 | **Likely** | 样本 `(1,1,0)`；三者取值与 Notes.txt 顺序吻合，但样本中 Dev/Debug 同为 1，无法独立区分前两者 |
-//! | `caption_len` / `caption` | 0x4C / 0x4E | Confirmed | 样本 28 / "Kemonomichi Girlish Square 2" |
+//! | Field | Offset | Note |
+//! |---|---|---|
+//! | `magic` / `version` | 0x00 / 0x04 | |
+//! | `screen_width/height` | 0x10 / 0x14 | |
+//! | `image_type_slots` | 0x1C | sample `01 02 03 04 05 06 00 00` |
+//! | `sound_type_slots` | 0x24 | sample `01 02 00 00` |
+//! | `file_priority_*` ×3 | 0x3C/0x40/0x44 | develop, debug, release; the first two are not told apart by the samples |
+//! | `caption_len` / `caption` | 0x4C / 0x4E | |
 
 use yuris_core::{Error, Reader, Result};
 

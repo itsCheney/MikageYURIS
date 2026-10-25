@@ -1,7 +1,7 @@
-//! 版本 Profile。
+//! Version profiles.
 //!
-//! YU-RIS 不同版本在加密、opcode、编码上存在差异（见 `docs/01-runtime-architecture.md` §3）。
-//! 版本兼容逻辑**集中**在这里，不要散落到各处硬编码。
+//! YU-RIS versions differ in encryption, command order and text encoding.
+//! Version-dependent choices belong here rather than spread through the code.
 
 /// 字符编码。具体使用哪种由游戏决定（汉化版会把 SJIS 表改成 GBK 表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

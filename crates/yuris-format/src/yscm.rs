@@ -1,21 +1,17 @@
-//! YSCM 命令字典（`ysc.ybn`）。
+//! YSCM command table (`ysbin\ysc.ybn`).
 //!
-//! 规格：`docs/formats/yscm.md`。
-//!
-//! **这是整个项目的关键数据源**：它就是 YU-RIS 脚本语言的命令表，
-//! 包含全部命令名、每个命令的参数名与参数类型码。
-//! P1.3（opcode 交叉比对）以它为字典。
-//!
-//! 结构（Confirmed，样本 121 条命令 / 1113 个参数）：
+//! Every command of the script language with its parameter names and
+//! types, in the order the game's scripts index them. See
+//! `docs/formats/ysbin.md`.
 //!
 //! ```text
-//! [Header 0x10]  magic + version + command_count + unknown
-//! [Body]         command_count × {
+//! [header 0x10]  magic, version, command_count, 0
+//! [body]         command_count × {
 //!                    name\0
 //!                    u8 param_count
 //!                    param_count × { param_name\0  u16 param_type }
 //!                }
-//! [Tail]         SJIS 消息表 + 分词器字符表（结构部分 Unknown）
+//! [tail]         37 C strings + a 256-byte table
 //! ```
 
 use std::collections::HashMap;

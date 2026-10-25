@@ -1,26 +1,21 @@
-//! YSLB 标签表（`ysl.ybn`）。
+//! YSLB labels (`ysbin\ysl.ybn`).
 //!
-//! 规格：`docs/engine/command-layer.md`（**Confirmed**，引擎 v555）。
-//!
-//! 证据：引擎 `FUN_00463c7c`（加载）+ `FUN_0045124c`（Murmur2 查找）。
-//! 样本 `ysl.ybn`：**4153/4153 条目**，`murmur2(name) == 存储哈希` 零失败，
-//! 消费 **139051/139051 精确闭合**（2026-09-03）。
+//! The targets of GO, GOSUB and LABELINFO, found by the murmur2 hash of the
+//! name. See `docs/formats/ysbin.md`.
 //!
 //! ```text
-//! [Header 12B]  magic b"YSLB" + version u32 + 标签数 u32
-//! [Buckets]     256 × u32（按 hash>>24 分桶的升序标签下标；供引擎查表）
-//! [Labels]      标签数 × {
+//! [header 12]   magic "YSLB", version u32, count u32
+//! [buckets]     256 × u32 (first label index per hash >> 24)
+//! [labels]      count × {
 //!     u8  name_len
-//!     u8[name_len]  name（ASCII/SJIS，如 "es.BT.W.GET"）
-//!     u32 hash      = murmur2(name)
-//!     u32 target_pc 目标组下标（GO/GOSUB 跳转目标）
-//!     u16 script_id 所属脚本号（yst%05d）
-//!     u8  flag_a    引擎存入标签 struct +0xE
-//!     u8  flag_b    引擎存入 +0xF（语义 Unknown，原样保留）
+//!     u8[name_len]  name, e.g. "es.BT.W.GET"
+//!     u32 hash      murmur2(name)
+//!     u32 target_pc group index
+//!     u16 script_id script number (yst%05d)
+//!     u8  flag_a
+//!     u8  flag_b    (the engine reads the next label's first byte here)
 //! }
 //! ```
-//!
-//! GO/GOSUB 的跳转目标由此表提供（编译期生成，运行期只查不改）。
 
 use std::collections::HashMap;
 

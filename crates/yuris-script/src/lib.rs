@@ -1,19 +1,14 @@
 //! yuris-script
 //!
-//! L2：变长 VM 字节码 → `Instruction` IR。
-//!
-//! 指令编码与语义见 `docs/opcode/opcode-table.md`(第二版,**Confirmed**,
-//! 由官方编译器 YSCom.exe 逆向 + v555 全语料统计双侧验证):
+//! Decodes expression bytecode into instructions and evaluates them; see
+//! `docs/engine/bytecode.md`.
 //!
 //! ```text
-//! instruction = op(u8) + operand_len(u16 LE) + operand(operand_len 字节)
+//! instruction = op(u8) + operand_len(u16 LE) + operand(operand_len bytes)
 //! ```
 //!
-//! 已证实语义:字面量族(0x42/57/49/4c/46/4d)、变量引用(0x48/56/76,
-//! 操作数 `[前缀字符][id:u16]`)、算术/比较/逻辑/位运算、类型转换(0x73/0x69)、
-//! 数组读取(0x29)、组分隔(0x2c)。
-//!
-//! **未证实**(0x00/0x01/0x08 等)一律输出 [`Insn::Unknown`],**绝不猜测**。
+//! Ops outside the known set decode to [`Insn::Unknown`] and are refused by
+//! the evaluator.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

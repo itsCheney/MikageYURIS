@@ -1,10 +1,7 @@
-//! 表达式求值器:对单个指令窗口做栈式执行。
+//! Expression evaluator: runs one window on a stack (`docs/engine/bytecode.md`).
 //!
-//! 只执行**已证实**语义(`docs/opcode/opcode-table.md` 第二版);
-//! 求值/存储语义未证实处显式报错:
-//! - `PushVarRef` / `PushVarIndexed` / `ArrayLoad`:赋值与数组存储模型 Unknown
-//! - `Unknown` 指令:走 [`yuris_core::Error::UnresolvedOpcode`]
-//! - 未定义变量读取:报错(引擎默认值行为 Unknown,不猜)
+//! Unknown ops and reads of undeclared variables are errors rather than
+//! guesses.
 
 use yuris_core::{Error, Result};
 use yuris_value::{Value, VarRef, VarSpace, VariableStore};

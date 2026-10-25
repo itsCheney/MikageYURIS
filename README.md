@@ -1,144 +1,115 @@
-# Yuris-Tyn（Mikage 分支）
+# MikageYURIS
 
-本仓库是 [Weiss-UltimateSavior/Yuris-Tyn](https://github.com/Weiss-UltimateSavior/Yuris-Tyn) 的 fork，
-`mikage` 分支用于 Mikage（iOS 多引擎视觉小说播放器）的 YU-RIS 运行时。
+A YU-RIS runtime in Rust, written for [Mikage](https://github.com/itsCheney/Mikage-Next),
+an iOS player for visual novels. It reads a game's original archives and
+compiled scripts and runs them; nothing is converted ahead of time.
 
-与上游的区别：
+This is a fork of [Weiss-UltimateSavior/Yuris-Tyn](https://github.com/Weiss-UltimateSavior/Yuris-Tyn).
+Work happens on the `mikage` branch. Upstream's desktop player, renderer and
+scenario player were removed; the format readers and the VM were kept and
+reworked, and the native command layer was written anew.
 
-- 只保留 `yuris-core`、`yuris-format`、`yuris-value`、`yuris-script`、`yuris-vm` 和 `yuris-tools`。
-  桌面播放器、渲染、scenario 播放器和空壳 crate 已移除，渲染与原生命令层将重新编写。
-- YPF 按公开格式重写（旧实现误读了条目布局），name_key 与偏移宽度从封包推断，见 `docs/formats/ypf.md`。
-- 新增 `yuris_format::vfs::GameFs`：松散文件 + 封包 + 存档目录，并可叠加汉化补丁的
-  Enigma Virtual Box 启动器（exe 内文件或其外部包，如 Erewhon 的 `erewhon_chs.mys`，
-  包内 YPF 原地读取并替换同名封包）。`evb.rs` 移植自 ethornell-rs，保持 MPL-2.0。
-- 命令下标与参数槽号按本游戏 `ysc.ybn` 的名字换算成 v555 顺序（`yuris_vm::commands`）。
-- 脚本密钥从脚本推断，启动链直接接受游戏目录。
-- `yuris boot <游戏目录> [--launcher <exe>]`：无画面跑启动链，报告封包、版本、密钥，
-  以及 VM 停在哪里、哪些命令尚未实现。`yuris evb <exe|包>` 列出 Enigma Virtual Box 文件。
-- 新代码注释使用英文。
+## Status
 
-许可证仍为 GPL-3.0-or-later。以下为上游原文。
+The test game is **Erewhon** (CLOCKUP, 2018; engine 481) with its Chinese
+translation patch. Run headless, it boots through the logo and the first-run
+config screen to the title, starts a new game and plays the opening and the
+first scenes: text with its glow, backgrounds, event CGs, sprites placed by
+`MATH3D`, BGM and sound effects. Clicks advance the text.
 
----
+Not done yet:
 
-> **用 Rust 从零实现一个 YU-RIS 引擎兼容运行内核:直接读取原始游戏数据并运行原游戏。**
-> 不是提取器,不是反编译器,不是转换器。
+- a GPU renderer (frames are composed on the CPU) and a real audio output
+  (the mixer is pulled by the caller);
+- the player-facing C ABI for the iOS app;
+- SAVEEND, VARINFO STRTYPE, CGACT TRANSITION, movies;
+- other games and engine versions: the format readers handle 481 and 555,
+  but only Erewhon has been run this far.
 
-## 项目简介
+## Crates
 
-本项目通过对引擎二进制的逆向分析,以纯 Rust 重新实现其运行时内核:解析 YPF 封包、解码 YSTB 字节码、
-逐组解释执行,并通过 winit + wgpu 渲染画面,目标是让原游戏在自研内核上完整运行。
-使用与测试的样本游戏为：AnimalTrailGirlishSquare 2
-
-**实机状态目前非常糟糕，虽然可以运行但是 存在包括但不限于 UI控件定位以及素材叠层定位等其他许多问题。
-属于半成品状态，希望能有大佬接手或者参考,继续推进该引擎的跨平台运行可行性。
-没办法，token与精力不足支持项目的继续（免费鸡蛋的极限，原谅我没有钱去购买token）
-逆向工程与代码实现均由zcode免费发放的5.3f与TraeWork签到免费积分5.3f产出
-
-**当前状态:M1(出画面)与 M2(首个可玩切片)已达成** ——
-内核可从封包直接启动游戏:厂商 LOGO → 注意事项页 → 分层标题画面 →
-进入第一幕对话(BGM 循环、voice 逐行播放、立绘按脚本出场、点击推进台词、
-选择肢分支、F5/F9 快速存读档)。
-
-**正确性验证方式(对拍)**:通过自研的引擎 trace 采集工具,从原引擎提取
-逐命令执行流(335,069 组),与本内核 VM 的独立执行流逐组比对 ——
-**对齐区间内唯一 1 处分歧**(已定性:输入子系统未实现,属已知缺口)。
-
-## 架构
-
-Cargo workspace,17 个 crate 按层次划分:
-
-| 层 | Crate | 职责 |
-|---|---|---|
-| L0/L1 | `yuris-format` | YPF 封包 / YSTB / YSCF / YSCM / YSER / YSSD+SNP 格式解码 |
-| L2 | `yuris-script` | 变长 VM 字节码 → `Instruction` IR |
-| L3 | `yuris-vm` | 组级执行 VM:PC、帧、GOSUB/LOOP、系统变量、挂起恢复 |
-| L3 | `yuris-expr` | 表达式引擎(Token → AST → Evaluator) |
-| L3 | `yuris-value` | INT/FLT/STR 三类型语义与变量存储 |
-| L4 | `yuris-runtime` | RuntimeApi / Graphics / Audio / Input / Storage 后端 trait |
-| L5 | `yuris-scene` | Scene / Layer / Animation 纯状态模型 |
-| L6 | `yuris-render` | winit 0.30 + wgpu 24 渲染后端(图层合成、letterbox、文本栅格化) |
-| L6 | `yuris-resource` | 多包挂载、松散根优先、seek 式随机读取、PNG/OGG 解码链路 |
-| L6 | `yuris-audio` / `yuris-input` / `yuris-save` | 音频 / 输入 / 存档(骨架) |
-| P7 | `yuris-scenario` | 明文剧本(scenario\*.txt)词法/行解析器 |
-| — | `yuris-scenario` 双脚本系统:YSTB VM + scenario 播放器并行驱动 | |
-| — | `yuris-core` | 错误类型、字节工具、版本 Profile(地基) |
-| — | `yuris-player-core` | 平台无关播放器核心:PlayerCore/Player/scenario 播放器/音频(桌面壳与 Android 壳共用) |
-| — | `yuris-cli` | 播放器入口(桌面壳:窗口/事件循环/输入翻译;`yuris-cli run <游戏目录>`) |
-| — | `yuris-tools` | 开发向 CLI:ypf / ystb / trace / opcode-scan |
-
-## 已逆向的格式(均为实测 Confirmed)
-
-| 格式 | 内容 |
+| Crate | What it does |
 |---|---|
-| **YPF** | 封包容器。名字 XOR 0xC9;bn/se 两种条目布局条目级自适应并存;资源明文 stored、脚本 zlib 压缩 |
-| **YSTB** | 脚本容器。4 分区 + 4 字节循环 XOR(密钥逐样本定位);命令区定长 12B 记录 |
-| **YSCF** | 编译器配置/键值表 |
-| **YSCM** | 引擎命令槽位定义(命令名 → 参数槽名表) |
-| **YSER** | 错误消息池 |
-| **YSSD + SNP** | 存档格式;SNP = snappy 变体(YSSNP.DLL 全逆向:字面量长度 +1、copy 族与标准一致) |
-| **op.ypf** | 实为 ASF/WMV 视频(OP 动画),非加密封包 |
-| 资源内容 | 图像 = 标准 PNG、音频 = 标准 OGG(可直接用 image / symphonia 解码) |
+| `yuris-core` | Errors, byte helpers, murmur2 |
+| `yuris-format` | YPF archives, YSTB scripts and the `ysbin` tables; the game file system (`vfs`), Enigma Virtual Box packages (`evb`) |
+| `yuris-value` | INT/FLT/STR values and variable storage |
+| `yuris-script` | Decodes and evaluates expression bytecode |
+| `yuris-vm` | The command-level VM: control flow, tasks, text, input, MATH/MATH3D, boot chain |
+| `yuris-host` | Native commands: CG layer tree and CPU compositor, fonts and text, sound mixer, window queries |
+| `yuris-tools` | The `yuris` command line tool |
 
-详细格式规格见 `docs/formats/`,命令语义见 `docs/engine/command-layer.md`,
-指令编码见 `docs/opcode/opcode-table.md`。
+## Building
 
-## 构建与运行
-
-```text
-工具链:Rust (MSVC),edition 2021
-
-cargo build --workspace          # 构建
-cargo test --workspace           # 49 个测试套件
-
-# 运行(需要自备正版游戏,指向游戏安装目录):
-cargo run --release -p yuris-cli -- run "<游戏目录>"
-# 调试跳转到指定剧本标签:
-cargo run --release -p yuris-cli -- run "<游戏目录>" --at "maho2_22"
-# 调试项:YSTB 4 字节 XOR key(不同游戏各异;正式路径 = yuris ystb guess-key)
-#        + 非 strict 模式(Unsupported 命令记录后继续)
-cargo run --release -p yuris-cli -- run "<游戏目录>" --key-hex <8hex> --lenient
+```sh
+cargo build --release
+cargo test
 ```
 
-操作:点击推进对话 / 选择肢;F5 快速存档,F9 快速读档,Esc 退出。
+Rust 2021, no platform dependencies. Tests that need game files skip
+themselves when the files are absent.
 
-## 目录结构
+## The `yuris` tool
 
-```text
-├── crates/            # 17 个 Rust crate(workspace members)
-├── docs/              # 架构设计、格式规格、命令语义、opcode 表
-│   ├── formats/       #   YPF/YSTB/YSCM/YSER 格式文档
-│   ├── engine/        #   命令层语义(含系统变量 case 表)
-│   └── opcode/        #   指令编码表
-├── scripts/           # Python 逆向/探针工具(格式侦查、trace 采集、对拍 diff)
-│   └── ghidra/        #   PyGhidra 自动化反编译脚本
-├── PROGRESS.md        # 开发进度日志(唯一进度真相来源:71 项成果、证据等级)
-├── Cargo.toml         # workspace 清单
-└── README.md
+```sh
+yuris ypf list <archive.ypf>
+yuris ypf extract <archive.ypf> --name <entry> -o <file>
+yuris ystb info|slots|groups|disasm ...       # script containers
+yuris yscm <bn.ypf> [--cmd SOUND]             # the game's command table
+yuris yscf <bn.ypf>                           # project config
+yuris evb <launcher.exe|package.mys> [--extract NAME -o FILE]
+yuris boot <game folder> [options]            # run the game headless
 ```
 
-## 方法论:证据等级驱动的逆向
+`boot` runs the game with a simulated clock (one frame = 1/60 s) and reports
+where it stopped, which commands are not implemented yet, and the task call
+stacks. Useful options:
 
-本项目的核心纪律是**不猜**。每个结论都标注证据等级并记录在 `PROGRESS.md`:
-
-| 等级 | 含义 |
+| Option | Effect |
 |---|---|
-| **Confirmed** | 有实测数据 + 可复现验证步骤,直接写实现与单测 |
-| **Likely** | 有间接证据,实现须加 `// UNVERIFIED` 与对照测试 |
-| **Hypothesis** | 结构推断,禁止写进核心路径 |
-| **Unknown** | 显式 `unimplemented!()`,绝不猜测 |
+| `--launcher <exe>` | Mounts a translation patch packed with Enigma Virtual Box |
+| `--max-groups N` | Command group budget; the run stops there |
+| `--click X,Y@MS` | Clicks once at game time MS (repeatable) |
+| `--auto-click X,Y@MS` | From MS on, clicks every 1.5 s |
+| `--shot FILE.png@MS` | Saves the screen at MS (repeatable) |
+| `--wav FILE` | Records the mixed sound output |
+| `--font FILE --encoding gbk` | Font for text drawing, and the scripts' text encoding |
+| `--cgs TEXT`, `--vars`, `--dump` | Layer and variable reports at the end |
+| `--jsonl FILE --trace` | The VM's event stream |
 
-`PROGRESS.md` 完整记录了 71 项成果的推导过程、验证命令与历次勘误,
-是理解本项目的最佳入口。
+Erewhon (Chinese patch), from the title to the first scenes:
 
-## 版权与免责声明
+```sh
+yuris boot <Erewhon> --launcher <Erewhon>/erewhon_chs.exe \
+  --font wqy-zenhei.ttc --encoding gbk --max-groups 520000000 \
+  --click 576,609@33000 --click 1100,90@125000 --auto-click 576,620@130000 \
+  --shot scene.png@245000 --wav opening.wav
+```
 
-- 本仓库**不包含任何游戏资源、游戏数据或引擎二进制**(封包、CG、音频、
-  可执行文件均不入库;由引擎二进制反编译产生的代码同样不入库)。
-- 本项目是原创的引擎兼容实现,仅供**互操作性研究与学习**。
-  运行游戏需要你**自行持有正版游戏副本**。
-- YU-RIS 及游戏作品版权归各自权利人所有,与本项目无关。
+## Documentation
 
-## 许可
+- [docs/formats/ypf.md](docs/formats/ypf.md): YPF archives
+- [docs/formats/ystb.md](docs/formats/ystb.md): YSTB script containers and their encryption
+- [docs/formats/ysbin.md](docs/formats/ysbin.md): the other `ysbin` tables (YSCM, YSLB, YSVR, YSTL, YSCF, YSTD, YSER) and save data (YSSD)
+- [docs/formats/evb.md](docs/formats/evb.md): Enigma Virtual Box packages used by translation patches
+- [docs/engine/bytecode.md](docs/engine/bytecode.md): expression bytecode
+- [docs/engine/vm.md](docs/engine/vm.md): how scripts run
+- [docs/engine/host.md](docs/engine/host.md): native commands (layers, text, sound)
+- [docs/engine/reversing.md](docs/engine/reversing.md): engine addresses and how the undocumented parts were found
 
-本项目采用 [GNU General Public License v3.0 或更高版本](LICENSE)授权(GPL-3.0-or-later,见 `Cargo.toml`)。
+The source carries most details at the place they are used; the module
+comments of `yuris-vm` (`tasks`, `text`, `input`, `math`, `commands`) and
+`yuris-host` (`audio`, `layers`, `text`) are the reference for those parts.
+
+## Legal
+
+This repository contains no game data, no engine binaries and no code
+decompiled from them. You need your own copy of a game to run it. YU-RIS
+and the games belong to their owners.
+
+`shimamura-sakura/yuri` and VNTranslationTools' notes were read for format
+facts only; no code was taken from them. `crates/yuris-format/src/evb.rs`
+comes from ethornell-rs and stays under MPL-2.0.
+
+## License
+
+GPL-3.0-or-later (see [LICENSE](LICENSE)), except `evb.rs` (MPL-2.0).

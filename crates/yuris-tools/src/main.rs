@@ -567,7 +567,7 @@ fn main() -> Result<()> {
                     shown += 1;
                 }
                 if !unknown_ops.is_empty() {
-                    println!("unknown opcodes: {unknown_ops:?}  (see docs/opcode/opcode-table.md)");
+                    println!("unknown opcodes: {unknown_ops:?}  (see docs/engine/bytecode.md)");
                 }
             }
         },

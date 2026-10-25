@@ -1,30 +1,22 @@
-//! YSSD 系统数据文件（`save/*.sd`）+ SNP（snappy 变体）解码。
+//! YSSD save data (`save\*.sd`) and SNP decoding.
 //!
-//! 规格（**Confirmed**，2026-09-05 侦查，样本 = 本作 save/ 六文件 28 块全解码）：
+//! Read from the v555 sample's save folder (6 files, 28 blocks) and the
+//! engine's LOAD handler; see `docs/formats/ysbin.md`.
 //!
 //! ```text
-//! [Header 0x1010B]  magic b"YSSD" + version u32(0x1E0) + 块数 u32
-//!                   + 偏移表容量 u32(0x400) + 偏移表 0x400 × u32
-//!                   （表项[i] = 块号 i+1 的绝对偏移；0 = 空）
-//! [Block]           u32 块号(=DNO) + u8 类型(0=普通) + u8 严格维数标志
-//!                   + u16 目标变量 id + u32 压缩长 + u32 未压长
-//!                   + SNP 压缩载荷
-//! [载荷(解压后)]     u32 类型(1=INT 2=FLT 3=STR) + u32 维数 + u32[维数] 边界
-//!                   + u32 数据长 + 数据（INT/FLT = 8B/元素；STR = 逐元素
-//!                   {u32 长度 + 字节}，元素数 = 维数积）
+//! [header 0x1010]  magic "YSSD", version u32 (0x1E0), block count u32,
+//!                  table length u32 (0x400), offsets 0x400 × u32
+//!                  (offsets[i] = file offset of block i+1; 0 = empty)
+//! [block]          u32 dno, u8 type (0 normal), u8 strict dims flag,
+//!                  u16 var id, u32 packed len, u32 unpacked len,
+//!                  SNP payload
+//! [payload]        u32 type (1 INT, 2 FLT, 3 STR), u32 dims, u32[dims]
+//!                  bounds, u32 data len, data (INT/FLT 8 bytes per
+//!                  element; STR u32 len + bytes per element)
 //! ```
 //!
-//! 引擎证据：LOAD 处理器 `FUN_00444648`（文件分支 fseek `DNO*4+0xC` =
-//! 偏移表[DNO-1]，块头 +4 跳过块号；magic/版本校验）；解压选择
-//! `DAT_0059b718 != 0` → SNP（`YSSNP.DLL!YSSnp_Uncompress`）；写回
-//! `FUN_0044564d`（类型一致 + 严格维数匹配 + memcpy 到描述符数据区）。
-//! 本构建实测载荷全部 SNP（zlib 头校验失败、SNP 全量闭合）。
-//!
-//! SNP = **snappy 变体**：头部 varint 未压长度（7-bit LE base-128）；
-//! 元素 tag 低 2 位 00=字面量 / 01=copy1 / 10=copy2 / 11=copy4；
-//! **字面量长度 = (tag>>2)+1**（非标准 snappy 的 tag>>2，引擎查表
-//! `DAT_1000ba40`/`FUN_10001d40` 实锤）；长字面量（tag>>2 ∈ 60..63）
-//! 后随 1..4 字节小端长度（同样 +1）；copy 族与标准 snappy 相同。
+//! SNP (`YSSNP.DLL`) is raw Snappy: a varint with the unpacked length, then
+//! literal and copy elements.
 
 use yuris_core::{Error, Result};
 

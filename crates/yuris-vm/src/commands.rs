@@ -18,8 +18,7 @@
 
 use yuris_format::yscm::YscmTable;
 
-/// Canonical commands, in the order of the v555 sample's `ysc.ybn`
-/// (`docs/opcode/yscm-commands-v555.json`).
+/// Canonical commands, in the order of the v555 sample's `ysc.ybn`.
 pub const CANONICAL: [&str; 121] = [
     "ALIAS", "CG", "CGACT", "CGEND", "CGINFO", "CLIPACT", "CLIPINFO", "CSV", "CSVINFO",
     "DEBUGLIST", "DIALOG", "ELSE", "EMOTE", "END", "ERROR", "ERRORINFO", "F_FLT", "F_INT",

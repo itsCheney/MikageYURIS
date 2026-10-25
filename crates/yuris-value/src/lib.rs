@@ -23,7 +23,8 @@ use yuris_core::{Error, Result};
 /// crate 版本(与 workspace 同步)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 变量空间。对应源码前缀字符(编译器证实,见 `docs/reverse/yscom-compiler-notes.md` §4.3)。
+/// Variable space: the source prefix character (from the compiler; see
+/// `docs/engine/bytecode.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VarSpace {
     /// `@` (0x40) —— 数值变量(INT/FLT)。

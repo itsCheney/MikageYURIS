@@ -1,11 +1,8 @@
 //! # yuris-core
 //!
-//! YurisKernel 的地基 crate：错误类型、字节工具、版本 Profile。
-//!
-//! 设计约束：
-//! - **无业务逻辑**。本 crate 被所有 crate 依赖，保持最小与稳定。
-//! - 所有「未确认」的行为一律返回 [`Error::Unimplemented`]，**禁止猜测**。
-//! - 实现顺序见 `docs/03-phase1-plan.md`。
+//! Shared basics for the other crates: the error type, a byte reader, the
+//! hashes (murmur2, a fast hasher) and version profiles. No engine logic
+//! lives here.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -20,5 +17,5 @@ pub use error::{Error, Result};
 pub use hash::{murmur2, FastBuildHasher, FastHashMap, FastHasher};
 pub use version::{CharEncoding, VersionProfile};
 
-/// crate 版本（与 workspace 同步）
+/// Crate version (the workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

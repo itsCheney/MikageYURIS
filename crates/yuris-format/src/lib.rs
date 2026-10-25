@@ -1,22 +1,21 @@
 //! # yuris-format
 //!
-//! L0（存储层）+ L1（容器解码层）。
+//! Readers for the game's files.
 //!
-//! | 模块 | 内容 | 证据等级 |
-//! |---|---|---|
-//! | [`ypf`] | YPF archives (header + index + zlib data; offset width and name key inferred) | Confirmed |
-//! | [`evb`] | Enigma Virtual Box packages (exe or external, e.g. `.mys`); MPL-2.0, from ethornell-rs | Confirmed |
-//! | [`vfs`] | Game file system (loose files, archives, save folder, EVB overlay) | Convention |
-//! | [`ystb`] | YSTB 脚本容器（header + 4 分区 + XOR + 命令组/窗口表） | Confirmed |
-//! | [`yscm`] | YSCM **命令字典**（121 命令 / 1113 参数 + tail） | Confirmed |
-//! | [`yscf`] | YSCF 工程配置（`yscfg.ybn`） | 部分确认 |
-//! | [`ysvr`] | YSVR 变量定义表（`ysv.ybn`） | Confirmed |
-//! | [`yssd`] | YSSD 系统数据（`save/*.sd`）+ SNP 解码 | Confirmed |
-//! | [`yslb`] | YSLB 标签表（`ysl.ybn`，GO/GOSUB 目标） | Confirmed |
-//! | [`ystl`] | YSTL script list (`yst_list.ybn`: source files, per-script counts) | Erewhon |
+//! | Module | Content |
+//! |---|---|
+//! | [`ypf`] | YPF archives (offset width and name key inferred) |
+//! | [`evb`] | Enigma Virtual Box packages (in an exe or external, e.g. `.mys`); MPL-2.0, from ethornell-rs |
+//! | [`vfs`] | The game file system (loose files, archives, save folder, EVB overlay) |
+//! | [`ystb`] | YSTB scripts (sections, XOR key, command groups and windows) |
+//! | [`yscm`] | YSCM command table (`ysc.ybn`) |
+//! | [`yscf`] | YSCF project config (`yscfg.ybn`) |
+//! | [`ysvr`] | YSVR variable table (`ysv.ybn`) |
+//! | [`yssd`] | YSSD save data (`save\*.sd`) and SNP (Snappy) |
+//! | [`yslb`] | YSLB labels (`ysl.ybn`) |
+//! | [`ystl`] | YSTL script list (`yst_list.ybn`) |
 //!
-//! 规格文档：`docs/formats/ypf.md`、`docs/formats/ystb.md`、`docs/formats/yscm.md`、
-//! `docs/engine/command-layer.md`。
+//! The formats are described in `docs/formats/`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -32,5 +31,5 @@ pub mod ystl;
 pub mod ysvr;
 pub mod yssd;
 
-/// crate 版本（与 workspace 同步）
+/// Crate version (the workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

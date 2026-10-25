@@ -1,5 +1,5 @@
-//! 指令语义。所有已证实映射来自官方编译器逆向(`docs/reverse/yscom-compiler-notes.md`),
-//! 与 v555 全语料统计(`docs/opcode/opcode-table.md`)一致。
+//! Instruction meanings, from the official compiler and checked on every
+//! script of the v555 sample (`docs/engine/bytecode.md`).
 
 // 注意: VarRef / VarSpace 定义在 `yuris-value`(变量模型归值层),此处 re-export。
 pub use yuris_value::{VarRef, VarSpace};

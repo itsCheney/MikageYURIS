@@ -1,25 +1,21 @@
-//! YSVR 变量定义表（`ysv.ybn`）。
+//! YSVR variable table (`ysbin\ysv.ybn`).
 //!
-//! 规格：`docs/engine/command-layer.md` §9（**Confirmed**，引擎 v555）。
-//!
-//! 证据：引擎 `FUN_0046b7a0`（载入）+ `FUN_00451348`（消费）+ `FUN_00454bb0`
-//! （存档过滤，同布局）。样本 `probe_vartab.py` **3362/3362 条目逐字节精确闭合**。
+//! Variables have no names at run time, only ids; YSVR declares them with
+//! their bounds and initial values. See `docs/formats/ysbin.md`.
 //!
 //! ```text
-//! [Header 10B]  magic b"YSVR" + version u32 + 条目数 u16
-//! [Entries]     条目数 × {
-//!     u8  kind      1=全局初值 2=按脚本初值 3=其他(样本 910 条，精确语义 Unknown)
-//!     u8  category  描述符 byte0（存档过滤类别，1..4）
-//!     u16 script    kind==2 的脚本号匹配键
-//!     u16 var_id    变量 id（描述符表下标；LET 左值 id = 声明命令 id）
-//!     u8  ty        1=INT 2=FLT 3=STR 0=仅声明无初值
-//!     u8  dims      维数
-//!     u32[dims]     各维边界
-//!     初值: ty1=i64 / ty2=f64 / ty3=u16 len + bytes / 其他=无
+//! [header 10]  magic "YSVR", version u32, count u16
+//! [entries]    count × {
+//!     u8  kind      1 global, 2 script-local (applied when the script loads), 3 other
+//!     u8  category  save category
+//!     u16 script    owning script
+//!     u16 var_id
+//!     u8  ty        1 INT, 2 FLT, 3 STR, 0 declared only
+//!     u8  dims
+//!     u32[dims]     bounds
+//!     init: ty 1 = i64, ty 2 = f64, ty 3 = u16 len + bytes, otherwise none
 //! }
 //! ```
-//!
-//! 运行期变量**没有名字**：变量 = 纯 id。名字只存在于编译期（ERIS 源码）。
 
 use yuris_core::{Error, Reader, Result};
 

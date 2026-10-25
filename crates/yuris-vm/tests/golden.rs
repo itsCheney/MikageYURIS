@@ -1,12 +1,10 @@
-//! Golden Test 框架(P3.2,自基线版)。
+//! Golden tests: the VM's event stream, as JSONL, compared line by line
+//! with `tests/golden/*.jsonl`.
 //!
-//! ## 原理(`docs/02-workspace-design.md` §5)
+//! The expected files were produced by this VM itself, so they catch
+//! regressions, not engine differences.
 //!
-//! VM 事件流序列化为 JSONL 快照;与 `tests/golden/*.jsonl` 逐行比对。
-//! 当前基线 = 本实现自身产生(自基线)——引擎真值待接(需 Windows/原版
-//! 观测),替换期望文件后即可做**真** Golden 对比。
-//!
-//! 再生成:`YURIS_REGEN_GOLDEN=1 cargo test -p yuris-vm --test golden`
+//! Regenerate: `YURIS_REGEN_GOLDEN=1 cargo test -p yuris-vm --test golden`
 
 use std::collections::HashMap;
 

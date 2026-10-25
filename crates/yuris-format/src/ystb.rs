@@ -1,35 +1,23 @@
-//! YSTB 脚本容器解析。
+//! YSTB scripts (`ysbin\yst%05d.ybn`).
 //!
-//! 规格：`docs/formats/ystb.md`（**Confirmed**，样本 v555）。
-//!
-//! 结构：
+//! Layout and encryption: `docs/formats/ystb.md`.
 //!
 //! ```text
-//! [Header 0x20]      未加密
-//! [part1]            加密，语义 Unknown（原样保留）
-//! [commands]         加密，定长 12 字节槽位表
-//! [content]          加密，变长 VM 字节码（既有工具称 strs，本 crate 改名）
-//! [part4]            加密，语义 Unknown（原样保留）
+//! [header 0x20]   not encrypted
+//! [part1]         command groups, 4 bytes each
+//! [windows]       parameter windows, 12 bytes each
+//! [content]       expression bytecode pool
+//! [part4]         continues the pool
 //! ```
 //!
-//! ## 密钥自动猜测
+//! ## Key guessing
 //!
-//! YSTB 的密钥逐游戏不同（同一游戏内统一：样本 278/278 可恢复文件同键）。
-//! 槽位表有两个可用的正确性判定器：
-//!
-//! 1. **连续性**：`off[n] + len[n] == off[n+1]` 全程成立 —— 仅对「顺序型」脚本
-//!    （如 yst00000）给出 1.0；「池式」脚本（如 yst00034）存在窗口重叠，正确密钥
-//!    下也只有 ~0.7。
-//! 2. **窗口闭合率**：content 区遵循自描述变长编码
-//!    `[op:u8][operand_len:u16 LE][operand]`（v555 Confirmed，全语料 506,351 条
-//!    指令零失败）。非 tag0 窗口在正确密钥下必须精确闭合。
-//!
-//! 候选生成（`part1_len == 4×unknown1` 恒成立 ⇒ 命令区相位恒为 0，无需旋转）：
-//!
-//! 1. 候选 1：`cipher[commands 起始 .. +4]`（假设首槽位 `tag == 0`）
-//! 2. 候选 2：`cipher[commands 起始+8 .. +12]`（假设首槽位 `offset == 0`）
-//!
-//! 取两种评分的最大值更高者；都低于阈值则报错，**不要猜**。
+//! The XOR key is the same for every script of a game. Two candidates come
+//! from the window table (the first window's offset is 0; its tag may be 0),
+//! and each is scored by how closely window offsets follow each other and
+//! by how many windows decode to well-formed `[op][len:u16][operand]`
+//! bytecode. The better candidate wins; a score below the threshold is an
+//! error.
 
 use yuris_core::{xor_cyclic_skip, Error, Reader, Result};
 
@@ -44,8 +32,7 @@ pub const SLOT_SIZE: usize = 12;
 
 /// 命令组表记录宽度（part1 区，每条 4 字节）。
 ///
-/// 证据：引擎加载器 `FUN_00450dfd`（kemonomichi2.exe）+ 全语料 302/302 断言。
-/// 详见 `docs/engine/command-layer.md`。
+/// From the v555 engine's loader (see `docs/formats/ystb.md`).
 pub const GROUP_SIZE: usize = 4;
 
 /// 已知 tag：正文文本。
@@ -406,7 +393,7 @@ impl YstbFile {
 
 /// content 窗口内的一条原始指令（v555 自描述变长编码，**Confirmed**）。
 ///
-/// 语义（名称/求值规则）尚未逆向，见 `docs/opcode/opcode-table.md`。
+/// The ops are described in `docs/engine/bytecode.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawInstr {
     /// 指令头在窗口内的字节偏移。

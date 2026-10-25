@@ -1,25 +1,21 @@
 //! yuris-vm
 //!
-//! L3:组级执行 VM / PC / 挂起恢复。**绝不阻塞**。
+//! The command-level VM: runs a script's command groups, with control flow,
+//! tasks, text, input and MATH. It never blocks: [`GroupVm::run`] returns
+//! when the script waits, ends or cannot go on. See `docs/engine/vm.md`.
 //!
-//! ## 执行模型(2026-09-03 引擎逆向,**Confirmed**)
-//!
-//! 证据:`docs/engine/command-layer.md`(kemonomichi2.exe 逆向 + 全语料断言)。
-//!
-//! - 执行单元 = **命令组**([`CommandGroup`]):part1 的一条 u32
-//!   (byte0=YSCM 命令下标,byte1=窗口数,gparam u16)
-//! - 主循环(引擎 FUN_0040449c):`pc = obj->pc++; yield = handler[pc]();`
-//!   —— PC **先取后增**,跳转处理器直接写目标组号
-//! - 处理器返回非零 = **让出**(挂起);本 VM 以 `VmSuspend` 表达
-//! - GO(0x2a):标签名 → 标签表(YSLB)→ {目标组号, 脚本号};跨脚本 = 多脚本
-//!   重绑,单脚本 VM 显式报 Unsupported(不猜)
-//! - GOSUB(0x2b):条件真 → 压帧{return_pc=pc+1} → 跳标签
-//! - RETURN(0x4f):弹帧;帧空 = 脚本结束(引擎 depth==0 路径)
-//! - IF(0x2c,3 窗):求值 w0 条件;假 → 跳 `w1.len ?: w2.len`
-//!   (**len 域存编译期组号**);嵌套栈记录 end 目标
-//! - ELSE(0x2d):跳嵌套栈顶的 end;IFEND(0x30):弹嵌套栈
-//! - 其余命令:语义未逆向 → [`VmEvent::Unsupported`](VmEvent::Unsupported)
-//!   事件;`strict` 模式(默认)挂起,`trace` 模式记录后继续 —— **不猜语义**
+//! - The unit of execution is a command group ([`CommandGroup`](yuris_format::ystb::CommandGroup)): byte 0 the
+//!   command, byte 1 the window count, the high u16 `gparam`.
+//! - As in the engine's loop, the PC is taken and then advanced; jumps
+//!   write the target group.
+//! - GO looks the label up in YSLB and may switch scripts; GOSUB pushes a
+//!   frame; RETURN pops it, and returning from the base frame ends the
+//!   script.
+//! - IF jumps on false to the group number the compiler stored in a
+//!   window's `len`; ELSE, IFBLEND and IFEND follow the IF stack.
+//! - Native commands go to [`native::Native`]; anything else that is not
+//!   implemented gives [`VmEvent::Unsupported`], which stops the VM in
+//!   strict mode and is only recorded otherwise.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -48,7 +44,7 @@ use yuris_value::{Value, VariableStore};
 /// crate 版本(与 workspace 同步)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 命令下标(YSCM 顺序,样本 v555;详见 `docs/engine/command-layer.md` §7)。
+/// Canonical command indices (the v555 YSCM order; see [`commands`]).
 pub mod cmd {
     /// GO。
     pub const GO: u8 = 0x2a;
@@ -2948,8 +2944,7 @@ impl GroupVm {
                         self.pc += 1;
                         continue;
                     }
-                    // 后端子系统配置/查询族(P2,处理器反编译见
-                    // docs/reverse/decompiled/engine/0044*_CMD_*.c):
+                    // 后端子系统配置/查询族(P2,引擎处理器 0044*):
                     // 0x1b FONTINFO/0x15 FILEINFO/0x14 FILEACT/0x6b WINDOWINFO/
                     // 0x45 MOUSE/0x1a FONT/0x5d SYSTEM/0x0e ERROR/0x1c FPS/
                     // 0x31 INPUT/0x3c MATH/0x0a DIALOG/0x69 WINDOW。

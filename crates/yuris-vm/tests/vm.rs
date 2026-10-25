@@ -1,8 +1,7 @@
-//! 组级 VM 测试:合成脚本(走完整 YSTB 加密管线)+ 真实样本烟雾。
+//! Group VM tests: synthetic scripts (through the full YSTB encryption
+//! path) and smoke tests on real samples.
 //!
-//! 执行模型证据:`docs/engine/command-layer.md`(引擎 FUN_0040449c/
-//! CMDH_0044272c/CMDH_004428c0/CMDH_0044b418/CMDH_004431ec/CMDH_004432e4/
-//! CMDH_00443434)。
+//! The execution model is described in `docs/engine/vm.md`.
 
 use std::collections::HashMap;
 
