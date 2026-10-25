@@ -91,8 +91,11 @@ void yuris_wheel(YurisSession *session, int32_t notches);
 /* Windows virtual-key code: 0x0D Enter, 0x1B Escape, 0x11 Ctrl, 0x20 Space... */
 void yuris_key(YurisSession *session, int32_t vk, int32_t down);
 
-/* Sound: a reference to the session's mixer, usable from any thread and
- * after the session closed, until released. */
+/* Sound: an output fed from the session's mixer by a thread of its own,
+ * usable after the session closed, until released. yuris_audio_render
+ * never blocks or allocates, so it can run on a real-time audio thread;
+ * call it from one thread at a time. What is rendered runs about 93 ms
+ * ahead of the game's sound positions. */
 YurisAudio *yuris_audio(const YurisSession *session);
 uint32_t yuris_audio_sample_rate(void);
 /* Writes frames interleaved stereo float samples (2 * frames floats). */

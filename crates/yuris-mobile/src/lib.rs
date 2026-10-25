@@ -13,9 +13,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 #[cfg(target_vendor = "apple")]
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Mutex, Once};
 
-use yuris_host::audio::{Mixer, OUTPUT_RATE};
+use yuris_host::audio::OUTPUT_RATE;
+
+mod audio;
 use yuris_player::{key_from_vk, Config, Encoding, FontFile, Player, Status};
 use yuris_render::{fit, Renderer};
 use yuris_vm::MouseButton;
@@ -55,8 +57,8 @@ pub struct YurisSession {
     surface_size: (u32, u32),
 }
 
-/// `YurisAudio`: the mixer, shared with the session.
-pub struct YurisAudio(Arc<Mutex<Mixer>>);
+/// `YurisAudio`: the sound output, fed from the session's mixer.
+pub struct YurisAudio(audio::AudioOutput);
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::default());
@@ -134,11 +136,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
             tracing::Level::DEBUG => 4,
             tracing::Level::TRACE => 5,
         };
-        let Ok(sink) = LOG.lock() else { return };
-        let Some(sink) = sink.as_ref() else { return };
-        if level > sink.max_level {
-            return;
-        }
+        // Copied out so the host is called without the lock held: a
+        // callback that calls back into the runtime must not deadlock.
+        let (callback, context) = match LOG.lock().ok().as_deref() {
+            Some(Some(sink)) if level <= sink.max_level => (sink.callback, sink.context),
+            _ => return,
+        };
         struct Visit(String);
         impl tracing::field::Visit for Visit {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -156,7 +159,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
         event.record(&mut v);
         let target = CString::new(event.metadata().target()).unwrap_or_default();
         let msg = CString::new(v.0.replace('\0', " ")).unwrap_or_default();
-        (sink.callback)(level, target.as_ptr(), msg.as_ptr(), sink.context as *mut c_void);
+        callback(level, target.as_ptr(), msg.as_ptr(), context as *mut c_void);
     }
 }
 
@@ -507,7 +510,13 @@ pub unsafe extern "C" fn yuris_key(session: *mut YurisSession, vk: i32, down: i3
 #[no_mangle]
 pub unsafe extern "C" fn yuris_audio(session: *const YurisSession) -> *mut YurisAudio {
     guard(std::ptr::null_mut(), || match session.as_ref() {
-        Some(s) => Box::into_raw(Box::new(YurisAudio(s.player.audio()))),
+        Some(s) => match audio::AudioOutput::new(s.player.audio()) {
+            Ok(out) => Box::into_raw(Box::new(YurisAudio(out))),
+            Err(e) => {
+                set_error(format!("no audio thread: {e}"));
+                std::ptr::null_mut()
+            }
+        },
         None => std::ptr::null_mut(),
     })
 }
@@ -518,19 +527,20 @@ pub extern "C" fn yuris_audio_sample_rate() -> u32 {
 }
 
 /// # Safety
-/// `audio` is from `yuris_audio`; `out` holds `2 * frames` floats.
+/// `audio` is from `yuris_audio`, used by one thread at a time; `out`
+/// holds `2 * frames` floats.
 #[no_mangle]
 pub unsafe extern "C" fn yuris_audio_render(audio: *mut YurisAudio, out: *mut f32, frames: u32) {
     if out.is_null() {
         return;
     }
     let buf = std::slice::from_raw_parts_mut(out, 2 * frames as usize);
-    let ok = catch_unwind(AssertUnwindSafe(|| match audio.as_ref().map(|a| a.0.lock()) {
-        Some(Ok(mut m)) => {
-            m.render(buf);
+    let ok = catch_unwind(AssertUnwindSafe(|| match audio.as_mut() {
+        Some(a) => {
+            a.0.render(buf);
             true
         }
-        _ => false,
+        None => false,
     }));
     if !matches!(ok, Ok(true)) {
         buf.fill(0.0);

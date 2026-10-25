@@ -64,13 +64,17 @@ and kind of set against the CPU compositor (at most 2/255 apart), and
 4. passes touches as `yuris_pointer` (drawable pixels; mapped through the
    letterbox to screen pixels), `yuris_wheel` and `yuris_key`;
 5. pulls sound with `yuris_audio_render` (44.1 kHz stereo floats) on its
-   audio thread, through a `YurisAudio` reference that outlives the session
-   until released;
+   audio thread, through a `YurisAudio` that outlives the session until
+   released. A feeder thread of its own mixes about 93 ms ahead into a
+   lock-free ring, and the render call only copies from it: it never waits
+   on the mixer's lock (which the game thread holds while it opens sounds)
+   and never allocates (mixing decodes Vorbis, which does);
 6. closes with `yuris_close`.
 
 Errors are reported as NULL or -1 / `YURIS_FAILED` with the text in
 `yuris_last_error`; panics are caught at the boundary. `yuris_set_log_callback`
-forwards the runtime's log records (only `yuris*` targets).
+forwards the runtime's log records (only `yuris*` targets); the callback
+runs without any lock held, so it may call back into the runtime.
 
 Build for iOS with `cargo build --release -p yuris-mobile --target
 aarch64-apple-ios` (and `aarch64-apple-ios-sim`); the crate is a

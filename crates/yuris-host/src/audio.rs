@@ -557,6 +557,8 @@ impl SoundLayer {
 pub struct Mixer {
     /// Layers by ID.
     pub layers: BTreeMap<Vec<u8>, SoundLayer>,
+    /// Parent gains of the layers during [`Mixer::render`].
+    gains: Vec<f32>,
 }
 
 /// The parameters of one SOUND call, in the engine's terms.
@@ -662,13 +664,19 @@ impl Mixer {
     /// into `out` (cleared first) and advances every layer.
     pub fn render(&mut self, out: &mut [f32]) {
         out.fill(0.0);
-        let ids: Vec<Vec<u8>> = self.layers.iter().filter(|(_, l)| l.playing).map(|(k, _)| k.clone()).collect();
-        for id in ids {
-            let parent = self.parent_gain(&id);
-            if let Some(l) = self.layers.get_mut(&id) {
+        // The parent gains first, into a buffer kept between calls, then
+        // the layers in the same (key) order: no allocation per call.
+        let mut gains = std::mem::take(&mut self.gains);
+        gains.clear();
+        for (id, l) in &self.layers {
+            gains.push(if l.playing { self.parent_gain(id) } else { 0.0 });
+        }
+        for (l, &parent) in self.layers.values_mut().zip(&gains) {
+            if l.playing {
                 l.mix(out, parent);
             }
         }
+        self.gains = gains;
         for s in out.iter_mut() {
             *s = s.clamp(-1.0, 1.0);
         }
