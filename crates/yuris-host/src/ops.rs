@@ -293,7 +293,8 @@ pub fn mosaic(img: &mut RgbaImage, r: Rect, block: i64) {
     }
 }
 
-/// BLUR: box blur of radius `radius` (horizontal then vertical pass).
+/// BLUR: box blur of radius `radius` (horizontal then vertical pass),
+/// alpha-weighted so transparent pixels do not tint the result.
 pub fn blur(img: &mut RgbaImage, r: Rect, radius: i64) {
     let r = r.clamp_to(img);
     let rad = radius.clamp(0, 64);
@@ -313,15 +314,20 @@ pub fn blur(img: &mut RgbaImage, r: Rect, radius: i64) {
                         continue;
                     }
                     let i = (sy as usize * w + sx as usize) * 4;
-                    for k in 0..4 {
-                        acc[k] += u32::from(src[i + k]);
+                    let a = u32::from(src[i + 3]);
+                    for k in 0..3 {
+                        acc[k] += u32::from(src[i + k]) * a;
                     }
+                    acc[3] += a;
                     n += 1;
                 }
                 let i = (y as usize * w + x as usize) * 4;
-                for k in 0..4 {
-                    img.data[i + k] = (acc[k] / n.max(1)) as u8;
+                if acc[3] > 0 {
+                    for k in 0..3 {
+                        img.data[i + k] = (acc[k] / acc[3]) as u8;
+                    }
                 }
+                img.data[i + 3] = (acc[3] / n.max(1)) as u8;
             }
         }
     }

@@ -146,20 +146,27 @@ impl Host {
     /// nothing). FILE on an existing layer swaps the image and keeps the
     /// attributes. The manual says `FILE=""` makes a 1×1 black image, but
     /// the reversed handler (kemonomichi2 0x423864) creates nothing for it,
-    /// so it counts as no FILE here.
+    /// so it counts as no FILE here. With SX and SY as well it makes a
+    /// black SX×SY canvas: Erewhon draws its text glow into one
+    /// (`CG ID=_FONT_TMP FILE="" SX=.. SY=..`, then clears its alpha).
     fn cg(&mut self, c: &NativeCall<'_>) {
         let Some(id) = c.bytes("ID") else { return };
         let path = LayerPath::parse(id);
         let file = c.bytes("FILE").filter(|f| !f.is_empty()).map(<[u8]>::to_vec);
-        let found = if file.is_some() || path.set {
+        let canvas = match (c.bytes("FILE"), c.int("SX"), c.int("SY")) {
+            (Some([]), Some(w), Some(h)) if w > 0 && h > 0 => Some((w.min(8192) as u32, h.min(8192) as u32)),
+            _ => None,
+        };
+        let found = if file.is_some() || canvas.is_some() || path.set {
             self.tree.find_or_create(id).map(|(l, _)| l)
         } else {
             self.tree.find(id)
         };
         let Some(lid) = found else { return };
-        let image = match &file {
-            Some(f) => Some(self.load_image(f).unwrap_or_else(|| Arc::new(layers::empty_image()))),
-            None => None,
+        let image = match (&file, canvas) {
+            (Some(f), _) => Some(self.load_image(f).unwrap_or_else(|| Arc::new(layers::empty_image()))),
+            (None, Some((w, h))) => Some(Arc::new(ops::solid(w, h, [0, 0, 0, 255]))),
+            (None, None) => None,
         };
         let Some(l) = self.tree.get_mut(lid) else { return };
         if let (Some(img), false) = (image, l.is_set) {
@@ -430,15 +437,24 @@ impl Host {
     }
 
     /// CGACT TEXT: SETSTR drawn into layer ID at X/Y with FONT slot BNO.
+    /// SET (not in the manual; read from the v481 engine's glyph routine)
+    /// draws the string several times in the same color: 1-10 at the nine
+    /// offsets (-SET..SET in steps of SET, both axes), an outline; 11 and
+    /// up at (d, 0), (0, d) and (d, d) with d = SET - 10, a drop shadow.
     fn cgact_text(&mut self, c: &NativeCall<'_>, id: &[u8]) {
         let Some(s) = c.bytes("SETSTR") else { return };
         let text = self.decode(s);
         let slot = self.fonts.slot(c.int("BNO").unwrap_or(0).max(0) as usize);
         let face = self.decode(&slot.name);
         let (x, y) = (c.int("X").unwrap_or(0), c.int("Y").unwrap_or(0));
+        let offsets = text_offsets(c.int("SET").unwrap_or(0));
         let fonts = self.fonts.clone();
         let mut drew = true;
-        self.edit_image(id, |img| drew = fonts.draw(img, x, y, &slot, &face, &text));
+        self.edit_image(id, |img| {
+            for &(dx, dy) in &offsets {
+                drew = fonts.draw(img, x + dx, y + dy, &slot, &face, &text);
+            }
+        });
         if !drew {
             self.note("CGACT TEXT: no font registered".into());
         }
@@ -625,6 +641,21 @@ impl Native for Host {
     }
 }
 
+/// Where CGACT TEXT draws its copies for a SET value (see `cgact_text`).
+fn text_offsets(set: i64) -> Vec<(i64, i64)> {
+    match set {
+        1..=10 => [set, 0, -set]
+            .iter()
+            .flat_map(|&dx| [-set, 0, set].map(|dy| (dx, dy)))
+            .collect(),
+        11.. => {
+            let d = set - 10;
+            vec![(d, 0), (0, d), (d, d)]
+        }
+        _ => vec![(0, 0)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +718,14 @@ mod tests {
         h.cgact(&call("CGACT", &args, (0, 0)));
         let b = h.tree.find(b"B").unwrap();
         assert_eq!(h.tree.get(b).unwrap().image.pixel(2, 2), Some([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn text_set_offsets() {
+        assert_eq!(text_offsets(0), [(0, 0)]);
+        let o = text_offsets(3);
+        assert_eq!(o.len(), 9);
+        assert!(o.contains(&(-3, 3)) && o.contains(&(0, 0)) && o.contains(&(3, -3)));
+        assert_eq!(text_offsets(11), [(1, 0), (0, 1), (1, 1)]);
     }
 }

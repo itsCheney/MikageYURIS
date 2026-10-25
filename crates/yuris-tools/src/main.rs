@@ -100,6 +100,12 @@ enum Cmd {
     Evb {
         /// Packed exe or package (e.g. `.mys`).
         path: PathBuf,
+        /// Writes this packed file (name as listed) instead of listing.
+        #[arg(long)]
+        extract: Option<String>,
+        /// Output file for `--extract`.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
     /// YPF archives.
     Ypf {
@@ -292,9 +298,21 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Evb { path } => {
+        Cmd::Evb { path, extract, out } => {
             let pkg = yuris_format::evb::EvbPackage::open(&path)?
                 .with_context(|| format!("{} is not an Enigma Virtual Box exe or package", path.display()))?;
+            if let Some(name) = extract {
+                let f = pkg
+                    .files()
+                    .iter()
+                    .find(|f| f.name == name)
+                    .with_context(|| format!("{name} is not in the package"))?;
+                let data = pkg.read(f)?;
+                let out = out.unwrap_or_else(|| PathBuf::from(name.rsplit('/').next().unwrap_or(&name)));
+                std::fs::write(&out, &data)?;
+                println!("wrote {} bytes -> {}", data.len(), out.display());
+                return Ok(());
+            }
             if let Some(ext) = std::fs::read(&path)
                 .ok()
                 .and_then(|b| yuris_format::evb::external_package_name(&b))
