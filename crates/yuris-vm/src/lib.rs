@@ -33,6 +33,7 @@ pub mod native;
 mod tasks;
 pub mod input;
 mod math;
+pub use math::{math3d, Math3dOut};
 pub mod text;
 pub use input::{Key, MouseButton};
 pub use tasks::TaskReport;
@@ -117,6 +118,8 @@ pub mod cmd {
     pub const PRINT: u8 = 0x70;
     /// MATH.
     pub const MATH: u8 = 0x3c;
+    /// MATH3D.
+    pub const MATH3D: u8 = 0x3d;
 }
 
 /// VM 状态机。
@@ -2831,6 +2834,11 @@ impl GroupVm {
                                 windows: g.window_count,
                             });
                         }
+                        self.pc += 1;
+                        continue;
+                    }
+                    if other == cmd::MATH3D {
+                        self.exec_math3d(&windows)?;
                         self.pc += 1;
                         continue;
                     }
