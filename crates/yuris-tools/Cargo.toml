@@ -17,6 +17,8 @@ yuris-value = { workspace = true }
 yuris-script = { workspace = true }
 yuris-vm = { workspace = true }
 yuris-host = { workspace = true }
+yuris-player = { workspace = true }
+yuris-render = { workspace = true }
 png = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

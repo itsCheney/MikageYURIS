@@ -570,7 +570,7 @@ fn kind(e: &VmEvent) -> usize {
 }
 
 /// Writes an RGBA image as PNG.
-fn save_png(path: &std::path::Path, img: &yuris_format::vfs::RgbaImage) -> Result<()> {
+pub(crate) fn save_png(path: &std::path::Path, img: &yuris_format::vfs::RgbaImage) -> Result<()> {
     let f = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?);
     let mut enc = png::Encoder::new(f, img.width, img.height);
     enc.set_color(png::ColorType::Rgba);

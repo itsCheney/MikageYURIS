@@ -1,0 +1,15 @@
+[package]
+name = "yuris-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "GPU compositor: draws the layer tree with wgpu (Metal on Apple devices)."
+
+[dependencies]
+yuris-format = { workspace = true }
+yuris-host = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+tracing = { workspace = true }

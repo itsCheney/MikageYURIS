@@ -1,0 +1,15 @@
+[package]
+name = "yuris-player"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Runs a game in real time: boot, frame stepping, input and the clock. No window or GPU."
+
+[dependencies]
+yuris-format = { workspace = true }
+yuris-vm = { workspace = true }
+yuris-host = { workspace = true }
+encoding_rs = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

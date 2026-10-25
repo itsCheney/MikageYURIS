@@ -45,8 +45,9 @@ out the extension.
 `compose::render_window` draws the tree into an RGBA frame on the CPU, with
 the blend modes normal, add, subtract, multiply, screen, lighten, darken and
 difference. Masks (MID) and transitions (TID, T) draw as normal for now.
-This is the reference path and what `yuris boot --shot` saves; a GPU
-renderer is planned for the player.
+This is the reference path and what `yuris boot --shot` saves. Players
+draw with the GPU compositor in `yuris-render`, which follows it (see
+[player.md](player.md)).
 
 ## Text
 

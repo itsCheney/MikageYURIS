@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! yuris boot     <game dir> [--launcher EXE] [--key-hex HEX] [--max-groups N]
+//! yuris play     <game dir> [--launcher EXE] [--seconds N] [--shot FILE@MS] [--compare]
 //! yuris evb      <exe or package>
 //! yuris ypf list     <bn.ypf> [--limit N]
 //! yuris ypf extract  <bn.ypf> (--name NAME | --index N) [-o OUT]
@@ -19,6 +20,7 @@
 use std::path::PathBuf;
 
 mod boot;
+mod play;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -101,6 +103,39 @@ enum Cmd {
         /// Folder for the game's save files (`<game>/save` by default).
         #[arg(long)]
         save_dir: Option<PathBuf>,
+    },
+    /// Runs a game as the app does (real-time player at 60 Hz, GPU
+    /// compositor), headless, with clicks and GPU screenshots.
+    Play {
+        /// Game folder (or its pac folder).
+        dir: PathBuf,
+        /// Launcher exe packed with Enigma Virtual Box (translation patches).
+        #[arg(long)]
+        launcher: Option<PathBuf>,
+        /// Folder for the game's save files (`<game>/save` by default).
+        #[arg(long)]
+        save_dir: Option<PathBuf>,
+        /// Registers a font file for text drawing (repeatable).
+        #[arg(long = "font")]
+        fonts: Vec<PathBuf>,
+        /// Text encoding of the game's strings: sjis (default), gbk, utf8.
+        #[arg(long, default_value = "sjis")]
+        encoding: String,
+        /// Game time to run, in seconds.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        /// Clicks at X,Y when the clock reaches MS (repeatable).
+        #[arg(long = "click", value_name = "X,Y@MS")]
+        clicks: Vec<String>,
+        /// From MS on, clicks at X,Y every 1.5 s.
+        #[arg(long = "auto-click", value_name = "X,Y@MS")]
+        auto_click: Option<String>,
+        /// Saves the GPU frame as PNG when the clock reaches MS (repeatable).
+        #[arg(long = "shot", value_name = "FILE@MS")]
+        shots: Vec<String>,
+        /// Compares each screenshot with the CPU compositor.
+        #[arg(long)]
+        compare: bool,
     },
     /// List the files of an Enigma Virtual Box exe or external package.
     Evb {
@@ -329,6 +364,9 @@ fn main() -> Result<()> {
             for f in pkg.files() {
                 println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
             }
+        }
+        Cmd::Play { dir, launcher, save_dir, fonts, encoding, seconds, clicks, auto_click, shots, compare } => {
+            play::run(play::PlayArgs { dir, launcher, save_dir, fonts, encoding, seconds, clicks, auto_click, shots, compare })?;
         }
         Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch, shots, fonts, encoding, auto_click, dumps, wav, save_dir } => {
             boot::run(boot::BootArgs {

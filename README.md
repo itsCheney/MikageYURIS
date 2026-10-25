@@ -19,12 +19,19 @@ first scenes: text with its glow, backgrounds, event CGs, sprites placed by
 slot (with its date and thumbnail) and loading it back from the title work;
 the story goes on from the saved line. The backlog and skip mode work.
 
+For an app, `yuris-player` runs the game in real time, `yuris-render`
+draws its frames with wgpu (Metal on iOS), and `yuris-mobile` puts both
+behind a C interface: the app gives it a view, steps it from its display
+link and pulls the sound from its audio callback (see
+[docs/engine/player.md](docs/engine/player.md)). The GPU frames match the
+CPU compositor's: Erewhon played to its first scenes this way differs by at
+most 1/255 per channel.
+
 Not done yet:
 
-- a GPU renderer (frames are composed on the CPU) and a real audio output
-  (the mixer is pulled by the caller);
-- the player-facing C ABI for the iOS app;
-- CGACT TRANSITION, movies;
+- the app side: a Swift session in Mikage that hosts the C interface
+  (`yuris-mobile`) has not been written yet;
+- CGACT TRANSITION, masks, movies;
 - other games and engine versions: the format readers handle 481 and 555,
   but only Erewhon has been run this far.
 
@@ -38,6 +45,9 @@ Not done yet:
 | `yuris-script` | Decodes and evaluates expression bytecode |
 | `yuris-vm` | The command-level VM: control flow, tasks, text, input, MATH/MATH3D, boot chain |
 | `yuris-host` | Native commands: CG layer tree and CPU compositor, fonts and text, sound mixer, window queries |
+| `yuris-render` | GPU compositor (wgpu): draws the layer tree like the CPU one |
+| `yuris-player` | Runs a game in real time: frame stepping, clock, input |
+| `yuris-mobile` | C interface for apps (`platform/ios/include/yuris_mobile.h`), static or dynamic library |
 | `yuris-tools` | The `yuris` command line tool |
 
 ## Building
@@ -47,8 +57,13 @@ cargo build --release
 cargo test
 ```
 
-Rust 2021, no platform dependencies. Tests that need game files skip
-themselves when the files are absent.
+Rust 2021. Tests that need game files skip themselves when the files are
+absent; the GPU tests skip without a GPU (on Linux, Mesa's lavapipe,
+`mesa-vulkan-drivers`, is enough).
+
+For iOS: `cargo build --release -p yuris-mobile --target aarch64-apple-ios`
+gives `libyuris_mobile.a` and `.dylib`; the header is
+`platform/ios/include/yuris_mobile.h`.
 
 ## The `yuris` tool
 
@@ -60,6 +75,7 @@ yuris yscm <bn.ypf> [--cmd SOUND]             # the game's command table
 yuris yscf <bn.ypf>                           # project config
 yuris evb <launcher.exe|package.mys> [--extract NAME -o FILE]
 yuris boot <game folder> [options]            # run the game headless
+yuris play <game folder> [options]            # run it as the app does, GPU frames
 ```
 
 `boot` runs the game with a simulated clock (one frame = 1/60 s) and reports
@@ -79,6 +95,12 @@ stacks. Useful options:
 | `--cgs TEXT`, `--vars`, `--dump` | Layer and variable reports at the end |
 | `--jsonl FILE --trace` | The VM's event stream |
 
+`play` runs the real-time player at 60 Hz and draws with the GPU compositor
+(`--seconds N`, `--click`, `--auto-click`, `--shot`, `--font`, `--encoding`,
+`--launcher`, `--save-dir` as above); `--compare` checks each screenshot
+against the CPU compositor. It also prints the time scripts and drawing
+take per frame.
+
 Erewhon (Chinese patch), from the title to the first scenes:
 
 ```sh
@@ -97,6 +119,7 @@ yuris boot <Erewhon> --launcher <Erewhon>/erewhon_chs.exe \
 - [docs/engine/bytecode.md](docs/engine/bytecode.md): expression bytecode
 - [docs/engine/vm.md](docs/engine/vm.md): how scripts run
 - [docs/engine/host.md](docs/engine/host.md): native commands (layers, text, sound)
+- [docs/engine/player.md](docs/engine/player.md): real-time player, GPU compositor and the C interface for apps
 - [docs/engine/reversing.md](docs/engine/reversing.md): engine addresses and how the undocumented parts were found
 
 The source carries most details at the place they are used; the module

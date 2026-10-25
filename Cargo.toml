@@ -7,6 +7,9 @@ members = [
     "crates/yuris-script",
     "crates/yuris-vm",
     "crates/yuris-host",
+    "crates/yuris-render",
+    "crates/yuris-player",
+    "crates/yuris-mobile",
     "crates/yuris-tools",
 ]
 
@@ -25,6 +28,8 @@ yuris-value    = { path = "crates/yuris-value" }
 yuris-script   = { path = "crates/yuris-script" }
 yuris-vm       = { path = "crates/yuris-vm" }
 yuris-host     = { path = "crates/yuris-host" }
+yuris-render   = { path = "crates/yuris-render" }
+yuris-player   = { path = "crates/yuris-player" }
 
 # --- externals ---
 thiserror          = "2"
@@ -43,6 +48,9 @@ clap               = { version = "4", features = ["derive"] }
 png                = "0.18"
 ab_glyph           = "0.2"
 lewton             = "0.10"
+wgpu               = { version = "26", default-features = false, features = ["wgsl", "metal", "vulkan", "std"] }
+bytemuck           = { version = "1", features = ["derive"] }
+pollster           = "0.4"
 
 [profile.release]
 opt-level = 3

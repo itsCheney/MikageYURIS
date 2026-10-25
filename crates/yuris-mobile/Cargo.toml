@@ -1,0 +1,22 @@
+[package]
+name = "yuris-mobile"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "C interface for app hosts (iOS): runs a game into a Metal view. Header: platform/ios/include/yuris_mobile.h."
+
+[lib]
+name = "yuris_mobile"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+yuris-host = { workspace = true }
+yuris-player = { workspace = true }
+yuris-render = { workspace = true }
+yuris-vm = { workspace = true }
+wgpu = { workspace = true }
+raw-window-handle = "0.6"
+pollster = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
