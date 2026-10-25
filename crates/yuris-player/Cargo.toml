@@ -12,4 +12,5 @@ yuris-vm = { workspace = true }
 yuris-host = { workspace = true }
 encoding_rs = { workspace = true }
 thiserror = { workspace = true }
+ttf-parser = "0.25"
 tracing = { workspace = true }

@@ -59,13 +59,44 @@ pub struct Config {
     pub launcher: Option<PathBuf>,
     /// Where `save\` goes; the game folder's `save` by default.
     pub save_dir: Option<PathBuf>,
-    /// Font files (TTF/OTF/TTC) with the face index to use, first is the
-    /// default face.
-    pub fonts: Vec<(PathBuf, u32)>,
+    /// Font files; the first is the default face.
+    pub fonts: Vec<FontFile>,
     /// Text encoding.
     pub encoding: Encoding,
     /// Local time offset from UTC, for the date the game reads (`@_TIME`).
     pub utc_offset_ms: i64,
+}
+
+/// A font file (TTF/OTF/TTC) and the face to use in it.
+#[derive(Debug, Clone, Default)]
+pub struct FontFile {
+    /// The file.
+    pub path: PathBuf,
+    /// Face index in a collection, used when `name` is None.
+    pub index: u32,
+    /// PostScript or family name of the face to use.
+    pub name: Option<String>,
+}
+
+impl FontFile {
+    /// The first face of a file.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into(), index: 0, name: None }
+    }
+}
+
+/// The index of the face named `name` (PostScript or family name) in a
+/// font file or collection.
+fn face_index(data: &[u8], name: &str) -> Option<u32> {
+    let count = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    (0..count).find(|&i| {
+        ttf_parser::Face::parse(data, i).is_ok_and(|f| {
+            f.names().into_iter().any(|n| {
+                matches!(n.name_id, ttf_parser::name_id::POST_SCRIPT_NAME | ttf_parser::name_id::FULL_NAME | ttf_parser::name_id::FAMILY)
+                    && n.to_string().is_some_and(|s| s == name)
+            })
+        })
+    })
 }
 
 /// Where the game is.
@@ -141,10 +172,16 @@ impl Player {
         if let Some(c) = &cfg {
             host.caption = host.encoding.encode(&c.caption).0.into_owned();
         }
-        for (path, face) in &config.fonts {
+        for font in &config.fonts {
+            let path = &font.path;
             let bytes = std::fs::read(path).map_err(|e| Error::Font(format!("{}: {e}", path.display())))?;
+            let index = match &font.name {
+                Some(name) => face_index(&bytes, name)
+                    .ok_or_else(|| Error::Font(format!("{} has no face {name}", path.display())))?,
+                None => font.index,
+            };
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            if !host.fonts.add_face(&name, bytes, *face) {
+            if !host.fonts.add_face(&name, bytes, index) {
                 return Err(Error::Font(path.display().to_string()));
             }
         }
@@ -440,5 +477,13 @@ mod tests {
         assert_eq!(key_from_vk(0x11), Some(Key::Ctrl));
         assert_eq!(key_from_vk(0xe2), Some(Key::Backslash));
         assert_eq!(key_from_vk(0x07), None);
+    }
+
+    #[test]
+    fn faces_by_name() {
+        let Ok(data) = std::fs::read("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc") else { return };
+        assert_eq!(face_index(&data, "WenQuanYiZenHei"), Some(0));
+        assert_eq!(face_index(&data, "WenQuanYi Zen Hei Mono"), Some(1));
+        assert_eq!(face_index(&data, "MS Gothic"), None);
     }
 }

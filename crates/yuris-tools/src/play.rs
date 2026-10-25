@@ -43,7 +43,7 @@ pub fn run(args: PlayArgs) -> Result<()> {
         game_dir: args.dir.clone(),
         launcher: args.launcher.clone(),
         save_dir: args.save_dir.clone(),
-        fonts: args.fonts.iter().map(|f| (f.clone(), 0)).collect(),
+        fonts: args.fonts.iter().map(yuris_player::FontFile::new).collect(),
         encoding: match args.encoding.to_ascii_lowercase().as_str() {
             "gbk" | "gb2312" | "cp936" => Encoding::Gbk,
             "utf8" | "utf-8" => Encoding::Utf8,

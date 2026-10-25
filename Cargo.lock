@@ -1466,6 +1466,7 @@ dependencies = [
  "encoding_rs",
  "thiserror",
  "tracing",
+ "ttf-parser",
  "yuris-format",
  "yuris-host",
  "yuris-vm",

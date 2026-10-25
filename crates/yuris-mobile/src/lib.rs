@@ -16,7 +16,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, Once};
 
 use yuris_host::audio::{Mixer, OUTPUT_RATE};
-use yuris_player::{key_from_vk, Config, Encoding, Player, Status};
+use yuris_player::{key_from_vk, Config, Encoding, FontFile, Player, Status};
 use yuris_render::{fit, Renderer};
 use yuris_vm::MouseButton;
 
@@ -30,9 +30,6 @@ pub struct YurisConfig {
     pub game_dir: *const c_char,
     pub launcher: *const c_char,
     pub save_dir: *const c_char,
-    pub font_paths: *const *const c_char,
-    pub font_faces: *const u32,
-    pub font_count: u32,
     pub encoding: u32,
     pub utc_offset_ms: i64,
 }
@@ -115,7 +112,7 @@ pub extern "C" fn yuris_last_error() -> *const c_char {
 
 // ---- logging ----
 
-type LogCallback = extern "C" fn(level: i32, message: *const c_char, context: *mut c_void);
+type LogCallback = extern "C" fn(level: i32, target: *const c_char, message: *const c_char, context: *mut c_void);
 
 struct LogSink {
     callback: LogCallback,
@@ -155,10 +152,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
                 }
             }
         }
-        let mut v = Visit(format!("{}: ", event.metadata().target()));
+        let mut v = Visit(String::new());
         event.record(&mut v);
+        let target = CString::new(event.metadata().target()).unwrap_or_default();
         let msg = CString::new(v.0.replace('\0', " ")).unwrap_or_default();
-        (sink.callback)(level, msg.as_ptr(), sink.context as *mut c_void);
+        (sink.callback)(level, target.as_ptr(), msg.as_ptr(), sink.context as *mut c_void);
     }
 }
 
@@ -174,6 +172,37 @@ pub extern "C" fn yuris_set_log_callback(callback: Option<LogCallback>, context:
             let filter = tracing_subscriber::filter::filter_fn(|m| m.target().starts_with("yuris"));
             let _ = tracing_subscriber::registry().with(CallbackLayer.with_filter(filter)).try_init();
         });
+    })
+}
+
+// ---- fonts ----
+
+/// Fonts for the sessions opened from now on.
+static FONTS: Mutex<Vec<FontFile>> = Mutex::new(Vec::new());
+
+/// # Safety
+/// `path` and `face` are NULL or NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn yuris_register_font(path: *const c_char, face: *const c_char) -> i32 {
+    guard(0, || {
+        let Some(path) = string(path) else { return 0 };
+        if !std::path::Path::new(&path).is_file() {
+            set_error(format!("no font file {path}"));
+            return 0;
+        }
+        if let Ok(mut fonts) = FONTS.lock() {
+            fonts.push(FontFile { path: PathBuf::from(path), index: 0, name: string(face) });
+        }
+        1
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn yuris_clear_fonts() {
+    guard((), || {
+        if let Ok(mut fonts) = FONTS.lock() {
+            fonts.clear();
+        }
     })
 }
 
@@ -198,15 +227,7 @@ pub unsafe extern "C" fn yuris_open(config: *const YurisConfig) -> *mut YurisSes
             set_error("no game folder");
             return std::ptr::null_mut();
         };
-        let mut fonts = Vec::new();
-        for i in 0..c.font_count as usize {
-            if c.font_paths.is_null() {
-                break;
-            }
-            let Some(path) = string(*c.font_paths.add(i)) else { continue };
-            let face = if c.font_faces.is_null() { 0 } else { *c.font_faces.add(i) };
-            fonts.push((PathBuf::from(path), face));
-        }
+        let fonts = FONTS.lock().map(|f| f.clone()).unwrap_or_default();
         let cfg = Config {
             game_dir: PathBuf::from(game_dir),
             launcher: string(c.launcher).map(PathBuf::from),

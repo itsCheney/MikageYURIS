@@ -28,9 +28,6 @@ typedef struct {
     const char *game_dir;          /* the game folder */
     const char *launcher;          /* a patch's packed executable, or NULL */
     const char *save_dir;          /* where saves go, or NULL for <game_dir>/save */
-    const char *const *font_paths; /* font files; the first is the default face */
-    const uint32_t *font_faces;    /* TTC face index per font, or NULL for all 0 */
-    uint32_t font_count;
     uint32_t encoding;             /* 0 Shift-JIS, 1 GBK, 2 UTF-8 */
     int64_t utc_offset_ms;         /* local time offset, for the date the game reads */
 } YurisConfig;
@@ -55,10 +52,19 @@ uint32_t yuris_abi_version(void);
  * call on this thread. */
 const char *yuris_last_error(void);
 
-/* Engine log records: level 1 error, 2 warn, 3 info, 4 debug, 5 trace.
- * The message is valid during the call; any thread. NULL stops them. */
-typedef void (*yuris_log_callback)(int32_t level, const char *message, void *context);
+/* Engine log records: level 1 error, 2 warn, 3 info, 4 debug, 5 trace;
+ * target is the Rust module. Strings are valid during the call; any
+ * thread. NULL stops them. */
+typedef void (*yuris_log_callback)(int32_t level, const char *target, const char *message, void *context);
 void yuris_set_log_callback(yuris_log_callback callback, void *context, int32_t max_level);
+
+/* Fonts for the sessions opened after the call: a TTF, OTF or TTC file and
+ * the PostScript or family name of the face in it (NULL or "" for the
+ * first). The first font registered draws text whose font the game names
+ * but nobody registered (MS Gothic...). Returns 1, or 0 when the file is
+ * missing; a face that is not in the file fails yuris_open. */
+int32_t yuris_register_font(const char *path, const char *face);
+void yuris_clear_fonts(void);
 
 /* Opens and boots a game. NULL on failure (see yuris_last_error). */
 YurisSession *yuris_open(const YurisConfig *config);

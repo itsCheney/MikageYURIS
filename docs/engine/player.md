@@ -52,8 +52,9 @@ and kind of set against the CPU compositor (at most 2/255 apart), and
 
 `platform/ios/include/yuris_mobile.h`. The app:
 
-1. opens a session with `yuris_open` (game folder, patch launcher, save
-   folder, fonts, encoding, UTC offset);
+1. registers its fonts with `yuris_register_font` (a file and a face name
+   in it, such as PingFang's), then opens a session with `yuris_open` (game
+   folder, patch launcher, save folder, encoding, UTC offset);
 2. gives it a view with `yuris_set_surface(session, uiView, w, h)` in
    drawable pixels (again after a size change). The view's layer should be a
    `CAMetalLayer`; wgpu makes the Metal surface from it;
