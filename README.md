@@ -24,7 +24,7 @@ Not done yet:
 - a GPU renderer (frames are composed on the CPU) and a real audio output
   (the mixer is pulled by the caller);
 - the player-facing C ABI for the iOS app;
-- PRODUCT, IFBREAK, CGACT TRANSITION, movies;
+- CGACT TRANSITION, movies;
 - other games and engine versions: the format readers handle 481 and 555,
   but only Erewhon has been run this far.
 

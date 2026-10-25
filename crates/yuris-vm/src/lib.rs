@@ -56,6 +56,12 @@ pub mod cmd {
     pub const ELSE: u8 = 0x0b;
     /// IFBLEND(0x2d;无条件跳到嵌套栈顶 else 块的结束)。
     pub const IFBLEND: u8 = 0x2d;
+    /// IFBREAK: leaves the enclosing IF block(s).
+    pub const IFBREAK: u8 = 0x2e;
+    /// IFCONTINUE: goes back to the enclosing IF.
+    pub const IFCONTINUE: u8 = 0x2f;
+    /// PRODUCT: a call into the game's own engine extension.
+    pub const PRODUCT: u8 = 0x74;
     /// RETURN。
     pub const RETURN: u8 = 0x4f;
     /// LET。
@@ -1480,6 +1486,55 @@ impl GroupVm {
                         });
                     }
                     self.pc = top.end_target as usize;
+                    continue;
+                }
+                cmd::IFBREAK | cmd::IFCONTINUE => {
+                    // From the manual: IFBREAK leaves the IF block (jumps to
+                    // its IFEND), IFCONTINUE goes back to its IF; LV=n acts
+                    // on the n-th enclosing IF (default 1). Erewhon uses
+                    // IFBREAK LV=2/3 in its movie and menu scripts.
+                    let lv = match windows.first().filter(|w| w.len > 0) {
+                        Some(w) => self
+                            .eval_window_condition(Some(w))?
+                            .and_then(|v| v.as_int_opt())
+                            .unwrap_or(1)
+                            .max(1) as usize,
+                        None => 1,
+                    };
+                    if self.if_nest.len() < lv {
+                        if let Some(reason) = self.halt_or_record(
+                            self.pc,
+                            g.command_type,
+                            format!("IF{} LV={lv} outside {lv} IF blocks",
+                                if g.command_type == cmd::IFBREAK { "BREAK" } else { "CONTINUE" }),
+                        ) {
+                            return Ok(VmSuspend::Error(reason));
+                        }
+                        self.pc += 1;
+                        continue;
+                    }
+                    let keep = self.if_nest.len() - lv;
+                    let target = self.if_nest[keep];
+                    let from = self.pc;
+                    if g.command_type == cmd::IFBREAK {
+                        // Its IFEND pops the target block itself.
+                        self.if_nest.truncate(keep + 1);
+                        self.pc = target.end_target as usize;
+                    } else {
+                        // The IF runs again and pushes its block anew.
+                        self.if_nest.truncate(keep);
+                        self.pc = target.if_pc;
+                    }
+                    if self.trace {
+                        self.events.push(VmEvent::Jump { from, to: self.pc, kind: JumpKind::Else });
+                    }
+                    continue;
+                }
+                cmd::PRODUCT => {
+                    // Erewhon's es.ONH.* pass COM=1001 and two numbers to the
+                    // product's own engine extension and never read a
+                    // result: nothing to do here.
+                    self.pc += 1;
                     continue;
                 }
                 cmd::LET => {
