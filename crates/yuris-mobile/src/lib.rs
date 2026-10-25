@@ -238,8 +238,9 @@ pub unsafe extern "C" fn yuris_open(config: *const YurisConfig) -> *mut YurisSes
             fonts,
             encoding: match c.encoding {
                 1 => Encoding::Gbk,
+                0 => Encoding::ShiftJis,
                 2 => Encoding::Utf8,
-                _ => Encoding::ShiftJis,
+                _ => Encoding::Auto,
             },
             utc_offset_ms: c.utc_offset_ms,
         };

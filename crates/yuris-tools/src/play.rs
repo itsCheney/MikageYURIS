@@ -47,7 +47,8 @@ pub fn run(args: PlayArgs) -> Result<()> {
         encoding: match args.encoding.to_ascii_lowercase().as_str() {
             "gbk" | "gb2312" | "cp936" => Encoding::Gbk,
             "utf8" | "utf-8" => Encoding::Utf8,
-            _ => Encoding::ShiftJis,
+            "sjis" | "shift-jis" | "shiftjis" | "cp932" => Encoding::ShiftJis,
+            _ => Encoding::Auto,
         },
         utc_offset_ms: 0,
     };

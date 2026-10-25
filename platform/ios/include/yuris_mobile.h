@@ -28,7 +28,8 @@ typedef struct {
     const char *game_dir;          /* the game folder */
     const char *launcher;          /* a patch's packed executable, or NULL */
     const char *save_dir;          /* where saves go, or NULL for <game_dir>/save */
-    uint32_t encoding;             /* 0 Shift-JIS, 1 GBK, 2 UTF-8 */
+    uint32_t encoding;             /* 0 Shift-JIS, 1 GBK, 2 UTF-8, 3 Shift-JIS or GBK
+                                      as the scripts' text reads */
     int64_t utc_offset_ms;         /* local time offset, for the date the game reads */
 } YurisConfig;
 

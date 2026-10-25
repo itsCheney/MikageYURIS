@@ -4,7 +4,11 @@
 //! Lookup order (the engine's own order is not reversed yet; this is our
 //! convention):
 //! 1. `save\` paths go to the save folder (`<game>\save` unless the host
-//!    sets another);
+//!    sets another) and nowhere else: save files a patch packs (Erewhon
+//!    CHS ships the translator's `save\config.sd`) are left out, as the
+//!    game would take them for a returning player's and skip the first-run
+//!    setup that `global.sd` would otherwise carry (its message window
+//!    then sits above the screen);
 //! 2. files packed into the launcher exe or its external package (Enigma
 //!    Virtual Box shows them ahead of the real files);
 //! 3. loose files below the game folder (patches often ship loose files);
@@ -252,16 +256,11 @@ impl GameFs {
         if let Some(rest) = norm.strip_prefix(b"save\\") {
             let (rest, _, _) = encoding_rs::SHIFT_JIS.decode(rest);
             let p = self.save_dir.join(rest.replace('\\', "/"));
-            if p.is_file() {
-                return Some(Hit::Disk(p));
-            }
+            return p.is_file().then_some(Hit::Disk(p));
         }
         if let Some(&(pi, fi)) = self.virtual_files.get(norm) {
             let pkg = &self.overlay[pi];
             return Some(Hit::Virtual(pkg, &pkg.files()[fi]));
-        }
-        if norm.starts_with(b"save\\") {
-            return None;
         }
         if let Some(p) = self.loose.get(norm) {
             return Some(Hit::Disk(p.clone()));
@@ -570,7 +569,8 @@ mod tests {
         assert!(!fs.exists("ysbin\\only_jp.ybn"));
         assert_eq!(fs.read("ysbin\\x.ybn").unwrap(), b"u9");
         assert_eq!(fs.image_size("cg/tip"), Some((4, 3)));
-        assert_eq!(fs.read("save\\config.sd").unwrap(), b"default config");
+        // The patch's own save files are not the player's.
+        assert!(!fs.exists("save\\config.sd"));
         std::fs::create_dir_all(dir.join("save")).unwrap();
         std::fs::write(dir.join("save/config.sd"), b"saved").unwrap();
         assert_eq!(fs.read("save\\config.sd").unwrap(), b"saved");

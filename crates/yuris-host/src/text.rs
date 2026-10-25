@@ -113,11 +113,31 @@ impl Fonts {
             .map(|(_, f)| f)
     }
 
+    /// The face that draws `c`: `face` when it has the character, else the
+    /// first registered face that has it (PingFang SC has no kana, so
+    /// Japanese text needs Hiragino), else `face` (its missing-glyph box).
+    fn face_with<'a>(&'a self, face: &'a FontArc, c: char) -> (&'a FontArc, ab_glyph::GlyphId) {
+        let gid = face.glyph_id(c);
+        if gid.0 != 0 {
+            return (face, gid);
+        }
+        self.faces
+            .iter()
+            .map(|(_, f)| (f, f.glyph_id(c)))
+            .find(|(_, g)| g.0 != 0)
+            .unwrap_or((face, gid))
+    }
+
     /// Width in pixels of `text` drawn with `slot`.
     pub fn measure(&self, slot: &FontSlot, name: &str, text: &str) -> i64 {
         let Some(face) = self.face_for(name) else { return 0 };
-        let sf = face.as_scaled(scale(slot));
-        text.chars().map(|c| sf.h_advance(face.glyph_id(c))).sum::<f32>().ceil() as i64
+        text.chars()
+            .map(|c| {
+                let (f, gid) = self.face_with(face, c);
+                f.as_scaled(scale(slot)).h_advance(gid)
+            })
+            .sum::<f32>()
+            .ceil() as i64
     }
 
     /// Draws `text` into `img` with its top-left corner at (x, y). Returns
@@ -132,10 +152,10 @@ impl Fonts {
             if c == '\n' {
                 continue;
             }
-            let gid = face.glyph_id(c);
+            let (f, gid) = self.face_with(face, c);
             let glyph = gid.with_scale_and_position(scale(slot), ab_glyph::point(pen, y as f32 + ascent));
-            pen += sf.h_advance(gid);
-            let Some(outline) = face.outline_glyph(glyph) else { continue };
+            pen += f.as_scaled(scale(slot)).h_advance(gid);
+            let Some(outline) = f.outline_glyph(glyph) else { continue };
             let bb = outline.px_bounds();
             let passes: &[f32] = if slot.bold { &[0.0, 1.0] } else { &[0.0] };
             for &dx in passes {

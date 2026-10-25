@@ -47,6 +47,9 @@ pub enum Encoding {
     Gbk,
     /// UTF-8.
     Utf8,
+    /// Shift-JIS or GBK, whichever the game's scripts are written in
+    /// (see [`guess_encoding`]).
+    Auto,
 }
 
 /// How to open a game.
@@ -151,6 +154,7 @@ impl Player {
         let booted = Bootstrap { fs: fs.clone(), key: None, entry_label: None }
             .boot()
             .map_err(|e| Error::Boot(e.to_string()))?;
+        let key = booted.key;
         let mut vm = booted.vm;
         let cfg = fs
             .read("ysbin\\yscfg.ybn")
@@ -160,13 +164,22 @@ impl Player {
             Some(c) if c.screen_width > 0 && c.screen_height > 0 => (c.screen_width, c.screen_height),
             _ => (1280, 720),
         };
+        let encoding = match config.encoding {
+            Encoding::Auto => {
+                let guessed = guess_encoding(&fs, key);
+                tracing::info!("script text looks like {guessed:?}");
+                guessed
+            }
+            chosen => chosen,
+        };
         let mut host = Host::new(Some(fs.clone()), screen);
-        host.encoding = match config.encoding {
+        host.encoding = match encoding {
             Encoding::ShiftJis => encoding_rs::SHIFT_JIS,
             Encoding::Gbk => encoding_rs::GBK,
             Encoding::Utf8 => encoding_rs::UTF_8,
+            Encoding::Auto => unreachable!(),
         };
-        if config.encoding == Encoding::Gbk {
+        if encoding == Encoding::Gbk {
             vm.set_codepage(yuris_vm::Codepage::Gbk);
         }
         if let Some(c) = &cfg {
@@ -485,5 +498,45 @@ mod tests {
         assert_eq!(face_index(&data, "WenQuanYiZenHei"), Some(0));
         assert_eq!(face_index(&data, "WenQuanYi Zen Hei Mono"), Some(1));
         assert_eq!(face_index(&data, "MS Gothic"), None);
+    }
+}
+
+/// Whether the game's scripts are written in Shift-JIS or GBK. Translation
+/// patches often keep the Japanese file names, so the names can't tell.
+///
+/// Counts the two-byte characters of each kind in the scripts' expression
+/// pools, where the strings live: Japanese text is full of Shift-JIS kana,
+/// kanji and punctuation (lead bytes 0x81-0x9F), which GBK puts in its
+/// rarely used extension area, and Chinese text of GB2312 hanzi (both bytes
+/// 0xA1 and up, from 0xB0), which Shift-JIS reads as half-width katakana.
+/// A patch keeps much of the Japanese (Erewhon CHS: 586k GBK pairs next to
+/// 953k Shift-JIS ones, the Japanese release 900 GBK-looking ones), so a
+/// few percent of GB2312 pairs already make it Chinese.
+pub fn guess_encoding(fs: &GameFs, key: [u8; 4]) -> Encoding {
+    let (mut gbk, mut sjis) = (0usize, 0usize);
+    for id in yuris_vm::host::list_script_ids(fs) {
+        let Ok(bytes) = fs.read(&yuris_vm::host::script_path(id)) else { continue };
+        let Ok(script) = yuris_format::ystb::YstbFile::from_bytes(&bytes, key) else { continue };
+        let pool = script.content();
+        let mut i = 0;
+        while i + 1 < pool.len() {
+            let (lead, trail) = (pool[i], pool[i + 1]);
+            if lead < 0x80 {
+                i += 1;
+                continue;
+            }
+            if (0x81..=0x9F).contains(&lead) && (0x40..=0xFC).contains(&trail) && trail != 0x7F {
+                sjis += 1;
+            } else if (0xB0..=0xF7).contains(&lead) && (0xA1..=0xFE).contains(&trail) {
+                gbk += 1;
+            }
+            i += 2;
+        }
+    }
+    tracing::debug!("two-byte characters: {gbk} GBK, {sjis} Shift-JIS");
+    if gbk * 20 > sjis {
+        Encoding::Gbk
+    } else {
+        Encoding::ShiftJis
     }
 }

@@ -118,8 +118,9 @@ enum Cmd {
         /// Registers a font file for text drawing (repeatable).
         #[arg(long = "font")]
         fonts: Vec<PathBuf>,
-        /// Text encoding of the game's strings: sjis (default), gbk, utf8.
-        #[arg(long, default_value = "sjis")]
+        /// Text encoding of the game's strings: auto (default, from the
+        /// scripts), sjis, gbk, utf8.
+        #[arg(long, default_value = "auto")]
         encoding: String,
         /// Game time to run, in seconds.
         #[arg(long, default_value_t = 60)]
