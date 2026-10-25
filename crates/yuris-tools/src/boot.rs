@@ -48,6 +48,8 @@ pub struct BootArgs {
     pub dumps: Vec<String>,
     /// WAVE file for the mixed sound output.
     pub wav: Option<PathBuf>,
+    /// Folder for save files.
+    pub save_dir: Option<PathBuf>,
 }
 
 fn hex(k: &[u8]) -> String {
@@ -55,8 +57,11 @@ fn hex(k: &[u8]) -> String {
 }
 
 pub fn run(args: BootArgs) -> Result<()> {
-    let fs = GameFs::open_with_launcher(&args.dir, args.launcher.as_deref())
+    let mut fs = GameFs::open_with_launcher(&args.dir, args.launcher.as_deref())
         .with_context(|| format!("open {}", args.dir.display()))?;
+    if let Some(dir) = &args.save_dir {
+        fs.set_save_dir(dir.clone());
+    }
     println!("game root: {}", fs.root().display());
     for pkg in fs.overlay() {
         println!("  overlay {} ({} files)", pkg.path().display(), pkg.files().len());
@@ -226,6 +231,11 @@ pub fn run(args: BootArgs) -> Result<()> {
     let mut button_down = false;
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut frames = 0usize;
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    vm.set_date_time(date_time(start))?;
     let mut audio_frames = 0u64;
     let mut audio_buf: Vec<f32> = Vec::new();
     let mut wav = args.wav.as_deref().map(WavWriter::create).transpose()?;
@@ -278,6 +288,7 @@ pub fn run(args: BootArgs) -> Result<()> {
                 frames += 1;
                 let step = time_ms.unwrap_or(0).max(counter.unwrap_or(1) * 1000 / 60).max(1);
                 vm.set_clock_ms(vm.clock_ms() + step);
+                vm.set_date_time(date_time(start + vm.clock_ms() as i64))?;
                 // Sound positions move only as the mixer is pulled: pull
                 // as much as the clock advanced.
                 if let Some(h) = vm.native_as::<Host>() {
@@ -512,6 +523,34 @@ const KINDS: [&str; 13] = [
 ];
 
 /// Index into [`KINDS`].
+/// `@_TIME` fields for a Unix time in ms. UTC: the headless tool has no
+/// time zone database.
+fn date_time(ms: i64) -> [i64; 8] {
+    let days = ms.div_euclid(86_400_000);
+    let in_day = ms.rem_euclid(86_400_000);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let weekday = (days + 4).rem_euclid(7);
+    [
+        year,
+        month,
+        day,
+        weekday,
+        in_day / 3_600_000,
+        in_day / 60_000 % 60,
+        in_day / 1000 % 60,
+        in_day % 1000,
+    ]
+}
+
 fn kind(e: &VmEvent) -> usize {
     match e {
         VmEvent::GroupExecuted { .. } => 0,

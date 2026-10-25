@@ -145,16 +145,29 @@ pub(crate) fn strip_quotes(v: &Value) -> Vec<u8> {
     }
 }
 
-/// `SCRIPTPOS` strings are ours: `script:pc`. They round-trip through
-/// TASKINFO SCRIPTPOS and TASK SCRIPTPOS within this runtime.
-pub(crate) fn format_script_pos(script_id: u16, pc: usize) -> Vec<u8> {
-    format!("{script_id}:{pc}").into_bytes()
+/// `SCRIPTPOS` strings are ours: `script:pc` of the task's position, then
+/// `;script:pc` for the return point of each GOSUB it is in, outermost
+/// first. They round-trip through TASKINFO SCRIPTPOS and TASK SCRIPTPOS
+/// within this runtime (Erewhon keeps one in its saves). GOSUB locals,
+/// IF and LOOP state are not kept.
+pub(crate) fn format_script_pos(script_id: u16, pc: usize, frames: &[GosubFrame]) -> Vec<u8> {
+    let mut s = format!("{script_id}:{pc}");
+    for f in frames.iter().skip(1) {
+        s.push_str(&format!(";{}:{}", f.script_id, f.return_pc));
+    }
+    s.into_bytes()
 }
 
-fn parse_script_pos(s: &[u8]) -> Option<(u16, usize)> {
+/// The positions of a `SCRIPTPOS` string: the task's own first, then the
+/// return points.
+fn parse_script_pos(s: &[u8]) -> Option<Vec<(u16, usize)>> {
     let s = std::str::from_utf8(s).ok()?;
-    let (a, b) = s.split_once(':')?;
-    Some((a.parse().ok()?, b.parse().ok()?))
+    s.split(';')
+        .map(|p| {
+            let (a, b) = p.split_once(':')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        })
+        .collect()
 }
 
 impl GroupVm {
@@ -407,11 +420,23 @@ impl GroupVm {
             return Ok((format!("text restart: {n} task(s) go on"), None));
         }
         let existing = self.task_target(p.id.as_deref());
-        let start = match (&p.label, &p.script_pos) {
-            (_, Some(pos)) if !pos.is_empty() => Some(
+        let script_pos = match &p.script_pos {
+            Some(pos) if !pos.is_empty() => Some(
                 parse_script_pos(pos)
+                    .filter(|v| !v.is_empty())
                     .ok_or_else(|| Error::format(format!("TASK SCRIPTPOS {:?}", String::from_utf8_lossy(pos))))?,
             ),
+            _ => None,
+        };
+        // From the manual: SCRIPTPOS on an existing task overwrites its
+        // position, "in effect a load of the script position".
+        if let (Some(i), Some(stack)) = (existing, &script_pos) {
+            if !p.restart {
+                return self.move_task(i, stack).map(|d| (d, None));
+            }
+        }
+        let start = match (&p.label, &script_pos) {
+            (_, Some(stack)) => Some(stack[0]),
             (Some(label), _) if !label.is_empty() => {
                 let (pc, sid) = self.labels.get(label.as_slice()).copied().ok_or_else(|| {
                     Error::format(format!("TASK label not found: {}", String::from_utf8_lossy(label)))
@@ -518,6 +543,43 @@ impl GroupVm {
         ))
     }
 
+    /// Puts task `i` at a SCRIPTPOS stack (see [`format_script_pos`]),
+    /// with fresh GOSUB frames and no IF/LOOP state, and wakes it.
+    fn move_task(&mut self, i: usize, stack: &[(u16, usize)]) -> Result<String> {
+        if i == self.current_task {
+            return Err(Error::format("TASK SCRIPTPOS on the running task is not supported"));
+        }
+        let (sid, pc) = stack[0];
+        let ctx = self.prepared_script(sid)?;
+        let entry_sid = stack.get(1).map(|f| f.0).unwrap_or(sid);
+        let mut frames = vec![GosubFrame {
+            return_pc: 0,
+            script_id: entry_sid,
+            locals: VariableStore::new(),
+            if_nest_depth: 0,
+            loop_depth: 0,
+        }];
+        for &(rsid, rpc) in &stack[1..] {
+            self.prepared_script(rsid)?;
+            frames.push(GosubFrame {
+                return_pc: rpc,
+                script_id: rsid,
+                locals: VariableStore::new(),
+                if_nest_depth: 0,
+                loop_depth: 0,
+            });
+        }
+        let t = &mut self.tasks[i];
+        t.saved = Some(ExecState { ctx, pc, frames, if_nest: Vec::new(), loops: Vec::new() });
+        t.wait_frames = 0;
+        t.wait_until_ms = 0;
+        t.text_wait = false;
+        Ok(format!(
+            "task {} moved to yst{sid:05} pc {pc}",
+            String::from_utf8_lossy(&t.name)
+        ))
+    }
+
     /// TASKEND: ends the named task, or the running one.
     pub(crate) fn exec_taskend(&mut self, id: Option<&[u8]>) -> (String, Option<Option<VmSuspend>>) {
         let Some(i) = self.task_target(id) else {
@@ -545,10 +607,11 @@ impl GroupVm {
             });
         };
         let t = &self.tasks[i];
-        let (sid, pc, base_sid) = match &t.saved {
-            Some(s) => (s.ctx.script_id, s.pc, s.frames.first().map(|f| f.script_id)),
-            None => (self.ctx.script_id, self.pc, self.frames.first().map(|f| f.script_id)),
+        let (sid, pc, frames) = match &t.saved {
+            Some(s) => (s.ctx.script_id, s.pc, &s.frames),
+            None => (self.ctx.script_id, self.pc, &self.frames),
         };
+        let base_sid = frames.first().map(|f| f.script_id);
         let file = |sid: u16| {
             self.script_list
                 .as_deref()
@@ -569,7 +632,7 @@ impl GroupVm {
             11 => Value::Int(0),
             12 => Value::Int(t.text_line),
             13 => Value::Int(0),
-            19 => Value::Str(format_script_pos(sid, pc)),
+            19 => Value::Str(format_script_pos(sid, pc, frames)),
             _ => return None,
         })
     }

@@ -94,6 +94,8 @@ pub mod cmd {
     pub const LOAD: u8 = 0x36;
     /// SAVE(存档数据位图标记;语料 298 组,非声明族最高频)。
     pub const SAVE: u8 = 0x56;
+    /// SAVEEND: forgets the blocks SAVE kept in memory.
+    pub const SAVEEND: u8 = 0x57;
     /// CGEND(CG 显示结束通知;语料 241 组)。
     pub const CGEND: u8 = 0x03;
     /// TASK(命名任务创建/重配置;引擎 0044fe40)。
@@ -574,6 +576,10 @@ pub struct GroupVm {
     ysvr_kind2_applied: std::collections::HashSet<u16>,
     /// The game's file system, for FILEINFO EXIST, CGINFO sizes and LOAD.
     file_probe: Option<std::sync::Arc<yuris_format::vfs::GameFs>>,
+    /// Blocks SAVE keeps until a SAVE with FILE writes them.
+    save_pending: Vec<yuris_format::yssd::YssdBlock>,
+    /// `SAVE MEM=n` memory slots (see the SAVE handler).
+    mem_slots: std::collections::BTreeMap<i64, Vec<yuris_format::yssd::YssdBlock>>,
     /// The script list (`ysbin\yst_list.ybn`), for SYSTEMINFO.
     script_list: Option<std::sync::Arc<yuris_format::ystl::YstlTable>>,
     /// Tasks (see [`tasks`]); empty until the first TASK, then [0] is the
@@ -641,6 +647,8 @@ impl GroupVm {
             ysvr_globals: Vec::new(),
             ysvr_kind2_applied: std::collections::HashSet::new(),
             file_probe: None,
+            save_pending: Vec::new(),
+            mem_slots: std::collections::BTreeMap::new(),
             script_list: None,
             tasks: Vec::new(),
             current_task: 0,
@@ -991,9 +999,10 @@ impl GroupVm {
             let elem = if e.ty == 1 { ElemType::Int }
                 else if e.ty == 2 { ElemType::Float }
                 else { ElemType::Str };
-            self.store.declare_array(&r, elem, &e.bounds);
-            let zeros = vec![0i64; e.bounds.len()];
-            self.store.set_elem(&r, &zeros, v)?;
+            // From the manual (INT/S_INT ...): an array declared with an
+            // initial value gets it in every element. Erewhon's sound
+            // tables (`S_INT @2556(201) = -99999`) mark unused channels so.
+            self.store.redeclare_array(&r, elem, &e.bounds, v);
         }
         Ok(())
     }
@@ -2518,6 +2527,7 @@ impl GroupVm {
                     let mut mem: Option<i64> = None;
                     let mut dno: Option<i64> = None;
                     let mut id_flag: i64 = 0;
+                    let mut layer_id: Option<Vec<u8>> = None;
                     let mut target: Option<yuris_script::LValueRef> = None;
                     let mut evaluated: Vec<(u8, String)> = Vec::new();
                     for w in &windows {
@@ -2549,7 +2559,10 @@ impl GroupVm {
                                 }
                                 1 => mem = v.as_int_opt(),
                                 2 => dno = v.as_int_opt(),
-                                4 => id_flag = v.as_int_opt().unwrap_or(0),
+                                4 => match &v {
+                                    Value::Str(b) => layer_id = Some(b.clone()),
+                                    _ => id_flag = v.as_int_opt().unwrap_or(0),
+                                },
                                 _ => {}
                             }
                             if self.trace {
@@ -2557,13 +2570,26 @@ impl GroupVm {
                             }
                         }
                     }
-                    if let (Some(fname), Some(dno_v), Some(lval)) = (file.clone(), dno, &target) {
+                    if let (None, Some(slot), Some(dno_v), Some(lval)) = (&file, mem, dno, &target) {
+                        if !lval.indices.is_empty() {
+                            return Err(self.halt_err(
+                                self.pc,
+                                cmd::LOAD,
+                                "LOAD MEM target with indices",
+                            ));
+                        }
+                        self.load_mem(slot, dno_v, &lval.var)?;
+                    } else if let (Some(fname), Some(dno_v), Some(id)) = (&file, dno, &layer_id) {
+                        if let Err(e) = self.load_layer(fname, dno_v, id) {
+                            let _ = self.halt_or_record(self.pc, g.command_type, format!("LOAD: {e}"));
+                        }
+                    } else if let (Some(fname), Some(dno_v), Some(lval)) = (file.clone(), dno, &target) {
                         if let Some(mem_v) = mem {
                             if mem_v != 0 {
                                 return Err(self.halt_err(
                                     self.pc,
                                     cmd::LOAD,
-                                    "LOAD MEM(内存源)路径未实现(语料未出现;不猜)",
+                                    "LOAD with both FILE and MEM",
                                 ));
                             }
                         }
@@ -2604,6 +2630,8 @@ impl GroupVm {
                     let mut dno: Option<i64> = None;
                     let mut file: Option<Vec<u8>> = None;
                     let mut set_ref: Option<Vec<u8>> = None;
+                    let mut layer_id: Option<Vec<u8>> = None;
+                    let mut mem: Option<i64> = None;
                     let mut set_flag = false;
                     let mut evaluated: Vec<(u8, String)> = Vec::new();
                     for w in &windows {
@@ -2652,6 +2680,8 @@ impl GroupVm {
                                 match (slot, &v) {
                                     (2, Value::Int(n)) => dno = Some(*n),
                                     (0, Value::Str(b)) => file = Some(b.clone()),
+                                    (1, Value::Int(n)) => mem = Some(*n),
+                                    (4, Value::Str(b)) => layer_id = Some(b.clone()),
                                     (3, Value::Int(n)) => set_flag = *n != 0,
                                     _ => {}
                                 }
@@ -2661,17 +2691,112 @@ impl GroupVm {
                             }
                         }
                     }
-                    // `SAVE DNO=n SET=@var` registers @var in save data
-                    // block n; a later `SAVE FILE="config.sd"` writes the
-                    // registered blocks. The engine's 1/0 store goes to the
-                    // variable descriptor's save flag (desc+0x30/+0x34), not
-                    // to the variable: writing it into the value wiped
-                    // Erewhon's whole config array (@1146) on its first save.
-                    // Nothing is persisted yet; the event carries the target.
+                    // From the manual (SAVE): `SAVE DNO=n SET=@var` keeps
+                    // @var's current value as block n in memory; a SAVE with
+                    // FILE writes the kept blocks to save\FILE(.sd) and
+                    // forgets them; SAVEEND forgets them too. The pure-value
+                    // SET form (a 1/0 the reversed v555 handler stores in
+                    // the variable descriptor) is ignored: writing it into
+                    // the value wiped Erewhon's config array (@1146).
+                    // Blocks are merged into an existing file.
                     let _ = set_flag;
                     let mut set_target = None;
                     if let Some(bytes) = set_ref {
-                        set_target = Some(extract_var_target(&bytes)?.summary());
+                        let target = extract_var_target(&bytes)?;
+                        set_target = Some(target.summary());
+                        match (&target, dno) {
+                            (VarTarget::Scalar(r), Some(n)) if (1..=1024).contains(&n) => {
+                                match self.save_block(r, n as u32) {
+                                    Some(block) => {
+                                        self.save_pending.retain(|b| b.dno != block.dno);
+                                        self.save_pending.push(block);
+                                    }
+                                    None => {
+                                        let _ = self.halt_or_record(
+                                            self.pc,
+                                            g.command_type,
+                                            format!("SAVE: {} is not declared", r.display()),
+                                        );
+                                    }
+                                }
+                            }
+                            (VarTarget::Indexed(r, _), Some(n)) if (1..=1024).contains(&n) => {
+                                // One element is kept as a scalar block of
+                                // its value (LOAD reads it back into a
+                                // scalar or an element the same way).
+                                let r = r.clone();
+                                let v = self.read_var_target(&target)?;
+                                let block = Self::value_block(r.id, n as u32, v);
+                                self.save_pending.retain(|b| b.dno != block.dno);
+                                self.save_pending.push(block);
+                            }
+                            _ => {
+                                let _ = self.halt_or_record(
+                                    self.pc,
+                                    g.command_type,
+                                    format!(
+                                        "SAVE: unsupported SET form (no DNO or DNO out of 1..=1024): {} DNO={dno:?}",
+                                        target.summary()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    if let (Some(id), Some(n)) = (&layer_id, dno) {
+                        // A layer image is kept as a block of our own type
+                        // (the engine's layer block layout is not reversed),
+                        // so only our LOAD reads it back.
+                        match self.native.save_layer(id) {
+                            Some(data) if (1..=1024).contains(&n) => {
+                                self.save_pending.retain(|b| b.dno != n as u32);
+                                self.save_pending.push(yuris_format::yssd::YssdBlock {
+                                    dno: n as u32,
+                                    btype: LAYER_BLOCK,
+                                    strict: 0,
+                                    var_id: 0,
+                                    compressed: yuris_format::yssd::snp_compress(&data),
+                                });
+                            }
+                            _ => {
+                                let _ = self.halt_or_record(
+                                    self.pc,
+                                    g.command_type,
+                                    format!(
+                                        "SAVE ID: no layer {} or DNO {n} out of range",
+                                        String::from_utf8_lossy(id)
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    // MEM (not in the manual; read from Erewhon's es.Save
+                    // and es.Load): `SAVE MEM=n` copies the kept blocks
+                    // into memory slot n (Erewhon keeps a rollback state
+                    // per backlog line there), `LOAD MEM=n` reads from it.
+                    // `SAVE MEM=99999` before `SAVE FILE` puts every slot
+                    // into the file as block 1024, and loading block 1024
+                    // brings them back: a loaded save then rolls back from
+                    // its own backlog. The engine's layout of that block is
+                    // not reversed; ours is MEM_BLOCK.
+                    match mem {
+                        Some(MEM_ALL) => {
+                            let block = self.mem_slots_block();
+                            self.save_pending.retain(|b| b.dno != block.dno);
+                            self.save_pending.push(block);
+                        }
+                        Some(n) => {
+                            self.mem_slots.insert(n, self.save_pending.clone());
+                        }
+                        None => {}
+                    }
+                    if let Some(name) = &file {
+                        if let Err(e) = self.save_write(name) {
+                            let _ = self.halt_or_record(
+                                self.pc,
+                                g.command_type,
+                                format!("SAVE: {e}"),
+                            );
+                        }
                     }
                     self.events.push(VmEvent::Save {
                         pc: self.pc,
@@ -2680,6 +2805,11 @@ impl GroupVm {
                         set_target,
                         evaluated,
                     });
+                    self.pc += 1;
+                    continue;
+                }
+                cmd::SAVEEND => {
+                    self.save_pending.clear();
                     self.pc += 1;
                     continue;
                 }
@@ -3671,11 +3801,197 @@ impl GroupVm {
         reason
     }
 
+    /// A save block holding a variable's current value: an array with its
+    /// bounds (strict, so LOAD checks them), or a scalar.
+    /// Every memory slot as one block: per slot, the slot number (i64),
+    /// its block count (u32), then each block as dno (u32), type (u8),
+    /// strict (u8), var id (u16), data length (u32) and its compressed data.
+    fn mem_slots_block(&self) -> yuris_format::yssd::YssdBlock {
+        let mut raw = Vec::new();
+        for (slot, blocks) in &self.mem_slots {
+            raw.extend_from_slice(&slot.to_le_bytes());
+            raw.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+            for b in blocks {
+                raw.extend_from_slice(&b.dno.to_le_bytes());
+                raw.push(b.btype);
+                raw.push(b.strict);
+                raw.extend_from_slice(&b.var_id.to_le_bytes());
+                raw.extend_from_slice(&(b.compressed.len() as u32).to_le_bytes());
+                raw.extend_from_slice(&b.compressed);
+            }
+        }
+        yuris_format::yssd::YssdBlock {
+            dno: MEM_DNO,
+            btype: MEM_BLOCK,
+            strict: 0,
+            var_id: 0,
+            compressed: yuris_format::yssd::snp_compress(&raw),
+        }
+    }
+
+    /// Replaces the memory slots with a [`Self::mem_slots_block`] dump.
+    fn restore_mem_slots(&mut self, block: &yuris_format::yssd::YssdBlock) -> Result<()> {
+        let raw = yuris_format::yssd::snp_uncompress(&block.compressed)
+            .map_err(|e| Error::format(format!("memory slot block: {e}")))?;
+        fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            if rest.len() < n {
+                return Err(Error::format("memory slot block is truncated"));
+            }
+            let (head, tail) = rest.split_at(n);
+            *rest = tail;
+            Ok(head)
+        }
+        let mut slots = std::collections::BTreeMap::new();
+        let mut rest: &[u8] = &raw;
+        while !rest.is_empty() {
+            let slot = i64::from_le_bytes(take(&mut rest, 8)?.try_into().unwrap());
+            let count = u32::from_le_bytes(take(&mut rest, 4)?.try_into().unwrap());
+            let mut blocks = Vec::new();
+            for _ in 0..count {
+                let dno = u32::from_le_bytes(take(&mut rest, 4)?.try_into().unwrap());
+                let head = take(&mut rest, 4)?;
+                let (btype, strict) = (head[0], head[1]);
+                let var_id = u16::from_le_bytes([head[2], head[3]]);
+                let len = u32::from_le_bytes(take(&mut rest, 4)?.try_into().unwrap()) as usize;
+                let compressed = take(&mut rest, len)?.to_vec();
+                blocks.push(yuris_format::yssd::YssdBlock { dno, btype, strict, var_id, compressed });
+            }
+            slots.insert(slot, blocks);
+        }
+        self.mem_slots = slots;
+        Ok(())
+    }
+
+    fn save_block(&self, r: &yuris_value::VarRef, dno: u32) -> Option<yuris_format::yssd::YssdBlock> {
+        let (values, dims, strict): (Vec<Value>, Vec<u32>, u8) = match self.store.array(r) {
+            Some(a) => (a.data.clone(), a.bounds.clone(), 1),
+            None => (vec![self.store.get_opt(r)?.clone()], Vec::new(), 0),
+        };
+        let ty = match values.first() {
+            Some(Value::Float(_)) => 2,
+            Some(Value::Str(_)) => 3,
+            _ => match self.store.array_elem_type(r) {
+                Some(yuris_value::ElemType::Float) => 2,
+                Some(yuris_value::ElemType::Str) => 3,
+                _ => 1,
+            },
+        };
+        Some(Self::encode_block(r.id, dno, ty, strict, dims, &values))
+    }
+
+    /// A scalar block holding `v`.
+    fn value_block(var_id: u16, dno: u32, v: Value) -> yuris_format::yssd::YssdBlock {
+        let ty = match v {
+            Value::Float(_) => 2,
+            Value::Str(_) => 3,
+            Value::Int(_) => 1,
+        };
+        Self::encode_block(var_id, dno, ty, 0, Vec::new(), &[v])
+    }
+
+    fn encode_block(
+        var_id: u16,
+        dno: u32,
+        ty: u8,
+        strict: u8,
+        dims: Vec<u32>,
+        values: &[Value],
+    ) -> yuris_format::yssd::YssdBlock {
+        use yuris_format::yssd::{snp_compress, YssdBlock, YssdPayload};
+        let mut data = Vec::new();
+        for v in values {
+            match v {
+                Value::Int(n) => data.extend_from_slice(&n.to_le_bytes()),
+                Value::Float(f) => data.extend_from_slice(&f.to_le_bytes()),
+                Value::Str(b) => {
+                    data.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    data.extend_from_slice(b);
+                }
+            }
+        }
+        let payload = YssdPayload { ty, dims, data };
+        YssdBlock {
+            dno,
+            btype: 0,
+            strict,
+            var_id,
+            compressed: snp_compress(&payload.to_bytes()),
+        }
+    }
+
+    /// Writes the kept SAVE blocks into `save\name` (`.sd` added when the
+    /// name has no extension), over the blocks already in the file.
+    fn save_write(&mut self, name: &[u8]) -> Result<()> {
+        let blocks = std::mem::take(&mut self.save_pending);
+        let Some(fs) = &self.file_probe else {
+            return Err(Error::format("no game file system to save into"));
+        };
+        let mut name = encoding_rs::SHIFT_JIS.decode(name).0.replace('\\', "/");
+        if !name.contains('.') {
+            name.push_str(".sd");
+        }
+        if name.contains("..") || name.starts_with('/') {
+            return Err(Error::format(format!("bad save file name {name}")));
+        }
+        let path = fs.save_dir().join(&name);
+        let mut file = std::fs::read(&path)
+            .ok()
+            .and_then(|b| yuris_format::yssd::YssdFile::from_bytes(&b).ok())
+            .unwrap_or_else(|| yuris_format::yssd::YssdFile::new(self.ctx.script.header().version));
+        for b in blocks {
+            file.set_block(b);
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("sd.tmp");
+        std::fs::write(&tmp, file.to_bytes())?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
     /// LOAD/YSSD 装载(引擎 FUN_00444648 文件分支 + FUN_0044564d 写回)。
     ///
     /// `fname` = 脚本槽 0 求值串(无扩展名 → 补 `.sd`,引擎 FUN_004409dc
     /// 分支);`dno` = 块号(1 基);`target` = 槽 3 延迟引用(块头 var_id
     /// 与之恒一致,语料 26 组实证)。装载路径 = 松散文件(save/ VFS 根)。
+    /// `LOAD ID=`: a layer block written by our `SAVE ID=` into layer `id`.
+    fn load_layer(&mut self, fname: &[u8], dno: i64, id: &[u8]) -> Result<()> {
+        let mut name = String::from_utf8_lossy(fname).into_owned();
+        if !name.contains('.') {
+            name.push_str(".sd");
+        }
+        let probe = self
+            .file_probe
+            .as_ref()
+            .ok_or_else(|| Error::format("LOAD needs a file source (no GameFs set)"))?;
+        let bytes = probe
+            .read(&name)
+            .or_else(|_| probe.read(&format!("save\\{name}")))
+            .map_err(|_| Error::format(format!("no file {name}")))?;
+        let yssd = yuris_format::yssd::YssdFile::from_bytes(&bytes)
+            .map_err(|e| Error::format(format!("{name}: {e}")))?;
+        let block = u32::try_from(dno)
+            .ok()
+            .and_then(|d| yssd.block(d))
+            .ok_or_else(|| Error::format(format!("{name} has no block {dno}")))?;
+        if block.btype != LAYER_BLOCK {
+            return Err(Error::format(format!(
+                "{name} block {dno}: layer block type {} not supported",
+                block.btype
+            )));
+        }
+        let data = yuris_format::yssd::snp_uncompress(&block.compressed)
+            .map_err(|e| Error::format(format!("{name} block {dno}: {e}")))?;
+        if !self.native.load_layer(id, &data) {
+            return Err(Error::format(format!(
+                "the host could not load layer {}",
+                String::from_utf8_lossy(id)
+            )));
+        }
+        Ok(())
+    }
+
     fn load_yssd(&mut self, fname: &[u8], dno: i64, target: &yuris_value::VarRef) -> Result<()> {
         if dno < 1 {
             return Err(self.halt_err(
@@ -3708,12 +4024,38 @@ impl GroupVm {
         let yssd = yuris_format::yssd::YssdFile::from_bytes(&bytes)
             .map_err(|e| Error::format(format!("LOAD {name}: {e}")))?;
         let Some(block) = yssd.block(dno as u32) else {
-            return Err(self.halt_err(
-                self.pc,
-                cmd::LOAD,
-                format!("LOAD {name} 无块 {dno}(偏移表空项;引擎 0x18ede)"),
-            ));
+            // A missing block leaves the variable alone.
+            return Ok(());
         };
+        if block.btype == MEM_BLOCK {
+            return self.restore_mem_slots(block);
+        }
+        let block = block.clone();
+        self.load_block(&name, dno, &block, target)
+    }
+
+    /// `LOAD MEM=n DNO=k LET=x`: block k of memory slot n (see
+    /// `mem_slots`). A missing slot or block leaves the variable alone.
+    fn load_mem(&mut self, slot: i64, dno: i64, target: &yuris_value::VarRef) -> Result<()> {
+        let Some(block) = self
+            .mem_slots
+            .get(&slot)
+            .and_then(|b| b.iter().find(|b| i64::from(b.dno) == dno))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.load_block(&format!("MEM {slot}"), dno, &block, target)
+    }
+
+    /// Puts block `dno` (from `name`) into `target`.
+    fn load_block(
+        &mut self,
+        name: &str,
+        dno: i64,
+        block: &yuris_format::yssd::YssdBlock,
+        target: &yuris_value::VarRef,
+    ) -> Result<()> {
         if block.btype == 1 {
             return Err(self.halt_err(
                 self.pc,
@@ -4043,6 +4385,15 @@ fn mstring(window: &[u8]) -> Option<&[u8]> {
     }
     Some(payload)
 }
+
+/// YSSD block type of our layer images (`SAVE ID=`); the engine uses 0-2.
+const LAYER_BLOCK: u8 = 0x80;
+/// YSSD block type of our memory slot dump (`SAVE MEM=99999`).
+const MEM_BLOCK: u8 = 0x81;
+/// `SAVE MEM=` value that stores every memory slot into the file.
+const MEM_ALL: i64 = 99999;
+/// Block number of the memory slot dump.
+const MEM_DNO: u32 = 1024;
 
 /// 变量引用目标(VARACT/VARINFO/CGINFO/SAVE/LOAD 的 SET/LET 槽;kind 2 延迟求值)。
 #[derive(Debug, Clone, PartialEq)]

@@ -90,6 +90,10 @@ per-frame effect and button tasks, and the scenario is started with
 stacks; variables are shared. In each frame every runnable task runs until
 it waits or ends, in order of Z and then creation (the main script has
 Z 0). See `tasks.rs` for TASK, TASKEND, TASKINFO and `TASK E=0`.
+`TASKINFO SCRIPTPOS` gives a position string of our own (`script:pc`, then
+`;script:pc` for each GOSUB return point); `TASK ID=... SCRIPTPOS=$s` puts
+an existing task there. Erewhon saves the scenario task's position this way
+and restores it on load; GOSUB locals and IF/LOOP state are not kept.
 
 ## Text
 

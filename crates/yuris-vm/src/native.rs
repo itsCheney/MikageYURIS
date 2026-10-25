@@ -118,6 +118,18 @@ pub trait Native: Any {
     /// returned value is stored there; `None` leaves the variable alone.
     fn call(&mut self, call: &NativeCall<'_>) -> Result<Option<Value>>;
 
+    /// `SAVE ID=`: the layer's image in the host's own encoding, or `None`
+    /// when there is no such layer.
+    fn save_layer(&mut self, _id: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// `LOAD ID=`: puts an image from [`Native::save_layer`] into the
+    /// layer, creating it if needed. Returns whether it was understood.
+    fn load_layer(&mut self, _id: &[u8], _data: &[u8]) -> bool {
+        false
+    }
+
     /// For downcasting to the concrete host.
     fn as_any(&self) -> &dyn Any;
 

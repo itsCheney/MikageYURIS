@@ -23,6 +23,14 @@ use yuris_value::{ElemType, Value, VarRef, VarSpace};
 
 use crate::{GroupVm, Result};
 
+/// `$_SYSTEM_PATH`, `$_PROJECT_PATH`, `$_SAVE_PATH`, `$_APPDATA_PATH`,
+/// `$_PERSONAL_PATH`, `@_SAVE_PATH_TYPE`.
+const SYSTEM_PATH: u16 = 103;
+const PROJECT_PATH: u16 = 104;
+const SAVE_PATH: u16 = 105;
+const APPDATA_PATH: u16 = 106;
+const PERSONAL_PATH: u16 = 107;
+const SAVE_PATH_TYPE: u16 = 112;
 pub(crate) const MOUSE_X: u16 = 133;
 pub(crate) const MOUSE_Y: u16 = 138;
 /// `@_INP[1024]`.
@@ -170,6 +178,17 @@ impl GroupVm {
                 self.store.set_elem(&r, &[pad, b], Value::Int(code))?;
             }
         }
+        // The path variables of the same table. The engine puts absolute
+        // folders here; scripts build save file names from `$_SAVE_PATH`
+        // (Erewhon checks `FILEINFO EXIST FILE=$_SAVE_PATH+"config.sd"`
+        // before loading), so it is `save\`, which the game file system
+        // maps to the save folder. `@_SAVE_PATH_TYPE` 0 keeps saves there.
+        let path = |id: u16| VarRef { space: VarSpace::Dollar, id };
+        for id in [SYSTEM_PATH, PROJECT_PATH, APPDATA_PATH, PERSONAL_PATH] {
+            self.store.set(&path(id), Value::Str(Vec::new()));
+        }
+        self.store.set(&path(SAVE_PATH), Value::Str(b"save\\".to_vec()));
+        self.store.set(&at(SAVE_PATH_TYPE), Value::Int(0));
         Ok(())
     }
 
@@ -265,5 +284,29 @@ mod tests {
         assert_eq!(KEY_STATE as usize + KEY_COUNT_ALL, KEY_ANY as usize);
         assert_eq!(KEY_COUNT as usize + KEY_COUNT_ALL, KEY_COUNT_ANY as usize);
         assert_eq!(KEY_CODE as usize + KEY_COUNT_ALL, PAD_CODE as usize);
+    }
+}
+
+/// `@_TIME(2,8)`. Scripts address it as `@0` (and `@_OS_TIME` as `@1`).
+const TIME: u16 = 0;
+
+impl GroupVm {
+    /// Sets `@_TIME`, the local date and time: year, month, day, weekday
+    /// (0 = Sunday), hour, minute, second, ms. From the manual, row 0 is
+    /// now and row 1 the engine start; row 1 is filled on the first call.
+    /// Erewhon shows row 0 as the save date of a slot.
+    pub fn set_date_time(&mut self, now: [i64; 8]) -> Result<()> {
+        let r = at(TIME);
+        let first = !self.store.has_array(&r);
+        if first {
+            self.store.declare_array(&r, ElemType::Int, &[2, 8]);
+        }
+        for (i, v) in now.iter().enumerate() {
+            self.store.set_elem(&r, &[0, i as i64], Value::Int(*v))?;
+            if first {
+                self.store.set_elem(&r, &[1, i as i64], Value::Int(*v))?;
+            }
+        }
+        Ok(())
     }
 }

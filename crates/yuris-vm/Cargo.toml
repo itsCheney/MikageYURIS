@@ -11,5 +11,6 @@ yuris-core = { workspace = true }
 yuris-value = { workspace = true }
 yuris-script = { workspace = true }
 yuris-format = { workspace = true }
+encoding_rs = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -126,10 +126,12 @@ impl Host {
     /// Without FILE an unknown image layer is not created (the engine
     /// returns quietly; Erewhon's button code relies on CGINFO then finding
     /// nothing). FILE on an existing layer swaps the image and keeps the
-    /// attributes. The manual says `FILE=""` makes a 1×1 black image, but
-    /// the reversed handler (kemonomichi2 0x423864) creates nothing for it,
-    /// so it counts as no FILE here. With SX and SY as well it makes a
-    /// black SX×SY canvas: Erewhon draws its text glow into one
+    /// attributes. The manual says `FILE=""` makes a 1×1 black image; here
+    /// it makes a layer with no image (an existing layer keeps its image),
+    /// so the attributes given with it stay: Erewhon's buttons do
+    /// `CG ID=x Z=.. FILE=""` and then fill x with `CGACT COPY2`, and the
+    /// copy must land at that Z. With SX and SY as well it makes a black
+    /// SX×SY canvas: Erewhon draws its text glow into one
     /// (`CG ID=_FONT_TMP FILE="" SX=.. SY=..`, then clears its alpha).
     fn cg(&mut self, c: &NativeCall<'_>) {
         let Some(id) = c.bytes("ID") else { return };
@@ -139,7 +141,7 @@ impl Host {
             (Some([]), Some(w), Some(h)) if w > 0 && h > 0 => Some((w.min(8192) as u32, h.min(8192) as u32)),
             _ => None,
         };
-        let found = if file.is_some() || canvas.is_some() || path.set {
+        let found = if c.bytes("FILE").is_some() || path.set {
             self.tree.find_or_create(id).map(|(l, _)| l)
         } else {
             self.tree.find(id)
@@ -652,6 +654,35 @@ impl Native for Host {
             "WINDOWINFO" => self.windowinfo(c),
             _ => None,
         })
+    }
+
+    /// Our layer block: width and height (u32 LE), then the RGBA pixels.
+    fn save_layer(&mut self, id: &[u8]) -> Option<Vec<u8>> {
+        let l = self.tree.get(self.tree.find(id)?)?;
+        let img = &l.image;
+        let mut out = Vec::with_capacity(8 + img.data.len());
+        out.extend_from_slice(&img.width.to_le_bytes());
+        out.extend_from_slice(&img.height.to_le_bytes());
+        out.extend_from_slice(&img.data);
+        Some(out)
+    }
+
+    fn load_layer(&mut self, id: &[u8], data: &[u8]) -> bool {
+        let (Some(w), Some(h)) = (data.get(0..4), data.get(4..8)) else { return false };
+        let width = u32::from_le_bytes(w.try_into().unwrap());
+        let height = u32::from_le_bytes(h.try_into().unwrap());
+        let pixels = &data[8..];
+        if pixels.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+            return false;
+        }
+        let Some((lid, _)) = self.tree.find_or_create(id) else { return false };
+        let Some(l) = self.tree.get_mut(lid) else { return false };
+        if l.is_set {
+            return false;
+        }
+        l.image = Arc::new(RgbaImage { width, height, data: pixels.to_vec() });
+        l.file.clear();
+        true
     }
 
     fn as_any(&self) -> &dyn Any {

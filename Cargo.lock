@@ -662,6 +662,7 @@ dependencies = [
 name = "yuris-vm"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "thiserror",
  "tracing",
  "yuris-core",

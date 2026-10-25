@@ -98,6 +98,9 @@ enum Cmd {
         /// Records the mixed sound output (44.1 kHz stereo) as a WAVE file.
         #[arg(long)]
         wav: Option<PathBuf>,
+        /// Folder for the game's save files (`<game>/save` by default).
+        #[arg(long)]
+        save_dir: Option<PathBuf>,
     },
     /// List the files of an Enigma Virtual Box exe or external package.
     Evb {
@@ -327,7 +330,7 @@ fn main() -> Result<()> {
                 println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
             }
         }
-        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch, shots, fonts, encoding, auto_click, dumps, wav } => {
+        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch, shots, fonts, encoding, auto_click, dumps, wav, save_dir } => {
             boot::run(boot::BootArgs {
                 dir,
                 launcher,
@@ -348,6 +351,7 @@ fn main() -> Result<()> {
                 auto_click,
                 dumps,
                 wav,
+                save_dir,
             })?;
         }
         Cmd::Ypf { sub } => match sub {

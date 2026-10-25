@@ -188,13 +188,13 @@ variables in numbered blocks (`DNO`). From the v555 sample's save folder:
 
 ```text
 u8  magic[4] = "YSSD"
-u32 version               // 0x1E0
+u32 version               // the engine's: 0x1E0 in the v555 sample, 481 in Erewhon
 u32 block_count
 u32 table_len             // 0x400
 u32 offsets[0x400]        // offsets[i] = file offset of block i+1; 0 = empty
 block
   u32 dno
-  u8  type                // 0 single block
+  u8  type                // 0 variable; 1/2 layer and multi-block forms (not reversed)
   u8  strict              // 1: the dimensions must match the declaration
   u16 var_id
   u32 packed_len
@@ -210,4 +210,24 @@ payload (unpacked)
 
 SNP (`YSSNP.DLL`) is raw Snappy: a varint with the unpacked length, then
 literal and copy elements. `snp_uncompress` decodes it; the v555 sample's
-saves all use it (none are zlib).
+saves all use it (none are zlib). `snp_compress` writes standard Snappy.
+
+What SAVE does (manual, and Erewhon's es.Save / es.Load scripts):
+
+- `SAVE DNO=n SET=@var` keeps the variable as block n in memory; an array
+  element (`SET=@a[1,2]`) is kept as a scalar block of its value.
+- `SAVE FILE=name` writes the kept blocks to `save\name(.sd)`, merged into
+  the blocks already in the file. `SAVEEND` forgets the kept blocks.
+- `SAVE MEM=n` (not in the manual) copies the kept blocks into memory slot
+  n; `LOAD MEM=n DNO=k` reads block k from it. Erewhon keeps a rollback
+  state per backlog line in these slots. `SAVE MEM=99999` before
+  `SAVE FILE` stores every slot in the file as block 1024, and the slot
+  load reads block 1024 first (`LOAD DNO=1024`), which brings them back.
+- `SAVE ID=layer` / `LOAD ID=layer` store a layer's image (the slot
+  thumbnail).
+- A LOAD of a block the file does not have leaves the variable alone.
+
+Our runtime writes the layer image (type 0x80: width, height, RGBA) and
+the memory slot dump (type 0x81) in layouts of its own, since the engine's
+were not reversed; saves made by the original engine with those blocks
+will not load them.

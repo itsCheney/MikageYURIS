@@ -69,5 +69,7 @@ found; the key is recovered from the data instead (see
 - The task scheduler's real order and the text handlers (WORD, RETURNCODE)
   were modelled on Erewhon's scripts, not reversed.
 - The sound mixer's volume and pan curves.
-- SAVEEND, VARINFO STRTYPE, CGACT TRANSITION, masks and movies.
+- VARINFO STRTYPE, PRODUCT, CGACT TRANSITION, masks and movies.
+- The engine's layout of layer blocks and of the `SAVE MEM=99999` block in
+  save files (ours are our own; see the YSSD section of `formats/ysbin.md`).
 - System variable ids above the v481 table in other versions.

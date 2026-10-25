@@ -15,14 +15,16 @@ The test game is **Erewhon** (CLOCKUP, 2018; engine 481) with its Chinese
 translation patch. Run headless, it boots through the logo and the first-run
 config screen to the title, starts a new game and plays the opening and the
 first scenes: text with its glow, backgrounds, event CGs, sprites placed by
-`MATH3D`, BGM and sound effects. Clicks advance the text.
+`MATH3D`, BGM and sound effects. Clicks advance the text. Saving into a
+slot (with its date and thumbnail) and loading it back from the title work;
+the story goes on from the saved line.
 
 Not done yet:
 
 - a GPU renderer (frames are composed on the CPU) and a real audio output
   (the mixer is pulled by the caller);
 - the player-facing C ABI for the iOS app;
-- SAVEEND, VARINFO STRTYPE, CGACT TRANSITION, movies;
+- VARINFO STRTYPE, PRODUCT, IFBREAK, CGACT TRANSITION, movies;
 - other games and engine versions: the format readers handle 481 and 555,
   but only Erewhon has been run this far.
 
@@ -72,6 +74,7 @@ stacks. Useful options:
 | `--auto-click X,Y@MS` | From MS on, clicks every 1.5 s |
 | `--shot FILE.png@MS` | Saves the screen at MS (repeatable) |
 | `--wav FILE` | Records the mixed sound output |
+| `--save-dir DIR` | Save folder (default: the game's `save`) |
 | `--font FILE --encoding gbk` | Font for text drawing, and the scripts' text encoding |
 | `--cgs TEXT`, `--vars`, `--dump` | Layer and variable reports at the end |
 | `--jsonl FILE --trace` | The VM's event stream |

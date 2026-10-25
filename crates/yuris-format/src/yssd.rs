@@ -44,7 +44,7 @@ pub struct YssdBlock {
 /// 已解析的 YSSD 文件。
 #[derive(Debug, Clone)]
 pub struct YssdFile {
-    /// 版本（样本 0x1E0）。
+    /// Version (the engine's: 480 in the v555 sample, 481 in Erewhon).
     pub version: u32,
     /// 块表（按出现顺序；DNO → 块经 `block()` 查找）。
     blocks: Vec<YssdBlock>,
@@ -66,12 +66,8 @@ impl YssdFile {
                 actual: data[0..4].try_into().unwrap(),
             });
         }
+        // The engine's version: 480 in the v555 sample, 481 in Erewhon.
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != 0x1E0 {
-            return Err(Error::format(format!(
-                "YSSD version {version:#x} != 0x1E0 (引擎 0x1a608 同族)"
-            )));
-        }
         let table_end = 0x10 + OFFSET_TABLE_LEN * 4;
         if data.len() < table_end {
             return Err(Error::format("YSSD offset table truncated"));
@@ -130,6 +126,128 @@ impl YssdFile {
     /// 块总数。
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// An empty file.
+    pub fn new(version: u32) -> Self {
+        Self { version, blocks: Vec::new(), index: vec![None; OFFSET_TABLE_LEN] }
+    }
+
+    /// Adds a block, replacing the one with the same DNO. DNOs outside
+    /// 1..=1024 are ignored.
+    pub fn set_block(&mut self, block: YssdBlock) {
+        let Some(slot) = (block.dno as usize).checked_sub(1).filter(|&i| i < OFFSET_TABLE_LEN) else {
+            return;
+        };
+        match self.index[slot] {
+            Some(i) => self.blocks[i as usize] = block,
+            None => {
+                self.index[slot] = Some(self.blocks.len() as u32);
+                self.blocks.push(block);
+            }
+        }
+    }
+
+    /// Writes the file: header, offset table, then the blocks in DNO order.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&YSSD_MAGIC);
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(OFFSET_TABLE_LEN as u32).to_le_bytes());
+        out.resize(0x10 + OFFSET_TABLE_LEN * 4, 0);
+        for (slot, i) in self.index.iter().enumerate() {
+            let Some(i) = i else { continue };
+            let b = &self.blocks[*i as usize];
+            let at = out.len() as u32;
+            out[0x10 + slot * 4..0x14 + slot * 4].copy_from_slice(&at.to_le_bytes());
+            out.extend_from_slice(&b.dno.to_le_bytes());
+            out.push(b.btype);
+            out.push(b.strict);
+            out.extend_from_slice(&b.var_id.to_le_bytes());
+            out.extend_from_slice(&(b.compressed.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(snp_length(&b.compressed) as u32).to_le_bytes());
+            out.extend_from_slice(&b.compressed);
+        }
+        out
+    }
+}
+
+/// The unpacked length an SNP stream starts with (0 if it is malformed).
+fn snp_length(src: &[u8]) -> usize {
+    let mut n = 0usize;
+    for (k, &b) in src.iter().take(5).enumerate() {
+        n |= ((b & 0x7f) as usize) << (7 * k);
+        if b < 0x80 {
+            return n;
+        }
+    }
+    0
+}
+
+/// SNP compression: standard Snappy, any decoder (ours and the engine's)
+/// reads it. Greedy matching through a hash of 4-byte sequences, copies
+/// within 64 KiB (Erewhon's 256x256 config arrays are mostly zeros).
+pub fn snp_compress(data: &[u8]) -> Vec<u8> {
+    const HASH_BITS: u32 = 14;
+    let mut out = Vec::with_capacity(data.len() / 2 + 16);
+    let mut n = data.len();
+    loop {
+        if n < 0x80 {
+            out.push(n as u8);
+            break;
+        }
+        out.push((n as u8 & 0x7f) | 0x80);
+        n >>= 7;
+    }
+    let hash = |p: usize| {
+        let v = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+        (v.wrapping_mul(0x1e35_a7bd) >> (32 - HASH_BITS)) as usize
+    };
+    let mut table = vec![usize::MAX; 1 << HASH_BITS];
+    let mut lit_start = 0;
+    let mut p = 0;
+    while p + 4 <= data.len() {
+        let h = hash(p);
+        let cand = table[h];
+        table[h] = p;
+        if cand != usize::MAX && p - cand <= 0xffff && data[cand..cand + 4] == data[p..p + 4] {
+            let mut len = 4;
+            while p + len < data.len() && data[cand + len] == data[p + len] {
+                len += 1;
+            }
+            snp_literal(&mut out, &data[lit_start..p]);
+            let off = (p - cand) as u16;
+            let mut left = len;
+            while left > 0 {
+                // A copy2 holds up to 64 bytes; keep the last one at 4+.
+                let k = if left > 64 { if left - 64 < 4 { 60 } else { 64 } } else { left };
+                out.push((((k - 1) as u8) << 2) | 2);
+                out.extend_from_slice(&off.to_le_bytes());
+                left -= k;
+            }
+            p += len;
+            lit_start = p;
+        } else {
+            p += 1;
+        }
+    }
+    snp_literal(&mut out, &data[lit_start..]);
+    out
+}
+
+/// Appends literal runs for `lit`.
+fn snp_literal(out: &mut Vec<u8>, lit: &[u8]) {
+    for chunk in lit.chunks(0x10000) {
+        let len = chunk.len() - 1;
+        if len < 60 {
+            out.push((len as u8) << 2);
+        } else {
+            // Tag 61: the length - 1 follows in 2 bytes.
+            out.push(61 << 2);
+            out.extend_from_slice(&(len as u16).to_le_bytes());
+        }
+        out.extend_from_slice(chunk);
     }
 }
 
@@ -284,5 +402,51 @@ impl YssdPayload {
             dims,
             data: raw[data_start..data_start + dlen].to_vec(),
         })
+    }
+
+    /// The unpacked payload bytes (the inverse of [`Self::from_bytes`]).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + self.dims.len() * 4 + self.data.len());
+        out.extend_from_slice(&u32::from(self.ty).to_le_bytes());
+        out.extend_from_slice(&(self.dims.len() as u32).to_le_bytes());
+        for d in &self.dims {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_then_read() {
+        let payload = YssdPayload { ty: 1, dims: vec![3], data: (0..24).collect() };
+        let raw = payload.to_bytes();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let zeros = vec![0u8; 524_288];
+        let mut noise = Vec::new();
+        let mut x = 1u32;
+        for _ in 0..100_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            noise.push((x >> 16) as u8 & 7);
+        }
+        for data in [raw.clone(), big.clone(), Vec::new(), zeros.clone(), noise, vec![1, 2, 3]] {
+            assert_eq!(snp_uncompress(&snp_compress(&data)).unwrap(), data);
+        }
+        assert!(snp_compress(&zeros).len() < 30_000);
+        let mut f = YssdFile::new(481);
+        for dno in [5, 2, 5] {
+            f.set_block(YssdBlock { dno, btype: 0, strict: 1, var_id: 7, compressed: snp_compress(&raw) });
+        }
+        let back = YssdFile::from_bytes(&f.to_bytes()).unwrap();
+        assert_eq!(back.version, 481);
+        assert_eq!(back.block_count(), 2);
+        let b = back.block(5).unwrap();
+        assert_eq!(YssdPayload::from_bytes(&snp_uncompress(&b.compressed).unwrap()).unwrap(), payload);
+        assert!(back.block(1).is_none());
     }
 }
