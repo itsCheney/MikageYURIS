@@ -521,6 +521,11 @@ impl VariableStore {
         self.vars.insert(key, v);
     }
 
+    /// The array storage of a variable, if it has one.
+    pub fn array(&self, r: &VarRef) -> Option<&ArrayStorage> {
+        self.arrays.get(&(r.space.prefix(), r.id))
+    }
+
     /// 声明/重置数组(YSVR 消费或 GOSUB 帧局部)。
     /// 幂等:重复声明同型数组不重置(引擎:声明组只在加载期消费一次)。
     pub fn declare_array(&mut self, r: &VarRef, elem: ElemType, bounds: &[u32]) {
@@ -531,6 +536,21 @@ impl VariableStore {
             }
         }
         self.arrays.insert(key, ArrayStorage::new(elem, bounds));
+    }
+
+    /// Declares the array afresh (a runtime `STR $a[11] = ""`): new
+    /// bounds, every element `init` (or the type's zero if `init` is of
+    /// another type).
+    pub fn redeclare_array(&mut self, r: &VarRef, elem: ElemType, bounds: &[u32], init: Value) {
+        let key = (r.space.prefix(), r.id);
+        let mut a = ArrayStorage::new(elem, bounds);
+        if a.elem_matches(&init) {
+            for v in a.data.iter_mut() {
+                *v = init.clone();
+            }
+        }
+        self.vars.remove(&key);
+        self.arrays.insert(key, a);
     }
 
     /// 读数组元素(标量数组 = 单下标;未声明 → 报错,同引擎 0x1a5ea)。

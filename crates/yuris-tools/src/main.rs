@@ -88,6 +88,13 @@ enum Cmd {
         /// Text encoding of the game's strings: sjis (default), gbk, utf8.
         #[arg(long, default_value = "sjis")]
         encoding: String,
+        /// From MS on, clicks at X,Y every 1.5 s (`--auto-click 576,600@125000`).
+        #[arg(long = "auto-click", value_name = "X,Y@MS")]
+        auto_click: Option<String>,
+        /// Prints a global variable when the run stops, arrays element by
+        /// element (non-empty ones): `--dump '$1259' --dump @1264`.
+        #[arg(long = "dump")]
+        dumps: Vec<String>,
     },
     /// List the files of an Enigma Virtual Box exe or external package.
     Evb {
@@ -299,7 +306,7 @@ fn main() -> Result<()> {
                 println!("{:>10} {:>10}  {}", f.size, f.stored, f.name);
             }
         }
-        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch, shots, fonts, encoding } => {
+        Cmd::Boot { dir, launcher, key_hex, entry, max_groups, jsonl, strict, trace, tail, clicks, cgs, vars, watch, shots, fonts, encoding, auto_click, dumps } => {
             boot::run(boot::BootArgs {
                 dir,
                 launcher,
@@ -317,6 +324,8 @@ fn main() -> Result<()> {
                 shots,
                 fonts,
                 encoding,
+                auto_click,
+                dumps,
             })?;
         }
         Cmd::Ypf { sub } => match sub {

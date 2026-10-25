@@ -148,7 +148,7 @@ fn subsystem_fontinfo_real_sample() {
 }
 
 /// script190 g342 真实窗口:MATH(函数选择 B0=20 + 操作数 @53[1]/@53[2]
-/// + 目标 @6352)。
+/// + 目标 @6352)。Slot 20 = RND.
 #[test]
 fn subsystem_math_real_sample() {
     let w0: &[u8] = &[0x42, 1, 0, 1]; // push 1(函数选择)
@@ -186,11 +186,11 @@ fn subsystem_math_real_sample() {
     assert_eq!(evaluated[0], (20, "int:1".to_string()));
     assert_eq!(evaluated[1], (1, "int:11".to_string()));
     assert_eq!(evaluated[2], (2, "int:22".to_string()));
-    assert!(
-        evaluated[3].0 == 0 && evaluated[3].1.starts_with("err:"),
-        "未声明 @6352 读取 → err 记录(引擎容忍语义),实际 {:?}",
-        evaluated[3]
-    );
+    // Slot 20 is RND: an integer in [11, 22] goes to LET (@6352).
+    assert_eq!(evaluated[3].0, 255);
+    assert!(evaluated[3].1.ends_with("-> @6352"), "{:?}", evaluated[3]);
+    let n = vm.global_int(6352).expect("MATH writes its LET variable");
+    assert!((11..=22).contains(&n), "RND gave {n}");
 }
 
 /// 子系统族全量:0x0e/0x14/0x15/0x1c/0x31/0x5d 各命令事件化

@@ -55,6 +55,11 @@ pub(crate) struct Task {
     pub wait_frames: u64,
     /// Clock time to wait for (ms).
     pub wait_until_ms: u64,
+    /// Stopped at the end of its text until `TASK RESTART=1` (see `text`).
+    pub text_wait: bool,
+    /// Number of the last text line it finished (RETURNCODE), for TASKINFO
+    /// TEXTLINE.
+    pub text_line: i64,
     /// Saved state; None while this task is the running one.
     pub saved: Option<ExecState>,
 }
@@ -74,6 +79,8 @@ pub struct TaskReport {
     pub wait_frames: u64,
     /// Clock time (ms) it waits for.
     pub wait_until_ms: u64,
+    /// Stopped at the end of its text.
+    pub text_wait: bool,
     /// (script, pc) from the entry frame's caller inward; the last one is
     /// where the task is.
     pub stack: Vec<(u16, usize)>,
@@ -184,6 +191,7 @@ impl GroupVm {
                     z: t.z,
                     wait_frames: t.wait_frames,
                     wait_until_ms: t.wait_until_ms,
+                    text_wait: t.text_wait,
                     stack,
                 }
             })
@@ -212,6 +220,8 @@ impl GroupVm {
                 a: 0,
                 wait_frames: 0,
                 wait_until_ms: 0,
+                text_wait: false,
+                text_line: 0,
                 saved: None,
             });
             self.current_task = 0;
@@ -252,7 +262,7 @@ impl GroupVm {
 
     fn runnable(&self, i: usize) -> bool {
         let t = &self.tasks[i];
-        t.enabled && t.wait_frames == 0 && self.clock_ms >= t.wait_until_ms
+        t.enabled && !t.text_wait && t.wait_frames == 0 && self.clock_ms >= t.wait_until_ms
     }
 
     /// Starts a frame: counts down frame waits and fixes this frame's order.
@@ -319,7 +329,7 @@ impl GroupVm {
 
     /// The running task gave up the rest of this frame (waited, paused or
     /// ended): run the next one, or end the frame.
-    fn end_turn(&mut self) -> Option<VmSuspend> {
+    pub(crate) fn end_turn(&mut self) -> Option<VmSuspend> {
         if self.next_task_in_frame() {
             return None;
         }
@@ -390,6 +400,12 @@ impl GroupVm {
     /// existing one. Returns a description for the event, and Some(suspend)
     /// when the running task paused itself and the VM moved on.
     pub(crate) fn exec_task(&mut self, p: TaskParams) -> Result<(String, Option<Option<VmSuspend>>)> {
+        // A bare `TASK RESTART=1` is how the text task lets the task that
+        // wrote the text go on (see `text`).
+        if p.restart && p.id.is_none() && p.label.is_none() && p.script_pos.is_none() {
+            let n = self.text_restart();
+            return Ok((format!("text restart: {n} task(s) go on"), None));
+        }
         let existing = self.task_target(p.id.as_deref());
         let start = match (&p.label, &p.script_pos) {
             (_, Some(pos)) if !pos.is_empty() => Some(
@@ -471,6 +487,8 @@ impl GroupVm {
             a: p.a.unwrap_or(0),
             wait_frames: 0,
             wait_until_ms: 0,
+            text_wait: false,
+            text_line: 0,
             saved: Some(state),
         });
         // A new task runs later this frame if its place in the order has
@@ -518,7 +536,7 @@ impl GroupVm {
 
     /// TASKINFO answers: EXIST, E, A, Z, SCRIPTPOS, FILE/FILENO/LINE (of the
     /// task's position), FILE0/FILENO0/LINE0 (of its entry frame).
-    /// TEXTLINE and NEXTVOICE are 0 until text is implemented.
+    /// TEXTLINE is the last text line the task finished; NEXTVOICE is 0.
     pub(crate) fn task_info(&self, id: Option<&[u8]>, slot: u8) -> Option<Value> {
         let Some(i) = self.task_target(id) else {
             return Some(match slot {
@@ -549,7 +567,8 @@ impl GroupVm {
             9 => Value::Str(file(base_sid.unwrap_or(sid))),
             10 => Value::Int(i64::from(base_sid.unwrap_or(sid))),
             11 => Value::Int(0),
-            12 | 13 => Value::Int(0),
+            12 => Value::Int(t.text_line),
+            13 => Value::Int(0),
             19 => Value::Str(format_script_pos(sid, pc)),
             _ => return None,
         })

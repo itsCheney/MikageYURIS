@@ -31,7 +31,12 @@ pub mod commands;
 pub mod host;
 pub mod native;
 mod tasks;
+pub mod input;
+mod math;
+pub mod text;
+pub use input::{Key, MouseButton};
 pub use tasks::TaskReport;
+pub use text::Codepage;
 
 use yuris_core::{Error, Result};
 use yuris_format::ystb::YstbFile;
@@ -102,6 +107,16 @@ pub mod cmd {
     pub const SYSTEMINFO: u8 = 0x5e;
     /// TASKEND.
     pub const TASKEND: u8 = 0x60;
+    /// LABEL (a no-op at run time).
+    pub const LABEL: u8 = 0x33;
+    /// RETURNCODE: the end of a text line.
+    pub const RETURNCODE: u8 = 0x51;
+    /// WORD: text.
+    pub const WORD: u8 = 0x6c;
+    /// `_`: a value printed as text.
+    pub const PRINT: u8 = 0x70;
+    /// MATH.
+    pub const MATH: u8 = 0x3c;
 }
 
 /// VM 状态机。
@@ -204,6 +219,19 @@ pub enum VmEvent {
         from: usize,
         /// 目标组。
         to: usize,
+    },
+    /// The end of a scenario text (see [`text`]): what WORD and `_` wrote
+    /// and the flags, `Z` included when the task now waits for it to be
+    /// shown.
+    TextOut {
+        /// The group after the text.
+        pc: usize,
+        /// Its script.
+        script_id: u16,
+        /// The characters (the game's encoding).
+        text: Vec<u8>,
+        /// One flag per unit (`1`, `2`, `E`, `Z`).
+        flags: Vec<u8>,
     },
     /// TEXT:显示文本(FILE 参数为 SJIS 字节;LET/CLEAR 布尔位)。
     Text {
@@ -382,6 +410,13 @@ pub fn event_json(e: &VmEvent) -> String {
                 r#"{{"ev":"text","pc":{pc},"file":{f},"let":{let_flag},"clear":{clear_flag}}}"#
             )
         }
+        VmEvent::TextOut { pc, script_id, text, flags } => {
+            let hex: String = text.iter().map(|x| format!("{x:02x}")).collect();
+            format!(
+                r#"{{"ev":"textout","script":{script_id},"pc":{pc},"hex":"{hex}","flags":"{}"}}"#,
+                String::from_utf8_lossy(flags)
+            )
+        }
         VmEvent::ScriptSwitch { from_script, to_script } => {
             format!(r#"{{"ev":"switch","from":{from_script},"to":{to_script}}}"#)
         }
@@ -558,6 +593,14 @@ pub struct GroupVm {
     native: Box<dyn native::Native>,
     /// Watch points (script, pc, times reached), for diagnostics.
     watch: Vec<(u16, usize, u64)>,
+    /// Code page of the game's strings.
+    codepage: text::Codepage,
+    /// Scenario text output (see [`text`]).
+    text: text::TextState,
+    /// Input variables (see [`input`]).
+    input: input::InputState,
+    /// MATH RND state.
+    math_rng: u64,
 }
 
 impl GroupVm {
@@ -608,6 +651,10 @@ impl GroupVm {
             frame_done: false,
             native: Box::new(native::NullNative),
             watch: Vec::new(),
+            codepage: text::Codepage::default(),
+            text: text::TextState::default(),
+            input: input::InputState::default(),
+            math_rng: 0x9E37_79B9_7F4A_7C15,
         })
     }
 
@@ -648,30 +695,19 @@ impl GroupVm {
     }
 
     /// The engine's per-frame update of the mouse button variables, for the
-    /// host to call before each frame with the physical button states.
-    ///
-    /// Read from Erewhon's scripts: `@147` is the left button (es.BT.MOUSECHECK
-    /// takes `@147 == 1` as a click on the hovered button and sets it to 2
-    /// to consume it); `@244` and `@245` sit next to it in every "any
-    /// button" test (ES.SCENARIO.SubLoop), so they are taken as the right
-    /// and middle buttons. After a scene change the scripts write 5 to
-    /// mean "ignore until released". So: up -> 0; down -> 1 on the first
-    /// frame, 2 while held, and 5 stays 5 until the button is released.
-    /// The engine's handler is not reversed.
+    /// host to call before each frame with the physical button states (see
+    /// [`input`]). Without the v48x input table only `@147` (`@_MOUSE_L`)
+    /// is updated, the same way.
     pub fn update_mouse_buttons(&mut self, left: bool, right: bool, middle: bool) -> Result<()> {
-        for (id, down) in [(147u16, left), (244, right), (245, middle)] {
-            let prev = self.global_int(id).unwrap_or(0);
-            let next = match (down, prev) {
-                (false, _) => 0,
-                (true, 5) => 5,
-                (true, 1 | 2) => 2,
-                (true, _) => 1,
-            };
-            if next != prev {
-                self.set_global_int(id, next)?;
-            }
+        self.set_mouse_button(MouseButton::Left, left);
+        self.set_mouse_button(MouseButton::Right, right);
+        self.set_mouse_button(MouseButton::Middle, middle);
+        if self.input.enabled {
+            return self.update_input();
         }
-        Ok(())
+        let prev = self.global_int(147).unwrap_or(0);
+        let next = if left { if prev > 0 { prev + 1 } else { 1 } } else if prev > 0 { -1 } else { (prev - 1).max(-1_000_000) };
+        self.set_global_int(147, next)
     }
 
     /// Counts how often each (script, pc) is reached (see [`Self::watch_counts`]).
@@ -848,6 +884,8 @@ impl GroupVm {
             self.apply_ysvr_entry(e)?;
             applied += 1;
         }
+        self.fill_char_table(ysvr);
+        self.init_input(ysvr)?;
         Ok(applied)
     }
 
@@ -1019,6 +1057,12 @@ impl GroupVm {
             self.executed_groups += 1;
 
             let g = self.ctx.groups[self.pc];
+            if let Some(stopped) = self.text_close_before(g.command_type) {
+                match stopped {
+                    Some(s) => return Ok(s),
+                    None => continue,
+                }
+            }
             if !self.watch.is_empty() {
                 let here = (self.ctx.script_id, self.pc);
                 for w in &mut self.watch {
@@ -1530,7 +1574,11 @@ impl GroupVm {
                         self.store.set(&lval.var, newv.clone());
                         Ok(())
                     } else {
-                        self.store.set_elem(&lval.var, &lval.indices, newv.clone())
+                        let v = match self.store.array_elem_type(&lval.var) {
+                            Some(elem) => coerce_elem(elem, newv.clone()),
+                            None => newv.clone(),
+                        };
+                        self.store.set_elem(&lval.var, &lval.indices, v)
                     };
                     if let Err(e) = store_res {
                         self.state = VmState::Error;
@@ -1814,6 +1862,42 @@ impl GroupVm {
                     self.pc += 1;
                     continue;
                 }
+                cmd::WORD => {
+                    // The raw text is the window's bytes. The YSCM gives
+                    // WORD's one parameter no name, so the command map
+                    // leaves its slot unmapped; take the window as it is.
+                    for w in &windows {
+                        if w.len > 0 {
+                            if let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) {
+                                self.text_append(&bytes);
+                            }
+                        }
+                    }
+                    self.pc += 1;
+                    continue;
+                }
+                cmd::PRINT => {
+                    // `_[expr]`: the value as text.
+                    if let Some(w) = windows.first() {
+                        if let Some(v) = self.eval_window_condition(Some(w))? {
+                            let bytes = match v {
+                                Value::Str(b) => b,
+                                Value::Int(n) => n.to_string().into_bytes(),
+                                Value::Float(f) => f.to_string().into_bytes(),
+                            };
+                            self.text_append(&bytes);
+                        }
+                    }
+                    self.pc += 1;
+                    continue;
+                }
+                cmd::RETURNCODE => {
+                    // The line number is the window's tag (no bytes).
+                    let line = windows.first().map(|w| i64::from(w.tag & 0xffff)).unwrap_or(0);
+                    self.text_line_end(line);
+                    self.pc += 1;
+                    continue;
+                }
                 cmd::TEXT => {
                     // 引擎 CMDH_00452888:FILE 参数为字符串(UTF-8/SJIS)→ 显示层;
                     // LET/CLEAR 为布尔。事件化;不阻塞(点击等待在文本层,非本 VM)。
@@ -1833,6 +1917,9 @@ impl GroupVm {
                                     match slot {
                                         1 => let_flag = n != 0,
                                         2 => clear_flag = n != 0,
+                                        // v481 OUTPUTMODE: 0 = the script
+                                        // draws the text (see `text`).
+                                        4 => self.text.auto = n != 0,
                                         _ => {}
                                     }
                                 }
@@ -1842,6 +1929,9 @@ impl GroupVm {
                                 }
                             }
                         }
+                    }
+                    if clear_flag {
+                        self.text_clear();
                     }
                     self.events.push(VmEvent::Text {
                         pc: self.pc,
@@ -2170,6 +2260,7 @@ impl GroupVm {
                                 result = Some(Value::Str(varact_ascii_case(
                                     &bytes,
                                     *slot == 7,
+                                    self.codepage,
                                 )));
                             }
                             slot @ (2 | 3) => {
@@ -2197,7 +2288,7 @@ impl GroupVm {
                                     result = Some(Value::Str(Vec::new()));
                                 } else {
                                     let start_ch = pos_ch.saturating_sub(1);
-                                    let start = varact_char_to_byte(&obj, start_ch)
+                                    let start = varact_char_to_byte(&obj, start_ch, self.codepage)
                                         .ok_or_else(|| {
                                             let pc = self.pc;
                                             let blen = bytes.len();
@@ -2212,7 +2303,7 @@ impl GroupVm {
                                                 "VARACT 槽 {slot} POS={pos_ch} 越界(引擎 0x1d4ca 同族; s{sid} pc={pc} 目标={target:?} 串字节={blen} ops={ops:?} hex={hex})"
                                             ))
                                         })?;
-                                    let end = varact_char_to_byte(&obj, start_ch + len_ch)
+                                    let end = varact_char_to_byte(&obj, start_ch + len_ch, self.codepage)
                                         .ok_or_else(|| {
                                             let pc = self.pc;
                                             let blen = bytes.len();
@@ -2315,9 +2406,11 @@ impl GroupVm {
                     // 结果接收:引擎 a3 分支收尾写 LET 引用的变量(有 LET 槽才写;
                     // DIMSIZE/PUSH/POP 无 LET 也不写)
                     if let Some(v) = result {
-                        let lt = let_target.clone().ok_or_else(|| {
-                            Error::format("VARACT CUT 有结果但无 LET(1) 引用槽(引擎必填)")
-                        })?;
+                        // Without LET the SET variable is changed in place:
+                        // Erewhon's es.TX.CHARNAME.CHK cuts the speaker name
+                        // off its text copy with `VARACT [CUT=1 SET=$3796
+                        // POS=1 LENGTH=@3975]`.
+                        let lt = let_target.clone().unwrap_or_else(|| target.clone());
                         self.write_var_target(&lt, v)?;
                         if self.trace {
                             evaluated.push((255u8, format!("→ {}", lt.summary())));
@@ -2695,7 +2788,25 @@ impl GroupVm {
                             }
                             break;
                         }
-                        self.store.set(&r, init);
+                        // `STR $a[11] = ""`: the declaration resets the
+                        // array to its bounds; setting element 0 only left
+                        // stale pieces in Erewhon's es._strsplit.str table
+                        // (`$5271`), so "MOUSE_L" split into "MOUSE_L", "V".
+                        let bounds = match (array_form, windows.first()) {
+                            (true, Some(w0)) => self.declared_bounds(w0)?,
+                            _ => None,
+                        };
+                        match bounds {
+                            Some(b) => {
+                                let elem = match other {
+                                    0x19 => yuris_value::ElemType::Float,
+                                    0x5C => yuris_value::ElemType::Str,
+                                    _ => yuris_value::ElemType::Int,
+                                };
+                                self.store.redeclare_array(&r, elem, &b, init);
+                            }
+                            None => self.store.set(&r, init),
+                        }
                         if self.trace {
                             self.events.push(VmEvent::Declaration {
                                 pc: self.pc,
@@ -2719,6 +2830,16 @@ impl GroupVm {
                                 command: other,
                                 windows: g.window_count,
                             });
+                        }
+                        self.pc += 1;
+                        continue;
+                    }
+                    if other == cmd::MATH {
+                        if let Some(reason) = self.exec_math(&windows)? {
+                            if self.strict {
+                                self.state = VmState::Error;
+                                return Ok(VmSuspend::Error(reason));
+                            }
                         }
                         self.pc += 1;
                         continue;
@@ -3875,8 +3996,8 @@ impl GroupVm {
                 return Ok(());
             }
         }
-        if self.store.has_array(r) {
-            return self.store.set_elem(r, indices, v);
+        if let Some(elem) = self.store.array_elem_type(r) {
+            return self.store.set_elem(r, indices, coerce_elem(elem, v));
         }
         if indices.is_empty() {
             self.store.set(r, v);
@@ -4230,6 +4351,23 @@ impl GroupVm {
         Ok(None)
     }
 
+    /// The bounds of a runtime array declaration's variable window
+    /// (`$5271 11 aload` -> [11], `@1319 400 1 add groupsep 8 aload` ->
+    /// [401, 8]); None if a bound is not positive.
+    fn declared_bounds(&mut self, w0: &yuris_format::ystb::CommandSlot) -> Result<Option<Vec<u32>>> {
+        let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w0) else {
+            return Ok(None);
+        };
+        let VarTarget::Indexed(_, idx) = extract_var_target(&bytes)? else {
+            return Ok(None);
+        };
+        let dims = self.eval_target_indices(&idx)?;
+        if dims.is_empty() || dims.iter().any(|&d| d <= 0 || d > u32::MAX as i64) {
+            return Ok(None);
+        }
+        Ok(Some(dims.iter().map(|&d| d as u32).collect()))
+    }
+
     fn write_var_target(&mut self, t: &VarTarget, v: Value) -> Result<()> {
         match t {
             VarTarget::Scalar(r) => self.write_var_value(r, &[], v),
@@ -4300,7 +4438,7 @@ impl GroupVm {
                 let v = self.read_var_target(target)?;
                 match v {
                     Value::Str(bytes) => {
-                        let n = sjis_char_len(&bytes);
+                        let n = sjis_char_len(&bytes, self.codepage);
                         if self.trace {
                             evaluated.push((13u8, format!("LENGTH(fallback)={n}")));
                         }
@@ -4376,7 +4514,7 @@ impl GroupVm {
                 let v = self.read_var_target(target)?;
                 match v {
                     Value::Str(bytes) => {
-                        let n = sjis_char_len(&bytes);
+                        let n = sjis_char_len(&bytes, self.codepage);
                         if self.trace {
                             evaluated.push((13u8, format!("LENGTH={n}")));
                         }
@@ -4449,15 +4587,41 @@ impl GroupVm {
     }
 }
 
+/// A value stored into an array element takes the array's type. Erewhon's
+/// es.LOG.PINIT clears the INT array `@4093` with `@4093[n] = ""`; a
+/// string becomes the number it starts with (0 for ""), floats truncate.
+fn coerce_elem(elem: yuris_value::ElemType, v: Value) -> Value {
+    use yuris_value::ElemType;
+    let leading_number = |b: &[u8]| -> f64 {
+        let s = String::from_utf8_lossy(b);
+        let t = s.trim_start();
+        let end = t
+            .char_indices()
+            .take_while(|&(i, c)| c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+')))
+            .map(|(i, c)| i + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        t[..end].parse().unwrap_or(0.0)
+    };
+    match (elem, v) {
+        (ElemType::Int, Value::Float(f)) => Value::Int(f as i64),
+        (ElemType::Int, Value::Str(b)) => Value::Int(leading_number(&b) as i64),
+        (ElemType::Float, Value::Int(n)) => Value::Float(n as f64),
+        (ElemType::Float, Value::Str(b)) => Value::Float(leading_number(&b)),
+        (ElemType::Str, Value::Int(n)) => Value::Str(n.to_string().into_bytes()),
+        (_, v) => v,
+    }
+}
+
 /// SJIS 字符数(VARINFO LENGTH 汇编终证 0x4551dc-0x455208:strlen 只作循环
 /// 边界,入栈结果 = 宽度表步进循环的 EAX 计数器 —— 每字符恰 +1,双字节
 /// 首区额外跳 1 字节。即 LENGTH = 字符数,非字节数)。
-fn sjis_char_len(bytes: &[u8]) -> usize {
+fn sjis_char_len(bytes: &[u8], cp: text::Codepage) -> usize {
     let mut off = 0usize;
     let mut n = 0usize;
     while off < bytes.len() {
         let b = bytes[off];
-        off += if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
+        off += if cp.is_lead(b) {
             2
         } else {
             1
@@ -4472,12 +4636,12 @@ fn sjis_char_len(bytes: &[u8]) -> usize {
 /// 双字节首区(步进表 DAT_0059b0c0==1)连跳 2 字节不转换;单字节
 /// `to_upper`: 'a'-'z' → -0x20;`!to_upper`: 'A'-'Z' → +0x20;其余原样。
 /// 引擎按 NUL 终止扫描,缓冲区语义由调用方保证 —— 这里按字节长度截住。
-fn varact_ascii_case(bytes: &[u8], to_upper: bool) -> Vec<u8> {
+fn varact_ascii_case(bytes: &[u8], to_upper: bool, cp: text::Codepage) -> Vec<u8> {
     let mut out = bytes.to_vec();
     let mut i = 0usize;
     while i < out.len() {
         let b = out[i];
-        if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
+        if cp.is_lead(b) {
             i += 2; // 双字节整体跳过(引擎 in_EAX += 2)
             continue;
         }
@@ -4494,7 +4658,7 @@ fn varact_ascii_case(bytes: &[u8], to_upper: bool) -> Vec<u8> {
 /// 字符序数 → SJIS 字节偏移(引擎 FUN_00471cf5/00471d7f 语义,字符步进表
 /// `DAT_0059b0c0`:双字节首区 +1 → 步进 2,其余步进 1)。
 /// 越界(序数超过字符数)→ `None`(引擎报错 0x1d52e/0x1d538 同族)。
-fn varact_char_to_byte(s: &Value, ordinal: usize) -> Option<usize> {
+fn varact_char_to_byte(s: &Value, ordinal: usize, cp: text::Codepage) -> Option<usize> {
     let Value::Str(bytes) = s else {
         return None;
     };
@@ -4504,7 +4668,7 @@ fn varact_char_to_byte(s: &Value, ordinal: usize) -> Option<usize> {
             return None;
         }
         let b = bytes[off];
-        off += if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
+        off += if cp.is_lead(b) {
             2
         } else {
             1
@@ -4515,7 +4679,7 @@ fn varact_char_to_byte(s: &Value, ordinal: usize) -> Option<usize> {
 
 /// 字节偏移 → 字符序数(引擎 FUN_00471d7f 逆换算;非字符边界 → 界内序数)。
 #[allow(dead_code)]
-fn varact_byte_to_char(s: &Value, byte_off: usize) -> usize {
+fn varact_byte_to_char(s: &Value, byte_off: usize, cp: text::Codepage) -> usize {
     let Value::Str(bytes) = s else {
         return 0;
     };
@@ -4523,7 +4687,7 @@ fn varact_byte_to_char(s: &Value, byte_off: usize) -> usize {
     let mut n = 0usize;
     while off < bytes.len() && off < byte_off {
         let b = bytes[off];
-        off += if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
+        off += if cp.is_lead(b) {
             2
         } else {
             1

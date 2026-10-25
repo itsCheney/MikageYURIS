@@ -353,10 +353,18 @@ pub const CANONICAL_PARAMS: [&[&str]; 121] = [
         "LINE0", "TEXTLINE", "NEXTVOICE", "GOLABEL", "GOSUBLABEL", "IFNEST", "GOSUBNEST",
         "LOOPNEST", "SCRIPTPOS", "TEXTPOS",
     ],
-    // TEXT
-    &["FILE", "LET", "CLEAR"],
-    // TEXTINFO
-    &[],
+    // TEXT (v555 has FILE/LET/CLEAR; the rest are v481's, as in the manual)
+    &[
+        "FILE", "LET", "CLEAR", "ID", "OUTPUTMODE", "CLICKBUTTON", "CLICKBUTTON2", "CLICKBUTTON3",
+        "CLICKBUTTON4", "SKIPBUTTON", "SKIPBUTTON2", "SKIPBUTTON3", "SKIPBUTTON4", "WAIT",
+        "RETURN", "PAGE", "CLICKRETURN", "CLICKPAGE", "CLICK", "AUTORETURN", "AUTOPAGE",
+        "AUTOCLICK",
+    ],
+    // TEXTINFO (v481)
+    &[
+        "ID", "OUTPUTMODE", "CX", "CY", "CLICK", "AUTORETURN", "AUTOPAGE", "AUTOCLICK", "LET",
+        "SET",
+    ],
     // TRAY
     &["E", "NAME", "ID", "MENUID"],
     // VAR

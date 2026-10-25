@@ -41,6 +41,10 @@ pub struct BootArgs {
     pub fonts: Vec<PathBuf>,
     /// Text encoding of the scripts' strings (`sjis` or `gbk`).
     pub encoding: String,
+    /// `X,Y@MS`: from MS on, click at X,Y when a text has waited a second.
+    pub auto_click: Option<String>,
+    /// Variables to print at the end (`$1259`, `@1264`).
+    pub dumps: Vec<String>,
 }
 
 fn hex(k: &[u8]) -> String {
@@ -132,6 +136,9 @@ pub fn run(args: BootArgs) -> Result<()> {
         "utf8" | "utf-8" => encoding_rs::UTF_8,
         _ => encoding_rs::SHIFT_JIS,
     };
+    if host.encoding == encoding_rs::GBK {
+        vm.set_codepage(yuris_vm::Codepage::Gbk);
+    }
     if let Some(c) = &cfg {
         host.caption = host.encoding.encode(&c.caption).0.into_owned();
     }
@@ -178,6 +185,23 @@ pub fn run(args: BootArgs) -> Result<()> {
         }
     }
     clicks.sort_by_key(|c| c.2);
+    let auto_click: Option<(i64, i64, u64)> = match &args.auto_click {
+        Some(c) => Some(
+            c.split_once('@')
+                .and_then(|(xy, t)| {
+                    let (x, y) = xy.split_once(',')?;
+                    Some((x.trim().parse().ok()?, y.trim().parse().ok()?, t.trim().parse().ok()?))
+                })
+                .with_context(|| format!("--auto-click wants X,Y@MS, got {c:?}"))?,
+        ),
+        None => None,
+    };
+    let text_enc = match args.encoding.to_ascii_lowercase().as_str() {
+        "gbk" | "gb2312" | "cp936" => encoding_rs::GBK,
+        "utf8" | "utf-8" => encoding_rs::UTF_8,
+        _ => encoding_rs::SHIFT_JIS,
+    };
+    let mut waiting_since: Option<u64> = None;
     let mut watch = Vec::new();
     for w in &args.watch {
         match w.split_once(':').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))) {
@@ -226,6 +250,14 @@ pub fn run(args: BootArgs) -> Result<()> {
                 VmEvent::Subsystem { command, .. } => {
                     *subsystem.entry(cmd_name(*command)).or_default() += 1;
                 }
+                VmEvent::TextOut { text, flags, .. } => {
+                    println!(
+                        "text ({:.1} s): {} [{}]",
+                        vm.clock_ms() as f64 / 1000.0,
+                        text_enc.decode(text).0,
+                        String::from_utf8_lossy(flags).chars().filter(|c| !matches!(c, '1' | '2')).collect::<String>()
+                    );
+                }
                 _ => {}
             }
         }
@@ -256,6 +288,18 @@ pub fn run(args: BootArgs) -> Result<()> {
                         vm.set_input_cursor(x, y);
                         button_down = true;
                         next_click += 1;
+                    }
+                }
+                if let Some((x, y, from)) = auto_click {
+                    // The text task waits on its own (TASK E=0 on the
+                    // writer), so the VM cannot tell a click wait from a
+                    // text being shown: click every 1.5 s.
+                    let last = *waiting_since.get_or_insert(from);
+                    if vm.clock_ms() >= from && vm.clock_ms() >= last + 1500 && !button_down {
+                        println!("auto-click at {x},{y} ({:.1} s)", vm.clock_ms() as f64 / 1000.0);
+                        vm.set_input_cursor(x, y);
+                        button_down = true;
+                        waiting_since = Some(vm.clock_ms());
                     }
                 }
                 // A click holds the left button for one frame.
@@ -317,6 +361,34 @@ pub fn run(args: BootArgs) -> Result<()> {
             .collect();
         println!("vars: {}", vals.join(" "));
     }
+    for d in &args.dumps {
+        let (space, id) = match (d.chars().next(), d[1..].parse::<u16>()) {
+            (Some('$'), Ok(id)) => (yuris_value::VarSpace::Dollar, id),
+            (Some('@'), Ok(id)) => (yuris_value::VarSpace::At, id),
+            _ => anyhow::bail!("--dump wants $ID or @ID, got {d:?}"),
+        };
+        let r = yuris_value::VarRef { space, id };
+        let show = |v: &yuris_value::Value| match v {
+            yuris_value::Value::Str(b) => format!("{:?}", text_enc.decode(b).0),
+            other => format!("{other:?}"),
+        };
+        if let Some(a) = vm.store().array(&r) {
+            println!("{d} {:?}:", a.bounds);
+            let last = *a.bounds.last().unwrap_or(&1) as usize;
+            for (i, v) in a.data.iter().enumerate() {
+                let empty = matches!(v, yuris_value::Value::Int(0))
+                    || matches!(v, yuris_value::Value::Str(b) if b.is_empty());
+                if !empty {
+                    println!("  [{}][{}] {}", i / last.max(1), i % last.max(1), show(v));
+                }
+            }
+        } else {
+            match vm.store().get_opt(&r) {
+                Some(v) => println!("{d} = {}", show(v)),
+                None => println!("{d} undefined"),
+            }
+        }
+    }
     if let Some(h) = vm.native_as::<Host>() {
         // Shots asked for after the run stopped are taken at the end.
         for (file, _) in &shots[next_shot..] {
@@ -370,6 +442,9 @@ pub fn run(args: BootArgs) -> Result<()> {
             if t.wait_frames > 0 {
                 state.push(format!("waits {} frames", t.wait_frames));
             }
+            if t.text_wait {
+                state.push("waits on its text".to_string());
+            }
             if t.wait_until_ms > vm.clock_ms() {
                 state.push(format!("waits {} ms", t.wait_until_ms - vm.clock_ms()));
             }
@@ -409,9 +484,9 @@ pub fn run(args: BootArgs) -> Result<()> {
     Ok(())
 }
 
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 13] = [
     "GroupExecuted", "Jump", "Call", "Text", "Native", "VarQuery", "Declaration", "Load", "Save",
-    "ScriptSwitch", "Unsupported", "Subsystem",
+    "ScriptSwitch", "Unsupported", "Subsystem", "TextOut",
 ];
 
 /// Index into [`KINDS`].
@@ -429,6 +504,7 @@ fn kind(e: &VmEvent) -> usize {
         VmEvent::ScriptSwitch { .. } => 9,
         VmEvent::Unsupported { .. } => 10,
         VmEvent::Subsystem { .. } => 11,
+        VmEvent::TextOut { .. } => 12,
     }
 }
 
