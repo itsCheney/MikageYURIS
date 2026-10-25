@@ -14,6 +14,7 @@ yuris-vm = { workspace = true }
 ab_glyph = { workspace = true }
 encoding_rs = { workspace = true }
 tracing = { workspace = true }
+lewton = { workspace = true }
 
 [dev-dependencies]
 yuris-script = { workspace = true }

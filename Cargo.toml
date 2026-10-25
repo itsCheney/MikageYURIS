@@ -42,6 +42,7 @@ lru                = "0.12"
 clap               = { version = "4", features = ["derive"] }
 png                = "0.18"
 ab_glyph           = "0.2"
+lewton             = "0.10"
 
 [profile.release]
 opt-level = 3

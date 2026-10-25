@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use yuris_format::vfs::GameFs;
+use yuris_host::audio::OUTPUT_RATE;
 use yuris_host::Host;
 use yuris_format::yscm::YscmTable;
 use yuris_format::ystb::YstbFile;
@@ -45,6 +46,8 @@ pub struct BootArgs {
     pub auto_click: Option<String>,
     /// Variables to print at the end (`$1259`, `@1264`).
     pub dumps: Vec<String>,
+    /// WAVE file for the mixed sound output.
+    pub wav: Option<PathBuf>,
 }
 
 fn hex(k: &[u8]) -> String {
@@ -223,6 +226,9 @@ pub fn run(args: BootArgs) -> Result<()> {
     let mut button_down = false;
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut frames = 0usize;
+    let mut audio_frames = 0u64;
+    let mut audio_buf: Vec<f32> = Vec::new();
+    let mut wav = args.wav.as_deref().map(WavWriter::create).transpose()?;
     let mut kinds = [0usize; KINDS.len()];
     let mut unsupported: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut subsystem: BTreeMap<String, usize> = BTreeMap::new();
@@ -272,6 +278,18 @@ pub fn run(args: BootArgs) -> Result<()> {
                 frames += 1;
                 let step = time_ms.unwrap_or(0).max(counter.unwrap_or(1) * 1000 / 60).max(1);
                 vm.set_clock_ms(vm.clock_ms() + step);
+                // Sound positions move only as the mixer is pulled: pull
+                // as much as the clock advanced.
+                if let Some(h) = vm.native_as::<Host>() {
+                    let target = vm.clock_ms() as u64 * u64::from(OUTPUT_RATE) / 1000;
+                    let n = target.saturating_sub(audio_frames) as usize;
+                    audio_frames = target;
+                    audio_buf.resize(2 * n, 0.0);
+                    h.audio.lock().unwrap().render(&mut audio_buf);
+                    if let Some(w) = wav.as_mut() {
+                        w.write(&audio_buf)?;
+                    }
+                }
                 while let Some((file, t)) = shots.get(next_shot) {
                     if vm.clock_ms() < *t {
                         break;
@@ -315,6 +333,10 @@ pub fn run(args: BootArgs) -> Result<()> {
     };
     if let Some(o) = out.as_mut() {
         o.flush()?;
+    }
+    if let Some(w) = wav.take() {
+        let secs = w.finish()?;
+        println!("sound output: {secs:.1} s");
     }
 
     println!();
@@ -516,4 +538,49 @@ fn save_png(path: &std::path::Path, img: &yuris_format::vfs::RgbaImage) -> Resul
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()?.write_image_data(&img.data)?;
     Ok(())
+}
+
+/// 16-bit stereo WAVE output; the header is written at the end.
+struct WavWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    frames: u64,
+}
+
+impl WavWriter {
+    fn create(path: &std::path::Path) -> Result<Self> {
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        file.write_all(&[0; 44])?;
+        Ok(Self { file, frames: 0 })
+    }
+
+    fn write(&mut self, samples: &[f32]) -> Result<()> {
+        for s in samples {
+            self.file.write_all(&((s * 32767.0) as i16).to_le_bytes())?;
+        }
+        self.frames += samples.len() as u64 / 2;
+        Ok(())
+    }
+
+    /// Writes the header; returns the length in seconds.
+    fn finish(mut self) -> Result<f64> {
+        use std::io::{Seek, SeekFrom};
+        let data = (self.frames * 4) as u32;
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&(36 + data).to_le_bytes());
+        h.extend_from_slice(b"WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(&2u16.to_le_bytes());
+        h.extend_from_slice(&OUTPUT_RATE.to_le_bytes());
+        h.extend_from_slice(&(OUTPUT_RATE * 4).to_le_bytes());
+        h.extend_from_slice(&4u16.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&data.to_le_bytes());
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&h)?;
+        self.file.flush()?;
+        Ok(self.frames as f64 / f64::from(OUTPUT_RATE))
+    }
 }

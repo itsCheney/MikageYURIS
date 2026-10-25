@@ -2,7 +2,7 @@
 //!
 //! [`Host`] implements [`yuris_vm::native::Native`]: the CG family on a
 //! [`layers::LayerTree`], FONT and CGACT TEXT through [`text::Fonts`],
-//! SOUND state, and the WINDOWINFO answers. [`compose::render_window`]
+//! SOUND layers on an [`audio::Mixer`], and the WINDOWINFO answers. [`compose::render_window`]
 //! turns the tree into the frame the player shows; headless tools use it
 //! for screenshots.
 //!
@@ -10,44 +10,25 @@
 //! WINDOW) and from what Erewhon's scripts expect; where both are silent the
 //! choice is noted at the handler.
 
+pub mod audio;
 pub mod compose;
 pub mod layers;
 pub mod ops;
 pub mod text;
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use yuris_core::Result;
 use yuris_format::vfs::{GameFs, RgbaImage};
 use yuris_value::Value;
 use yuris_vm::native::{Native, NativeCall};
 
+use crate::audio::{Mixer, SoundCall};
 use crate::layers::{LayerPath, LayerTree};
 use crate::ops::Rect;
 use crate::text::Fonts;
-
-/// One SOUND channel, by ID.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Sound {
-    /// FILE.
-    pub file: Vec<u8>,
-    /// Playing (PLAY=1 until PLAY=0, END or SOUNDEND).
-    pub playing: bool,
-    /// Paused (PAUSE=1).
-    pub paused: bool,
-    /// LOOP.
-    pub looping: bool,
-    /// VOLUME (0..=100 in Erewhon's scripts).
-    pub volume: i64,
-    /// PAN.
-    pub pan: i64,
-    /// PITCH.
-    pub pitch: i64,
-    /// FADE (ms) of the last change.
-    pub fade: i64,
-}
 
 /// How many decoded images [`Host`] keeps besides those on layers.
 const IMAGE_CACHE: usize = 96;
@@ -58,8 +39,9 @@ pub struct Host {
     pub tree: LayerTree,
     /// Fonts and FONT slots.
     pub fonts: Fonts,
-    /// SOUND channels by ID.
-    pub sounds: BTreeMap<Vec<u8>, Sound>,
+    /// SOUND layers. Shared so a player's audio callback can pull
+    /// [`audio::Mixer::render`] on its own thread.
+    pub audio: Arc<Mutex<Mixer>>,
     /// Screen size (yscfg), for WINDOWINFO and screenshots.
     pub screen: (u32, u32),
     /// Window caption (yscfg), for WINDOWINFO CAPTION.
@@ -90,7 +72,7 @@ impl Host {
         Self {
             tree: LayerTree::new(),
             fonts: Fonts::default(),
-            sounds: BTreeMap::new(),
+            audio: Arc::new(Mutex::new(Mixer::default())),
             screen,
             caption: Vec::new(),
             encoding: encoding_rs::SHIFT_JIS,
@@ -520,43 +502,87 @@ impl Host {
         })
     }
 
-    fn sound(&mut self, c: &NativeCall<'_>) {
-        let Some(id) = c.bytes("ID").map(<[u8]>::to_vec) else { return };
-        let s = self.sounds.entry(id).or_insert_with(|| Sound { volume: 100, ..Sound::default() });
-        for a in c.args {
-            let n = match &a.value {
-                Value::Int(n) => *n,
-                Value::Float(f) => *f as i64,
-                Value::Str(_) => 0,
-            };
-            match a.param {
-                "FILE" => s.file = str_of(&a.value),
-                "PLAY" | "START" | "RESTART" => {
-                    s.playing = n != 0;
-                    s.paused = false;
-                }
-                "END" if n != 0 => s.playing = false,
-                "PAUSE" => s.paused = n != 0,
-                "LOOP" => s.looping = n != 0,
-                "VOLUME" => s.volume = n,
-                "PAN" => s.pan = n,
-                "PITCH" => s.pitch = n,
-                "FADE" => s.fade = n,
-                _ => {}
-            }
-        }
+    fn mixer(&self) -> std::sync::MutexGuard<'_, Mixer> {
+        self.audio.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// SOUNDINFO PLAY: with no audio output yet, only looping channels
-    /// count as playing, so scripts that wait for a voice to end go on.
+    /// Reads a sound file: as given, then with `.ogg`, then `.wav`.
+    fn load_sound(&mut self, file: &[u8]) -> Option<Vec<u8>> {
+        let path = self.decode(file);
+        let fs = self.fs.clone()?;
+        let data = fs.resolve_with_ext(&path, &["ogg", "wav"]).and_then(|p| fs.read(&p).ok());
+        if data.is_none() {
+            self.note(format!("SOUND: cannot load {path}"));
+        }
+        data
+    }
+
+    fn sound(&mut self, c: &NativeCall<'_>) {
+        let Some(id) = c.bytes("ID").map(<[u8]>::to_vec) else { return };
+        let file = match c.bytes("FILE") {
+            Some(f) => {
+                let f = f.to_vec();
+                let data = self.load_sound(&f);
+                Some((f, data))
+            }
+            None => None,
+        };
+        let call = SoundCall {
+            file,
+            enabled: c.int("E").map(|n| n != 0),
+            play: c.int("PLAY").map(|n| n != 0),
+            pause: c.int("PAUSE").map(|n| n != 0),
+            fade: c.int("FADE"),
+            start: c.int("START"),
+            restart: c.int("RESTART"),
+            end: c.int("END"),
+            loop_count: c.int("LOOP"),
+            volume: c.int("VOLUME"),
+            pan: c.int("PAN"),
+            pitch: c.int("PITCH").or_else(|| c.int("SPEED")),
+        };
+        self.mixer().sound(&id, call);
+    }
+
+    /// SOUNDINFO: the first query parameter given decides the answer; a
+    /// missing layer answers 0 (FILE: "").
     fn soundinfo(&mut self, c: &NativeCall<'_>) -> Option<Value> {
-        let id = c.bytes("ID")?;
-        let s = self.sounds.get(id);
-        let q = c.first_flag(&["PLAY", "TIME", "TOTALTIME", "DATALEFT", "DATARIGHT", "CODEC"])?;
-        Some(Value::Int(match q {
-            "PLAY" => i64::from(s.is_some_and(|s| s.playing && s.looping && !s.paused)),
-            _ => 0,
-        }))
+        let id = c.bytes("ID")?.to_vec();
+        let q = c.first_flag(&[
+            "EXIST", "E", "PLAY", "PAUSE", "VOLUME", "PAN", "PITCH", "FILE", "FILETYPE", "START", "RESTART",
+            "END", "LOOP", "LOOPCOUNT", "TIME", "TOTALTIME", "CHANNEL", "BIT", "SAMPLING", "DATALEFT",
+            "DATARIGHT", "CODEC",
+        ])?;
+        let m = self.mixer();
+        let Some(l) = m.layers.get(&id) else {
+            return Some(if q == "FILE" { Value::Str(Vec::new()) } else { Value::Int(0) });
+        };
+        let (channels, bits, rate) = l.format();
+        Some(match q {
+            "FILE" => Value::Str(l.file.clone()),
+            q => Value::Int(match q {
+                "EXIST" => 1,
+                "E" => i64::from(l.enabled),
+                "PLAY" => i64::from(l.playing),
+                "PAUSE" => i64::from(l.paused),
+                "VOLUME" => l.volume,
+                "PAN" => l.pan,
+                "PITCH" => l.pitch,
+                "FILETYPE" | "CODEC" => l.codec,
+                "START" => l.start_ms,
+                "RESTART" => l.restart_ms,
+                "END" => l.end_ms,
+                "LOOP" => l.loop_count,
+                "LOOPCOUNT" => l.loops_done,
+                "TIME" => l.time_ms(),
+                "TOTALTIME" => l.total_ms(),
+                "CHANNEL" => channels,
+                "BIT" => bits,
+                "SAMPLING" => rate,
+                "DATALEFT" => l.levels()[0],
+                _ => l.levels()[1],
+            }),
+        })
     }
 
     /// WINDOWINFO for the main window (NO=0): client and window size are
@@ -618,12 +644,8 @@ impl Native for Host {
                 None
             }
             "SOUNDEND" => {
-                match c.bytes("ID") {
-                    Some(id) => {
-                        self.sounds.remove(id);
-                    }
-                    None => self.sounds.clear(),
-                }
+                let id = c.bytes("ID").map(<[u8]>::to_vec);
+                self.mixer().remove(id.as_deref());
                 None
             }
             "SOUNDINFO" => self.soundinfo(c),
