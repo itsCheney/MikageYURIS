@@ -51,6 +51,19 @@ the reader works out two things from the archive itself:
   lowercased). If none matches, it votes on the key that puts a `.` before
   the extension.
 
+### SkyChord resource archives
+
+SkyChord's `cgsys.ypf`, `cgsys2.ypf`, and `bgm.ypf` use a variant of the
+name-size table: replace swaps (17,25) and (46,50) with (17,24) and
+(20,46). Its `ysbin.ypf` still uses the original table. Both report version
+500, so the reader tries each table per archive and validates the complete
+index boundary and entry data ranges, with both offset widths.
+
+Validated against the supplied files: 621 PNG images, 25 YCG images,
+295 script/config entries, and 34 music tracks. All images decoded; all
+music tracks decoded and mixed to completion, including `bgm/BGM23.ogg`.
+The game files are not included in this repository.
+
 ## Name lookup
 
 Names are compared after turning `/` into `\` and lowercasing ASCII. The

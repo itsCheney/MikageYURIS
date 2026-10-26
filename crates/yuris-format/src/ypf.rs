@@ -82,6 +82,19 @@ pub const NAME_SIZE_MAP: [u8; 256] = {
     m
 };
 
+// SkyChord's resource archives use different swaps than its script archive.
+// Selected per archive by validating the complete index and data ranges.
+const SKYCHORD_NAME_SIZE_MAP: [u8; 256] = {
+    let mut m = NAME_SIZE_MAP;
+    m[17] = 24;
+    m[24] = 17;
+    m[25] = 25;
+    m[20] = 46;
+    m[46] = 20;
+    m[50] = 50;
+    m
+};
+
 /// Decrypts a name_size byte.
 pub fn decrypt_name_size(v: u8) -> u8 {
     NAME_SIZE_MAP[(v ^ 0xFF) as usize]
@@ -263,13 +276,15 @@ impl YpfIndex {
         let prefer_wide = header.version >= 477;
         let mut last_err = None;
         let mut raw = None;
-        for wide in [prefer_wide, !prefer_wide] {
-            match walk_entries(buf, &header, wide, file_len) {
-                Ok(v) => {
-                    raw = Some((wide, v));
-                    break;
+        'layouts: for table in [&NAME_SIZE_MAP, &SKYCHORD_NAME_SIZE_MAP] {
+            for wide in [prefer_wide, !prefer_wide] {
+                match walk_entries(buf, &header, wide, file_len, table) {
+                    Ok(v) => {
+                        raw = Some((wide, v));
+                        break 'layouts;
+                    }
+                    Err(e) => last_err = Some(e),
                 }
-                Err(e) => last_err = Some(e),
             }
         }
         let (wide_offsets, raw) = match raw {
@@ -338,13 +353,13 @@ impl YpfIndex {
 /// An entry with its name still encrypted.
 type RawEntry = (Vec<u8>, YpfEntry);
 
-fn walk_entries(buf: &[u8], h: &YpfHeader, wide: bool, file_len: u64) -> Result<Vec<RawEntry>> {
+fn walk_entries(buf: &[u8], h: &YpfHeader, wide: bool, file_len: u64, table: &[u8; 256]) -> Result<Vec<RawEntry>> {
     let mut r = Reader::new(buf);
     r.seek(HEADER_LEN);
     let mut out = Vec::with_capacity(h.file_count as usize);
     for i in 0..h.file_count {
         let name_hash = r.u32_le()?;
-        let size = decrypt_name_size(r.u8()?) as usize;
+        let size = table[(r.u8()? ^ 0xFF) as usize] as usize;
         let enc_name = r.bytes(size)?.to_vec();
         let file_type = r.u8()?;
         let compression = r.u8()?;
@@ -682,6 +697,36 @@ mod tests {
             assert_eq!(ypf.read("YSBIN/yst00000.ybn").unwrap(), b"YSTB script body");
             assert_eq!(ypf.read("cg\\bg\\bg01.png").unwrap(), files[1].3);
             assert_eq!(ypf.entries()[2].name, files[2].0);
+        }
+    }
+
+    #[test]
+    fn detects_resource_name_table_per_archive() {
+        // Exercise every changed length; the original table remains needed
+        // for ysbin.ypf from the same game.
+        let names: Vec<Vec<u8>> = [17, 24, 25, 20, 46, 50]
+            .iter().map(|&n| {
+                let mut name = vec![b'a'; n - 4];
+                name.extend_from_slice(b".png");
+                name
+            }).collect();
+        let files: Vec<(&[u8], u8, bool, &[u8])> = names.iter()
+            .map(|n| (n.as_slice(), 2, false, &b"payload"[..])).collect();
+        for wide in [false, true] {
+            let original = build(500, 0xC9, wide, NameHash::Murmur2, &files);
+            let mut variant = original.clone();
+            let mut pos = HEADER_LEN;
+            for name in &names {
+                variant[pos + 4] = SKYCHORD_NAME_SIZE_MAP[name.len()] ^ 0xFF;
+                pos += 5 + name.len() + if wide { 22 } else { 18 };
+            }
+            for bytes in [variant, original] {
+                let arch = YpfArchive::from_bytes(bytes, None).unwrap();
+                assert_eq!(arch.entries().len(), names.len());
+                for name in &names {
+                    assert_eq!(arch.read(std::str::from_utf8(name).unwrap()).unwrap(), b"payload");
+                }
+            }
         }
     }
 
