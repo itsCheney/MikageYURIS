@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 mod boot;
+mod diagnostics;
 mod play;
 
 use anyhow::{bail, Context, Result};
@@ -54,7 +55,7 @@ enum Cmd {
         /// this is what stops the run).
         #[arg(long, default_value_t = 200_000)]
         max_groups: usize,
-        /// Writes the VM event stream as JSONL.
+        /// Writes startup diagnostics and the VM event stream as JSONL.
         #[arg(long)]
         jsonl: Option<PathBuf>,
         /// Stops at the first unimplemented command (by default it is recorded

@@ -57,8 +57,19 @@ fn hex(k: &[u8]) -> String {
 }
 
 pub fn run(args: BootArgs) -> Result<()> {
+    if let Some(path) = &args.jsonl {
+        std::fs::File::create(path).context("create diagnostic JSONL")?;
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        crate::diagnostics::capture(file, || run_inner(args))
+    } else { run_inner(args) }
+}
+
+fn run_inner(args: BootArgs) -> Result<()> {
     let mut fs = GameFs::open_with_launcher(&args.dir, args.launcher.as_deref())
-        .with_context(|| format!("open {}", args.dir.display()))?;
+        .map_err(|e| {
+            tracing::error!(target: "yuris_boot", "boot_failed stage=filesystem error={e}");
+            e
+        }).with_context(|| format!("open {}", args.dir.display()))?;
     if let Some(dir) = &args.save_dir {
         fs.set_save_dir(dir.clone());
     }
@@ -175,7 +186,7 @@ pub fn run(args: BootArgs) -> Result<()> {
     let names = vm.command_map().clone();
     let cmd_name = |c: u8| names.name(c);
     let mut out = match &args.jsonl {
-        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        Some(p) => Some(std::io::BufWriter::new(std::fs::OpenOptions::new().append(true).open(p)?)),
         None => None,
     };
 

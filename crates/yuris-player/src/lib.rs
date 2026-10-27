@@ -146,7 +146,10 @@ impl Player {
     /// Opens and boots a game. Nothing runs before the first [`Self::step`].
     pub fn open(config: &Config) -> Result<Self, Error> {
         let mut fs = GameFs::open_with_launcher(&config.game_dir, config.launcher.as_deref())
-            .map_err(|e| Error::Files(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!(target: "yuris_boot", "boot_failed stage=filesystem error={e}");
+                Error::Files(e.to_string())
+            })?;
         if let Some(dir) = &config.save_dir {
             fs.set_save_dir(dir.clone());
         }

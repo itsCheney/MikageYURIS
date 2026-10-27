@@ -159,3 +159,76 @@ expression reads, and explicit bootstrap overrides. SkyChord initialization
 still selects the known map, enters script 202 at PC 0, applies 1,969 initial
 values, and exposes its YSCF-derived 1920×1080 display metrics. This is a bootstrap
 check, not a full gameplay or rendering validation.
+
+## Stage 3 implementation: structural YSVR layout selection
+
+`YsvrTable::from_bytes` now evaluates both `Legacy` (seven-byte entry prefix,
+no category) and `Category` (eight-byte prefix). It selects only a unique valid
+candidate, independently of the reported version. `from_bytes_with_layout`
+provides an explicit low-level choice with identical validation. This supersedes
+the earlier stage-1 restriction to the current layout.
+
+Both readers validate header and count, scopes 1–3, types 0–3, categories 0–3,
+system-ID category consistency, dimension/initializer byte boundaries, and exact
+file consumption. Zero-sized dimensions and repeated IDs remain legal: they are
+not sufficient evidence to reject a physical layout, and scoped/redefined
+variables can repeat IDs. The reader does not allocate arrays from dimension
+values. Legacy categories follow `yuri` commit 183b85e `readV000`: SYS=0 for
+IDs below 1000, DEF=1 otherwise; the missing byte is not read from the stream.
+
+Diagnostics retain both layout candidates and their rejection reasons. Zero
+valid candidates mean unsupported or malformed data. Two valid candidates mean
+ambiguity, including an empty table; automatic bootstrap fails rather than using
+the header version to break the tie. Shape matching is withheld on ambiguity.
+An explicit runtime system-variable map override does not resolve a binary-layout
+ambiguity: these are separate decisions.
+
+Synthetic fixtures cover both layouts with reported versions 450, 480, 481, 490,
+554 and 555, all initializer types, multidimensional and zero-sized arrays,
+truncation at every byte boundary, trailing data, invalid fields/counts, and an
+ambiguous empty table. Bootstrap coverage includes a patch-selected legacy YSVR
+still reporting 555, and rejection of an ambiguous table. SkyChord's actual
+YSVR uniquely selects Category and retains the stage-2 bootstrap results.
+No real legacy-game sample has been validated yet. Supporting its YSVR does not
+imply support for its other containers, expression format, or system semantics.
+
+## Exported startup diagnostics
+
+Startup now emits identification evidence and a runtime-map decision before
+script-key inference or label parsing can fail. Records include:
+
+- Resolved core file paths/origins and reported versions; script version counts.
+- YSVR layout status (`selected`, `ambiguous`, `unreadable`), valid candidates,
+  and each rejected candidate's validation error.
+- YSVR byte length/fingerprint, every dictionary's match counts, and missing,
+  conflicting and extra IDs in bounded chunks of 32.
+- Detected and selected semantic maps, any explicit override, fingerprint/shape
+  checks, and a reason: `ysvr_missing_or_unreadable`, `ysvr_layout_unresolved`,
+  `system_shape_unrecognized`, `fingerprint_not_registered`, or
+  `verified_fingerprint_and_shape`.
+- `boot_success` with entry script/PC and applied initial values, or
+  `boot_failed` with the stage and original error. Stages cover filesystem,
+  script key, labels, entry lookup/script, YSVR, commands, VM initialization,
+  declarations and variable initializers.
+
+The mobile callback already forwards `yuris_version` and `yuris_boot` through
+its `yuris*` target filter. Hosts must install it before opening the player and
+request INFO (`max_level >= 3`) to retain evidence, not only warnings/errors.
+This repository does not contain the consuming app's JSONL export UI, so the
+host's retention and share-sheet behavior still require device validation.
+
+`yuris boot GAME --jsonl FILE` now creates the file before VFS/boot work and
+captures diagnostics even when startup fails. Diagnostic rows have
+`type="diagnostic"`, `schema_version=1`, `level`, `target`, and a `fields` object;
+existing VM event rows follow their existing schema. Consumers must distinguish
+row types. Export I/O failures are reported. The regression test opens a
+synthetic game that fails key inference and verifies that ambiguous YSVR
+evidence, its actual loose-file source, the unknown-map reason, and the failure
+stage all survive in valid JSONL.
+
+Export validation: 119 tests across format, VM, player and tools passed. The
+SkyChord CLI smoke run produced 1,692 individually valid JSONL rows (45 diagnostic
+rows and 1,647 existing VM event rows), including Category selection,
+`verified_fingerprint_and_shape`, and `boot_success` at script 202 / PC 0 with
+1,969 applied initial values. This verifies export and initialization, not full
+gameplay; the CLI still reports an unimplemented/recorded ERROR command later.

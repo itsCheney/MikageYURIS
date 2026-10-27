@@ -30,10 +30,13 @@ fn yslb(labels: &[(&[u8], u32, u16)]) -> Vec<u8> {
     v
 }
 
-fn ysvr_empty() -> Vec<u8> {
+fn ysvr_fixture() -> Vec<u8> {
     let mut v = b"YSVR".to_vec();
     v.extend_from_slice(&555u32.to_le_bytes());
-    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    // One ordinary user variable; empty tables cannot distinguish layouts.
+    v.extend_from_slice(&[1, 1, 0, 0, 0xe8, 3, 1, 0]);
+    v.extend_from_slice(&0i64.to_le_bytes());
     v
 }
 
@@ -48,7 +51,7 @@ fn boots_synthetic_game_with_inferred_keys() {
     let w_ret: &[u8] = &[0x42, 1, 0, 1];
     let script = make_ystb(KEY, &[(cmd::RETURN, 1, 0)], &[([0, 0, 0, 0], w_ret.len() as u32, 0, w_ret)]);
     let ysl = yslb(&[(b"SYSTEM_START", 0, 0)]);
-    let ysv = ysvr_empty();
+    let ysv = ysvr_fixture();
     let files: [(&[u8], u8, bool, &[u8]); 3] = [
         (b"ysbin\\yst00000.ybn", 0, true, &script),
         (b"ysbin\\ysl.ybn", 0, true, &ysl),
@@ -85,6 +88,31 @@ fn boots_synthetic_game_with_inferred_keys() {
         assert_eq!(vm.global_int(114), Some(32));
         assert_eq!(vm.global_int(115), Some(i64::from(expected.0)));
         assert_eq!(vm.global_int(116), Some(i64::from(expected.1)));
+    }
+
+    // A patch can replace only YSVR with the old layout while still reporting 555.
+    let mut legacy = ysvr_fixture();
+    legacy.remove(11); // category byte in the first (and only) entry
+    std::fs::write(dir.join("ysbin/ysv.ybn"), &legacy).unwrap();
+    let fs = Arc::new(GameFs::open(&dir).unwrap());
+    let booted = Bootstrap { fs, key: None, entry_label: None }.boot().unwrap();
+    let valid: Vec<_> = booted.detection.ysvr_layouts.iter().filter(|c| c.table.is_some()).collect();
+    assert_eq!(valid.len(), 1);
+    assert_eq!(valid[0].layout, yuris_format::ysvr::YsvrLayout::Legacy);
+    assert_eq!(booted.vm.system_var_map(), yuris_core::SystemVarMap::Unknown);
+    assert_eq!(booted.vm.global_int(1000), Some(0));
+
+    // Ambiguity must reach diagnostics and prevent automatic bootstrap selection.
+    legacy.truncate(10);
+    legacy[8..10].copy_from_slice(&0u16.to_le_bytes());
+    std::fs::write(dir.join("ysbin/ysv.ybn"), &legacy).unwrap();
+    let fs = Arc::new(GameFs::open(&dir).unwrap());
+    let report = yuris_format::detection::DetectionReport::inspect(&fs);
+    assert!(report.warnings.iter().any(|w| w.contains("ambiguous YSVR")));
+    assert!(report.candidates.is_empty());
+    match (Bootstrap { fs, key: None, entry_label: None }).boot() {
+        Ok(_) => panic!("ambiguous layout must not boot automatically"),
+        Err(e) => assert!(e.to_string().contains("ambiguous")),
     }
 
     if std::env::var_os("YURIS_KEEP_TEST_DIR").is_none() {

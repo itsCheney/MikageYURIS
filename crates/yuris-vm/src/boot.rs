@@ -68,16 +68,42 @@ impl Bootstrap {
     fn boot_impl(self, override_map: Option<yuris_core::SystemVarMap>) -> Result<Booted> {
         let detection = yuris_format::detection::DetectionReport::inspect(&self.fs);
         detection.log();
+        let known_fingerprint = detection.ysvr_fingerprint == Some((47166, 0xd472c3293659379d));
+        let known_shape = detection.candidates.iter().filter(|c| c.exact_shape()).count() == 1
+            && detection.candidates.iter().any(|c| c.dictionaries == "494" && c.exact_shape());
+        let detected = if known_fingerprint && known_shape { yuris_core::SystemVarMap::SkyChord }
+            else { yuris_core::SystemVarMap::Unknown };
+        let reason = if detection.ysvr_fingerprint.is_none() { "ysvr_missing_or_unreadable" }
+            else if detection.ysvr_layouts.iter().filter(|c| c.table.is_some()).count() != 1 { "ysvr_layout_unresolved" }
+            else if !known_shape { "system_shape_unrecognized" }
+            else if !known_fingerprint { "fingerprint_not_registered" }
+            else { "verified_fingerprint_and_shape" };
+        let map = override_map.unwrap_or(detected);
+        tracing::info!(target: "yuris_version", "runtime_map detected={detected:?} selected={map:?} reason={reason} override={override_map:?} fingerprint_match={known_fingerprint} shape_match={known_shape}");
+        let mut stage = "start";
+        let result = self.boot_detected(detection, map, &mut stage);
+        match &result {
+            Ok(b) => tracing::info!(target: "yuris_boot", "boot_success script={} pc={} applied_ysvr={}", b.script_id, b.entry_pc, b.applied_ysvr),
+            Err(e) => tracing::error!(target: "yuris_boot", "boot_failed stage={stage} error={e}"),
+        }
+        result
+    }
+
+    fn boot_detected(self, detection: yuris_format::detection::DetectionReport,
+        map: yuris_core::SystemVarMap, stage: &mut &'static str) -> Result<Booted> {
+        *stage = "script_key";
         let key = match self.key {
             Some(k) => k,
             None => guess_script_key(&self.fs)?,
         };
         let mut host = FsScriptHost::new(self.fs.clone(), key);
+        *stage = "label_table";
         let yslb_data = host.read_entry("ysbin\\ysl.ybn")?;
         let yslb = YslbTable::from_bytes(&yslb_data)?;
 
         // Entry label
         let entry: &[u8] = self.entry_label.as_deref().unwrap_or(b"SYSTEM_START");
+        *stage = "entry_label";
         let entry_idx = yslb.find(entry).ok_or_else(|| {
             Error::format(format!("entry label not found: {:?}", String::from_utf8_lossy(entry)))
         })?;
@@ -85,32 +111,25 @@ impl Bootstrap {
         let (entry_pc, script_id) = (label.target_pc, label.script_id);
 
         // Read YSVR before the host moves into the VM.
+        *stage = "variable_table";
         let ysvr_data = host.read_entry("ysbin\\ysv.ybn")?;
         let ysvr = yuris_format::ysvr::YsvrTable::from_bytes(&ysvr_data)?;
 
+        *stage = "entry_script";
         let ctx = host.load(script_id)?;
 
         // Scripts index commands in this game's ysc.ybn order; map them to the
         // canonical order by name.
+        *stage = "command_table";
         let cmd_map = Arc::new(match host.read_entry("ysbin\\ysc.ybn") {
             Ok(b) => CommandMap::from_yscm(&YscmTable::from_bytes(&b)?),
             Err(_) => CommandMap::identity(),
         });
 
         // VM with the entry script loaded
+        *stage = "vm_initialization";
         let mut vm = GroupVm::load(ctx.script)?;
-        let fingerprint = ysvr_data.iter().fold(0xcbf29ce484222325u64,
-            |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
-        let known_shape = detection.candidates.iter().filter(|c| c.exact_shape()).count() == 1
-            && detection.candidates.iter().any(|c| c.dictionaries == "494" && c.exact_shape());
-        let map = if ysvr_data.len() == 47166 && fingerprint == 0xd472c3293659379d && known_shape {
-            yuris_core::SystemVarMap::SkyChord
-        } else { yuris_core::SystemVarMap::Unknown };
-        tracing::info!(target: "yuris_version", "YSVR fingerprint={fingerprint:016x} bytes={} selected={map:?}", ysvr_data.len());
-        if let Some(selected) = override_map {
-            tracing::warn!(target: "yuris_version", "explicit system-variable override={selected:?}, detected={map:?}");
-        }
-        vm.set_system_var_map(override_map.unwrap_or(map));
+        vm.set_system_var_map(map);
         // A virtual display matching the game canvas is the portable default.
         // These are device capabilities, not iOS surface/letterbox dimensions.
         let display = self.fs.read("ysbin\\yscfg.ybn").ok()
@@ -128,6 +147,7 @@ impl Bootstrap {
         }
         vm.set_labels(labels);
 
+        *stage = "script_declarations";
         // Consume the declarations (INT/FLT/STR) of every script up front:
         // the engine's variable descriptors are global, and without this the
         // boot chain reads undefined variables (@1417, @6292). Declarations
@@ -155,6 +175,7 @@ impl Bootstrap {
 
         // YSVR initial values, after the declarations. Kinds 1 and 3 apply
         // here; kind 2 applies when its script first loads.
+        *stage = "variable_initializers";
         let applied_ysvr = vm.apply_ysvr(&ysvr)?;
         vm.apply_ysvr_for_script(script_id)?;
 

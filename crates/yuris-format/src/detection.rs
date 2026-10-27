@@ -38,8 +38,12 @@ impl Candidate {
 pub struct DetectionReport {
     /// Per-file evidence after patch resolution.
     pub files: Vec<FileEvidence>,
-    /// Shape comparisons, only when the current YSVR parser consumes the file.
+    /// Shape comparisons, only when exactly one YSVR layout validates.
     pub candidates: Vec<Candidate>,
+    /// Structural YSVR candidates, including parse failures and ambiguity.
+    pub ysvr_layouts: Vec<crate::ysvr::LayoutEvidence>,
+    /// Decompressed YSVR byte count and FNV-1a-64 compatibility fingerprint.
+    pub ysvr_fingerprint: Option<(usize, u64)>,
     /// Conflicts and limitations that prevent semantic conclusions.
     pub warnings: Vec<String>,
 }
@@ -78,10 +82,14 @@ impl DetectionReport {
                     if b.len() >= 8 && &b[..4] == magic { e.version = Some(u32::from_le_bytes(b[4..8].try_into().unwrap())); }
                     else { e.error = Some("missing/invalid header".into()); }
                     if magic == b"YSVR" {
-                        match YsvrTable::from_bytes(&b) {
-                            Ok(t) if t.consumed == b.len() => report.candidates = compare_system_shapes(&t),
-                            Ok(_) => report.warnings.push("YSVR current layout did not consume the entire file; shape matching withheld".into()),
-                            Err(err) => report.warnings.push(format!("YSVR current layout unreadable: {err}; old-layout detection not yet implemented")),
+                        report.ysvr_fingerprint = Some((b.len(), b.iter().fold(0xcbf29ce484222325u64,
+                            |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))));
+                        report.ysvr_layouts = YsvrTable::inspect_layouts(&b);
+                        let valid: Vec<_> = report.ysvr_layouts.iter().filter_map(|c| c.table.as_ref()).collect();
+                        match valid.as_slice() {
+                            [table] => report.candidates = compare_system_shapes(table),
+                            [] => report.warnings.push("no structurally valid YSVR layout; shape matching withheld".into()),
+                            _ => report.warnings.push("ambiguous YSVR layouts; explicit layout required; shape matching withheld".into()),
                         }
                     }
                 }
@@ -107,7 +115,19 @@ impl DetectionReport {
             if !f.path.replace('\\', "/").starts_with("ysbin/yst") || f.error.is_some() { tracing::info!(target: "yuris_version", "file={} source={:?} reported={:?} error={:?}", f.path, f.source, f.version, f.error); }
         }
         tracing::info!(target: "yuris_version", "reported version counts={counts:?}");
+        let valid: Vec<_> = self.ysvr_layouts.iter().filter(|c| c.table.is_some()).map(|c| c.layout).collect();
+        let status = match valid.len() { 0 => "unreadable", 1 => "selected", _ => "ambiguous" };
+        tracing::info!(target: "yuris_version", "YSVR layout_status={status} candidates={valid:?} fingerprint={:?}", self.ysvr_fingerprint);
+        for c in &self.ysvr_layouts { tracing::info!(target: "yuris_version", "YSVR layout={:?} valid={} error={:?}", c.layout, c.table.is_some(), c.error); }
         for c in &self.candidates { tracing::info!(target: "yuris_version", "dictionary={} matched={} missing={} conflicts={} extra={} exact_shape={}", c.dictionaries, c.matched, c.missing.len(), c.conflicting.len(), c.unexpected.len(), c.exact_shape()); }
+        for c in &self.candidates {
+            // Bound each line for mobile exporters; preserve every conflicting ID.
+            for (kind, ids) in [("missing", &c.missing), ("conflicting", &c.conflicting), ("unexpected", &c.unexpected)] {
+                for chunk in ids.chunks(32) {
+                    tracing::info!(target: "yuris_version", "dictionary={} {kind}_ids={chunk:?}", c.dictionaries);
+                }
+            }
+        }
         for w in &self.warnings { tracing::warn!(target: "yuris_version", "{w}"); }
     }
 }
