@@ -71,3 +71,55 @@ Tests: public 480 vs 494 shapes; misleading commercial version header;
 old/new YSVR layouts; ambiguous scalar-only matches; patch-overridden tables;
 unknown profile must not overwrite @147 or reinterpret @115 as display width;
 current SkyChord 555 behavior preserved.
+
+## Stage 1 implementation: read-only detection
+
+`yuris_format::detection::DetectionReport` is collected at the start of VM boot
+and logged through the existing `yuris_version` tracing target. `Booted` retains
+the report. It records resolved YSCF, YSVR, YSCM, YSLB and numbered YSTB headers,
+with their actual VFS origins. Mixed header versions are diagnostic evidence,
+not boot failures. Script headers are summarized by version in logs; individual
+read/header failures are also logged. The report retains every inspected file.
+
+The current YSVR reader must consume the whole file before shape comparisons
+are produced. Seven dictionary families cover the 29 inspected public SDK
+files (450–494). Generated profiles contain only factual type/dimension data;
+provenance is recorded in `system_profiles.rs`. Comparisons retain missing,
+conflicting, duplicate, and unexpected active system IDs. A unique complete
+shape match still does not prove semantic compatibility: YSVR contains no
+variable names. Unknown and ambiguous results remain explicit.
+
+This stage does **not** select a new parser, change runtime variable mappings,
+remove existing fallback writes, inspect EXE metadata, or support the old YSVR
+layout. Those remain subsequent steps. A malformed current-layout table is
+reported rather than retried under an assumed version threshold.
+
+Validation: all seven synthetic profiles uniquely match regardless of their
+reported header version; one INP anchor is insufficient; duplicate IDs conflict;
+patch-selected header and source agree; missing files produce evidence. Format,
+VM and player test suites pass.
+
+### SkyChord real archive validation (2026-10-27)
+
+Rechecked the re-uploaded `ysbin.ypf` (3,017,456 bytes; SHA-256
+`f7cc95f4af75fbf5cea04125f1963d93e5a4036f553b9611c9a1bcc9b59a20e7`).
+All 292 inspected files (288 numbered YSTB scripts and four core tables) report
+555, with no read/header failures. The four core origins resolve to this archive.
+The current YSVR parser consumes the entire table.
+
+| Dictionary family | Matched | Missing | Conflicting | Extra active IDs |
+| --- | ---: | ---: | ---: | ---: |
+| 450–451 | 395 | 0 | 101 | 52 |
+| 452–466 | 432 | 0 | 81 | 35 |
+| 470–471 | 435 | 0 | 81 | 32 |
+| 472,473,477,479 | 452 | 0 | 74 | 22 |
+| 480 | 469 | 0 | 69 | 10 |
+| 484,487,488,493 | 481 | 0 | 60 | 7 |
+| 494 | 548 | 0 | 0 | 0 |
+
+The 494 dictionary is the sole complete **shape** match; this does not establish
+semantic equivalence of every variable or make the engine version 494. The
+bootstrap integration also succeeds: entry script 202, PC 0, 1,969 applied YSVR
+initial values, with the same report retained in `Booted`. Existing runtime
+mapping remains unchanged. This checks archive detection and VM initialization,
+not full gameplay, rendering, audio, or unprovided update archives.

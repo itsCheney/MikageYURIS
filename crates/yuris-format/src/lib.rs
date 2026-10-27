@@ -33,3 +33,6 @@ pub mod yssd;
 
 /// Crate version (the workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod system_profiles;
+pub mod detection;

@@ -34,6 +34,8 @@ pub struct Bootstrap {
 
 /// Boot result: an initialized VM that has not run yet.
 pub struct Booted {
+    /// Read-only version/profile evidence; never selects runtime behavior.
+    pub detection: yuris_format::detection::DetectionReport,
     /// The VM, with host, labels and entry script set.
     pub vm: GroupVm,
     /// Entry script id.
@@ -54,6 +56,8 @@ impl Bootstrap {
     /// - The file system also answers the VM's file queries (FILEINFO,
     ///   CGINFO, LOAD).
     pub fn boot(self) -> Result<Booted> {
+        let detection = yuris_format::detection::DetectionReport::inspect(&self.fs);
+        detection.log();
         let key = match self.key {
             Some(k) => k,
             None => guess_script_key(&self.fs)?,
@@ -139,6 +143,7 @@ impl Bootstrap {
         vm.set_pc(entry_pc as usize);
 
         Ok(Booted {
+            detection,
             vm,
             script_id,
             entry_pc,

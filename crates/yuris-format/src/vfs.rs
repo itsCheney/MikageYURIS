@@ -270,6 +270,15 @@ impl GameFs {
         Some(Hit::Pack(pack, &pack.index().entries[ei]))
     }
 
+    /// Origin selected by the same precedence rules as `read`.
+    pub fn source_of(&self, path: &str) -> Option<String> {
+        match self.locate(&normalize_name(path.as_bytes()))? {
+            Hit::Disk(p) => Some(format!("loose:{}", p.strip_prefix(&self.root).unwrap_or(&p).display())),
+            Hit::Pack(pack, entry) => Some(format!("{}:{}", pack.name(), entry.name_lossy())),
+            Hit::Virtual(pkg, file) => Some(format!("{}:{}", pkg.path().file_name()?.to_string_lossy(), file.name)),
+        }
+    }
+
     /// Every file name visible through the layers above, normalized (see
     /// [`normalize_name`]), without duplicates; save files are not listed.
     pub fn file_names(&self) -> Vec<Vec<u8>> {
