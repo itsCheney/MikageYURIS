@@ -19,3 +19,6 @@ pub use version::{CharEncoding, VersionProfile};
 
 /// Crate version (the workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod system_vars;
+pub use system_vars::SystemVarMap;

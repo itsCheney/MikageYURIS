@@ -14,6 +14,7 @@ fn expression(vm: &mut GroupVm, r: VarRef, indices: &[i64]) -> yuris_core::Resul
     for &i in indices { bytes.extend([0x42, 1, 0, i as u8]); }
     if !indices.is_empty() { bytes.extend([0x29, 1, 0, 0]); }
     let mut ev = Evaluator::with_locals(&mut vm.store, vm.frames.last().map(|f| &f.locals));
+    ev.set_system_var_map(vm.system_vars);
     ev.set_cursor(vm.input_cursor.0, vm.input_cursor.1);
     ev.set_display_metrics(vm.display_metrics);
     ev.set_clock_ms(vm.clock_ms as i64);
@@ -95,4 +96,77 @@ fn display_capabilities_are_independent_of_cursor_and_storage() {
     assert!(DisplayMetrics::new(0, 720, 32).is_none());
     assert!(DisplayMetrics::new(1280, 0, 32).is_none());
     assert!(DisplayMetrics::new(1280, 720, 0).is_none());
+}
+
+#[test]
+fn unknown_mapping_preserves_storage_and_disables_host_writes() {
+    let mut vm = vm();
+    vm.set_system_var_map(yuris_core::SystemVarMap::Unknown);
+    // IDs that mean something else in older tables must remain ordinary values.
+    for id in [48, 53, 60, 114, 115, 116, 133, 138, 147] {
+        vm.set_global_int(id, 777).unwrap();
+    }
+    let r = |space, id| VarRef {space, id};
+    vm.store.set(&r(VarSpace::At, 0), Value::Int(888));
+    vm.store.set(&r(VarSpace::Dollar, 105), Value::Str(b"keep path".to_vec()));
+    vm.store.set(&r(VarSpace::Dollar, 122), Value::Str(b"keep text".to_vec()));
+    // A single INP-shaped entry must not activate an unknown map.
+    let table = yuris_format::ysvr::YsvrTable {
+        version: 555, consumed: 0,
+        entries: vec![yuris_format::ysvr::YsvrEntry {
+            kind: 1, category: 0, script: 0, var_id: 144, ty: 1,
+            bounds: vec![1024], init: yuris_format::ysvr::YsvrInit::Int(0),
+        }],
+    };
+    vm.apply_ysvr(&table).unwrap();
+    vm.set_date_time([2026, 10, 27, 2, 1, 2, 3, 4]).unwrap();
+    vm.set_clock_ms(1234);
+    vm.set_input_cursor(20, 30);
+    vm.update_mouse_buttons(true, true, true).unwrap();
+    vm.set_key(Key::A, true);
+    vm.update_input().unwrap();
+    vm.text_append(b"new text");
+    vm.text_line_end(1);
+    vm.text_clear();
+    vm.text_restart();
+    check(&mut vm, r(VarSpace::Dollar, 122), &[], Value::Str(b"keep text".to_vec()));
+    for id in [48, 53, 60, 114, 115, 116, 133, 138, 147] {
+        check(&mut vm, r(VarSpace::At, id), &[], Value::Int(777));
+    }
+    check(&mut vm, r(VarSpace::At, 0), &[], Value::Int(888));
+    check(&mut vm, r(VarSpace::Dollar, 105), &[], Value::Str(b"keep path".to_vec()));
+    assert_eq!(vm.store.get_elem(&r(VarSpace::At, 144), &[1]).unwrap(), &Value::Int(0));
+    assert!(!vm.input.enabled);
+}
+
+#[test]
+fn ysvr_initial_expression_uses_selected_mapping() {
+    let mut vm = vm();
+    vm.set_system_var_map(yuris_core::SystemVarMap::Unknown);
+    let r = VarRef { space: VarSpace::At, id: 115 };
+    vm.store.declare_array(&r, ElemType::Int, &[2]);
+    vm.store.set_elem(&r, &[1], Value::Int(42)).unwrap();
+    let expression = [0x56, 3, 0, b'@', 115, 0, 0x42, 1, 0, 1, 0x29, 1, 0, 0];
+    assert_eq!(vm.ysvr_string(&expression), Value::Int(42));
+}
+
+#[test]
+fn unknown_mapping_does_not_seed_frame_or_character_slots() {
+    let mut vm = vm();
+    vm.set_system_var_map(yuris_core::SystemVarMap::Unknown);
+    let mut locals = VariableStore::new();
+    vm.seed_frame_locals(&mut locals, &[], 8);
+    assert_eq!(locals.len(), 0);
+    let chr = VarRef { space: VarSpace::Dollar, id: 127 };
+    vm.store.declare_array(&chr, ElemType::Str, &[256]);
+    vm.store.set_elem(&chr, &[65], Value::Str(b"original".to_vec())).unwrap();
+    let table = yuris_format::ysvr::YsvrTable {
+        version: 555, consumed: 0,
+        entries: vec![yuris_format::ysvr::YsvrEntry {
+            kind: 1, category: 0, script: 0, var_id: 127, ty: 3,
+            bounds: vec![256], init: yuris_format::ysvr::YsvrInit::None,
+        }],
+    };
+    vm.fill_char_table(&table);
+    assert_eq!(vm.store.get_elem(&chr, &[65]).unwrap(), &Value::Str(b"original".to_vec()));
 }

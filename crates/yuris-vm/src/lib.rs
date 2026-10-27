@@ -579,6 +579,7 @@ pub struct GroupVm {
     /// 播放器注入的光标逻辑坐标(@133/@138;P9.2)。
     input_cursor: (i64, i64),
     display_metrics: yuris_script::eval::DisplayMetrics,
+    system_vars: yuris_core::SystemVarMap,
     /// YSVR kind2(按脚本初值)条目暂存,首载时应用(成果 59h)。
     ysvr_kind2: Vec<yuris_format::ysvr::YsvrEntry>,
     /// Global YSVR entries (kind 1), kept for VARACT INIT.
@@ -656,6 +657,7 @@ impl GroupVm {
             declared_scripts: std::collections::HashSet::new(),
             input_cursor: (0, 0),
             display_metrics: Default::default(),
+            system_vars: yuris_core::SystemVarMap::SkyChord,
             ysvr_kind2: Vec::new(),
             ysvr_globals: Vec::new(),
             ysvr_kind2_applied: std::collections::HashSet::new(),
@@ -696,6 +698,22 @@ impl GroupVm {
         self.host = Some(host);
     }
 
+    /// Selects semantic IDs before applying YSVR or running the VM.
+    /// Standalone `load` retains legacy SkyChord semantics; bootstrap selects
+    /// from evidence and uses Unknown for unrecognized games.
+    pub fn set_system_var_map(&mut self, map: yuris_core::SystemVarMap) {
+        self.system_vars = map;
+        self.input.enabled = false;
+        self.date_time_initialized = false;
+        tracing::info!(target: "yuris_version", "runtime system-variable map={map:?}");
+        if map == yuris_core::SystemVarMap::Unknown {
+            tracing::warn!(target: "yuris_version", "unknown mapping: computed system reads and host system-variable writes disabled");
+        }
+    }
+
+    /// The selected runtime semantic map.
+    pub fn system_var_map(&self) -> yuris_core::SystemVarMap { self.system_vars }
+
     /// Sets display-device capabilities without changing game coordinates.
     pub fn set_display_metrics(&mut self, display: yuris_script::eval::DisplayMetrics) {
         self.display_metrics = display;
@@ -720,18 +738,12 @@ impl GroupVm {
 
     /// The engine's per-frame update of the mouse button variables, for the
     /// host to call before each frame with the physical button states (see
-    /// [`input`]). Without the v48x input table only `@147` (`@_MOUSE_L`)
-    /// is updated, the same way.
+    /// [`input`]). Unknown mappings never write guessed variable IDs.
     pub fn update_mouse_buttons(&mut self, left: bool, right: bool, middle: bool) -> Result<()> {
         self.set_mouse_button(MouseButton::Left, left);
         self.set_mouse_button(MouseButton::Right, right);
         self.set_mouse_button(MouseButton::Middle, middle);
-        if self.input.enabled {
-            return self.update_input();
-        }
-        let prev = self.global_int(147).unwrap_or(0);
-        let next = if left { if prev > 0 { prev + 1 } else { 1 } } else if prev > 0 { -1 } else { (prev - 1).max(-1_000_000) };
-        self.set_global_int(147, next)
+        self.update_input()
     }
 
     /// Counts how often each (script, pc) is reached (see [`Self::watch_counts`]).
@@ -946,6 +958,11 @@ impl GroupVm {
                     .any(|i| matches!(i.kind, yuris_script::Insn::Unknown { .. }));
                 if !unknown {
                     let mut ev = Evaluator::new(&mut self.store);
+                    ev.set_system_var_map(self.system_vars);
+                    ev.set_display_metrics(self.display_metrics);
+                    ev.set_clock_ms(self.clock_ms as i64);
+                    ev.set_cursor(self.input_cursor.0, self.input_cursor.1);
+                    ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
                     if let Ok(mut stack) = ev.eval_instructions(&instrs) {
                         if stack.len() == 1 {
                             return match stack.pop().unwrap() {
@@ -1337,6 +1354,10 @@ impl GroupVm {
                         }
                         // 返回值写入调用者帧(弹出后 frames.last() = 调用者)
                         for (b0, v) in ret_vals {
+                            let Some(ids) = self.system_vars.ids() else {
+                                tracing::warn!(target: "yuris_version", "return mapping unavailable script={} pc={}", self.ctx.script_id, self.pc);
+                                continue;
+                            };
                             let (r, idx, et): (
                                 yuris_value::VarRef,
                                 u32,
@@ -1350,7 +1371,7 @@ impl GroupVm {
                                 0x00..=0x0f => (
                                     yuris_value::VarRef {
                                         space: yuris_value::VarSpace::At,
-                                        id: 60,
+                                        id: ids.ret_int,
                                     },
                                     b0 + 1,
                                     yuris_value::ElemType::Int,
@@ -1358,7 +1379,7 @@ impl GroupVm {
                                 0x10..=0x1f => (
                                     yuris_value::VarRef {
                                         space: yuris_value::VarSpace::At,
-                                        id: 61,
+                                        id: ids.ret_float,
                                     },
                                     b0 - 0x10 + 1,
                                     yuris_value::ElemType::Float,
@@ -1366,7 +1387,7 @@ impl GroupVm {
                                 0x20..=0x2f => (
                                     yuris_value::VarRef {
                                         space: yuris_value::VarSpace::Dollar,
-                                        id: 62,
+                                        id: ids.ret_str,
                                     },
                                     b0 - 0x20 + 1,
                                     yuris_value::ElemType::Str,
@@ -3551,6 +3572,7 @@ impl GroupVm {
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
+        ev.set_system_var_map(self.system_vars);
         ev.set_display_metrics(self.display_metrics);
         // @48 系统变量注入(P5 定性,引擎 sysvar case 0x30):内层 LOOP
         // 迭代计数 —— 引擎读 obj+0x244 嵌套栈顶记录 +0x10,LOOP 置 1、
@@ -3618,6 +3640,7 @@ impl GroupVm {
         ints: &[(u32, i64)],
         strs: &[(u32, &[u8])],
     ) -> Result<()> {
+        let ids = self.system_vars.ids().ok_or_else(|| Error::format("guest arguments require a system-variable map"))?;
         let key = label.as_bytes().to_vec();
         let Some(&(target, target_script)) = self.labels.get(&key) else {
             return Err(Error::format(format!("标签不存在: {label}")));
@@ -3628,7 +3651,7 @@ impl GroupVm {
         if max_i > 0 {
             let r = yuris_value::VarRef {
                 space: yuris_value::VarSpace::At,
-                id: 53,
+                id: ids.arg_int,
             };
             locals.declare_array(&r, yuris_value::ElemType::Int, &[max_i + 1]);
             for (slot, v) in ints {
@@ -3638,7 +3661,7 @@ impl GroupVm {
         if max_s > 0 {
             let r = yuris_value::VarRef {
                 space: yuris_value::VarSpace::Dollar,
-                id: 55,
+                id: ids.arg_str,
             };
             locals.declare_array(&r, yuris_value::ElemType::Str, &[max_s + 1]);
             for (slot, v) in strs {
@@ -3706,23 +3729,27 @@ impl GroupVm {
             };
             args[ty].insert(slot, w);
         }
+        let Some(ids) = self.system_vars.ids() else {
+            tracing::warn!(target: "yuris_version", "argument mapping unavailable script={} pc={}", self.ctx.script_id, self.pc);
+            return;
+        };
         let specs = [
             (
                 0usize,
                 int_count,
-                yuris_value::VarRef { space: yuris_value::VarSpace::At, id: 53 },
+                yuris_value::VarRef { space: yuris_value::VarSpace::At, id: ids.arg_int },
                 yuris_value::ElemType::Int,
             ),
             (
                 1usize,
                 flt_count,
-                yuris_value::VarRef { space: yuris_value::VarSpace::At, id: 54 },
+                yuris_value::VarRef { space: yuris_value::VarSpace::At, id: ids.arg_float },
                 yuris_value::ElemType::Float,
             ),
             (
                 2usize,
                 str_count,
-                yuris_value::VarRef { space: yuris_value::VarSpace::Dollar, id: 55 },
+                yuris_value::VarRef { space: yuris_value::VarSpace::Dollar, id: ids.arg_str },
                 yuris_value::ElemType::Str,
             ),
         ];
@@ -3840,6 +3867,7 @@ impl GroupVm {
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
+        ev.set_system_var_map(self.system_vars);
         ev.set_display_metrics(self.display_metrics);
         // @48 注入(同 eval_window_condition;左值下标表达式可读系统变量)
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
@@ -4280,6 +4308,7 @@ impl GroupVm {
     /// (引擎 0042158e:id<1000 走帧/系统存储,id≥1000 走 desc+0x30)。
     fn read_var_value(&self, r: &yuris_value::VarRef, indices: &[i64]) -> Option<Value> {
         let context = yuris_script::eval::VariableReadContext {
+            system_vars: self.system_vars,
             display: self.display_metrics,
             loop_counter: self.loops.last().map(|l| l.counter as i64).unwrap_or(0),
             cursor: self.input_cursor,
@@ -4497,6 +4526,7 @@ impl GroupVm {
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
+        ev.set_system_var_map(self.system_vars);
         ev.set_display_metrics(self.display_metrics);
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
         ev.set_clock_ms(self.clock_ms as i64);

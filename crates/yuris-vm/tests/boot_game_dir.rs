@@ -63,7 +63,13 @@ fn boots_synthetic_game_with_inferred_keys() {
     assert_eq!(booted.script_id, 0);
     let mut vm = booted.vm;
     assert_eq!(vm.run(100).unwrap(), VmSuspend::Complete);
-    assert_eq!(vm.global_int(115), Some(1280)); // absent config fallback
+    assert_eq!(vm.system_var_map(), yuris_core::SystemVarMap::Unknown);
+    assert_eq!(vm.global_int(115), None); // header 555 alone never selects semantics
+    assert_eq!(vm.global_int(116), None);
+    let fs = Arc::new(GameFs::open(&dir).unwrap());
+    let vm = Bootstrap { fs, key: None, entry_label: None }
+        .boot_with_system_var_map(yuris_core::SystemVarMap::SkyChord).unwrap().vm;
+    assert_eq!(vm.global_int(115), Some(1280)); // explicit mapping, absent config fallback
     assert_eq!(vm.global_int(116), Some(720));
     std::fs::create_dir_all(dir.join("ysbin")).unwrap();
     for (w, h) in [(800u32, 600u32), (1280, 720), (1920, 1080), (0, 0)] {
@@ -74,7 +80,7 @@ fn boots_synthetic_game_with_inferred_keys() {
         cfg[0x14..0x18].copy_from_slice(&h.to_le_bytes());
         std::fs::write(dir.join("ysbin/yscfg.ybn"), cfg).unwrap();
         let fs = Arc::new(GameFs::open(&dir).unwrap());
-        let vm = Bootstrap { fs, key: None, entry_label: None }.boot().unwrap().vm;
+        let vm = Bootstrap { fs, key: None, entry_label: None }.boot_with_system_var_map(yuris_core::SystemVarMap::SkyChord).unwrap().vm;
         let expected = if w == 0 { (1280, 720) } else { (w, h) };
         assert_eq!(vm.global_int(114), Some(32));
         assert_eq!(vm.global_int(115), Some(i64::from(expected.0)));

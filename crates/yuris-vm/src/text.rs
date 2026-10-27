@@ -33,13 +33,16 @@ use yuris_value::{Value, VarRef, VarSpace};
 use crate::{cmd, GroupVm, VmEvent, VmSuspend};
 
 /// `$_TEXT` in v481.
+#[cfg(test)]
 pub(crate) const TEXT_VAR: u16 = 122;
 /// `$_TEXT_FLAG` in v481.
+#[cfg(test)]
 pub(crate) const TEXT_FLAG_VAR: u16 = 123;
 /// A STR[256] the engine fills with the 256 one-byte strings: scripts use
 /// `$127[13]+$127[10]` for CR LF, `$127[34]` for `"`, and the scenario
 /// markers `$127[239]+$127[240]` (new line) and `$127[239]+$127[243]`
 /// (click) that the text task turns into `R` and `C`.
+#[cfg(test)]
 pub(crate) const CHAR_TABLE_VAR: u16 = 127;
 
 /// How the game's strings are encoded: decides which bytes start a
@@ -127,14 +130,15 @@ impl GroupVm {
 
     /// Fills the one-byte character table if the YSVR declares it.
     pub(crate) fn fill_char_table(&mut self, ysvr: &yuris_format::ysvr::YsvrTable) {
+        let Some(ids) = self.system_vars.ids() else { return; };
         let declared = ysvr
             .entries()
             .iter()
-            .any(|e| e.var_id == CHAR_TABLE_VAR && e.ty == 3 && e.bounds == [256]);
+            .any(|e| e.var_id == ids.characters && e.ty == 3 && e.bounds == [256]);
         if !declared {
             return;
         }
-        let r = str_var(CHAR_TABLE_VAR);
+        let r = str_var(ids.characters);
         for i in 1..256i64 {
             let _ = self.store.set_elem(&r, &[i], Value::Str(vec![i as u8]));
         }
@@ -151,7 +155,8 @@ impl GroupVm {
         self.tasks.get(self.current_task).map(|t| t.seq).unwrap_or(0)
     }
 
-    fn append_str_var(&mut self, id: u16, bytes: &[u8]) {
+    fn append_str_var(&mut self, id: Option<u16>, bytes: &[u8]) {
+        let Some(id) = id else { return; };
         let r = str_var(id);
         let mut v = match self.store.get_opt(&r) {
             Some(Value::Str(s)) => s.clone(),
@@ -171,8 +176,8 @@ impl GroupVm {
             flags.push(if n == 2 { b'2' } else { b'1' });
             off += n;
         }
-        self.append_str_var(TEXT_VAR, bytes);
-        self.append_str_var(TEXT_FLAG_VAR, &flags);
+        self.append_str_var(self.system_vars.ids().map(|ids| ids.text), bytes);
+        self.append_str_var(self.system_vars.ids().map(|ids| ids.text_flags), &flags);
         self.text.text.extend_from_slice(bytes);
         self.text.flags.extend_from_slice(&flags);
         self.text.owner = Some(self.running_seq());
@@ -182,7 +187,7 @@ impl GroupVm {
     /// RETURNCODE: the end of a line. `line` is its number, which TASKINFO
     /// TEXTLINE reports.
     pub(crate) fn text_line_end(&mut self, line: i64) {
-        self.append_str_var(TEXT_FLAG_VAR, b"E");
+        self.append_str_var(self.system_vars.ids().map(|ids| ids.text_flags), b"E");
         self.text.flags.push(b'E');
         self.text.owner = Some(self.running_seq());
         self.text.line_ended = true;
@@ -216,7 +221,7 @@ impl GroupVm {
         // Without tasks nothing could let the script go on.
         let stop = !self.text.auto && self.has_tasks();
         if stop {
-            self.append_str_var(TEXT_FLAG_VAR, b"Z");
+            self.append_str_var(self.system_vars.ids().map(|ids| ids.text_flags), b"Z");
             flags.push(b'Z');
         }
         self.events.push(VmEvent::TextOut {
@@ -242,15 +247,15 @@ impl GroupVm {
                 n += 1;
             }
         }
-        self.store.set(&str_var(TEXT_VAR), Value::Str(Vec::new()));
-        self.store.set(&str_var(TEXT_FLAG_VAR), Value::Str(Vec::new()));
+        if let Some(ids) = self.system_vars.ids() { self.store.set(&str_var(ids.text), Value::Str(Vec::new())); }
+        if let Some(ids) = self.system_vars.ids() { self.store.set(&str_var(ids.text_flags), Value::Str(Vec::new())); }
         n
     }
 
     /// `TEXT CLEAR=1`: empties the text strings.
     pub(crate) fn text_clear(&mut self) {
-        self.store.set(&str_var(TEXT_VAR), Value::Str(Vec::new()));
-        self.store.set(&str_var(TEXT_FLAG_VAR), Value::Str(Vec::new()));
+        if let Some(ids) = self.system_vars.ids() { self.store.set(&str_var(ids.text), Value::Str(Vec::new())); }
+        if let Some(ids) = self.system_vars.ids() { self.store.set(&str_var(ids.text_flags), Value::Str(Vec::new())); }
         self.text.text.clear();
         self.text.flags.clear();
         self.text.line_ended = false;

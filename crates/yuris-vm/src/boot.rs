@@ -56,6 +56,16 @@ impl Bootstrap {
     /// - The file system also answers the VM's file queries (FILEINFO,
     ///   CGINFO, LOAD).
     pub fn boot(self) -> Result<Booted> {
+        self.boot_impl(None)
+    }
+
+    /// Explicit compatibility override for an independently verified game.
+    /// Logged separately from detection; does not change reported evidence.
+    pub fn boot_with_system_var_map(self, map: yuris_core::SystemVarMap) -> Result<Booted> {
+        self.boot_impl(Some(map))
+    }
+
+    fn boot_impl(self, override_map: Option<yuris_core::SystemVarMap>) -> Result<Booted> {
         let detection = yuris_format::detection::DetectionReport::inspect(&self.fs);
         detection.log();
         let key = match self.key {
@@ -89,6 +99,18 @@ impl Bootstrap {
 
         // VM with the entry script loaded
         let mut vm = GroupVm::load(ctx.script)?;
+        let fingerprint = ysvr_data.iter().fold(0xcbf29ce484222325u64,
+            |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
+        let known_shape = detection.candidates.iter().filter(|c| c.exact_shape()).count() == 1
+            && detection.candidates.iter().any(|c| c.dictionaries == "494" && c.exact_shape());
+        let map = if ysvr_data.len() == 47166 && fingerprint == 0xd472c3293659379d && known_shape {
+            yuris_core::SystemVarMap::SkyChord
+        } else { yuris_core::SystemVarMap::Unknown };
+        tracing::info!(target: "yuris_version", "YSVR fingerprint={fingerprint:016x} bytes={} selected={map:?}", ysvr_data.len());
+        if let Some(selected) = override_map {
+            tracing::warn!(target: "yuris_version", "explicit system-variable override={selected:?}, detected={map:?}");
+        }
+        vm.set_system_var_map(override_map.unwrap_or(map));
         // A virtual display matching the game canvas is the portable default.
         // These are device capabilities, not iOS surface/letterbox dimensions.
         let display = self.fs.read("ysbin\\yscfg.ybn").ok()

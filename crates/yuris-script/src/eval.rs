@@ -32,6 +32,8 @@ impl Default for DisplayMetrics {
 pub struct VariableReadContext {
     /// Display device properties, not the drawable surface size.
     pub display: DisplayMetrics,
+    /// Explicit semantic mapping; unknown IDs use ordinary storage.
+    pub system_vars: yuris_core::SystemVarMap,
     /// Innermost loop iteration, or zero outside a loop.
     pub loop_counter: i64,
     /// Cursor in game logical coordinates.
@@ -41,6 +43,16 @@ pub struct VariableReadContext {
 }
 
 impl VariableReadContext {
+    fn frame_sysvar_elem(&self, r: &VarRef) -> Option<yuris_value::ElemType> {
+        let ids = self.system_vars.ids()?;
+        use yuris_value::ElemType;
+        match r.space {
+            VarSpace::At if [ids.arg_int, ids.ret_int].contains(&r.id) => Some(ElemType::Int),
+            VarSpace::At if [ids.arg_float, ids.ret_float].contains(&r.id) => Some(ElemType::Float),
+            VarSpace::Dollar if [ids.arg_str, ids.ret_str].contains(&r.id) => Some(ElemType::Str),
+            _ => None,
+        }
+    }
     /// Reads computed system values, then frame-local and global storage.
     /// Empty indices mean a scalar read (element zero for arrays).
     /// Frame argument/return families never fall back to globals when a
@@ -52,15 +64,15 @@ impl VariableReadContext {
         r: &VarRef,
         indices: &[i64],
     ) -> Result<Value> {
-        if r.space == VarSpace::At {
+        if let Some(ids) = self.system_vars.ids().filter(|_| r.space == VarSpace::At) {
             let computed = match r.id {
-                1 if indices == [1] => Some(self.clock_ms),
-                48 => Some(self.loop_counter),
-                133 => Some(self.cursor.0),
-                138 => Some(self.cursor.1),
-                114 => Some(i64::from(self.display.bits_per_pixel)),
-                115 => Some(i64::from(self.display.width)),
-                116 => Some(i64::from(self.display.height)),
+                id if id == ids.os_time && indices == [1] => Some(self.clock_ms),
+                id if id == ids.loop_counter => Some(self.loop_counter),
+                id if id == ids.mouse_x => Some(self.cursor.0),
+                id if id == ids.mouse_y => Some(self.cursor.1),
+                id if id == ids.display_depth => Some(i64::from(self.display.bits_per_pixel)),
+                id if id == ids.display_width => Some(i64::from(self.display.width)),
+                id if id == ids.display_height => Some(i64::from(self.display.height)),
                 _ => None,
             };
             if let Some(v) = computed { return Ok(Value::Int(v)); }
@@ -70,10 +82,10 @@ impl VariableReadContext {
                 if let Some(v) = local.get_opt(r) { return Ok(v.clone()); }
             }
             if local.has_array(r) {
-                return read_array(local, r, indices, is_frame_sysvar(r));
+                return read_array(local, r, indices, self.frame_sysvar_elem(r).is_some());
             }
-            if is_frame_sysvar(r) {
-                return Ok(frame_sysvar_default(frame_sysvar_elem(r)));
+            if self.frame_sysvar_elem(r).is_some() {
+                return Ok(frame_sysvar_default(self.frame_sysvar_elem(r)));
             }
         }
         if store.has_array(r) { return read_array(store, r, indices, true); }
@@ -114,6 +126,7 @@ pub struct Evaluator<'s> {
     /// `256 * (@1[1] - start) / duration`). Set by the VM.
     clock_ms: i64,
     display: DisplayMetrics,
+    system_vars: yuris_core::SystemVarMap,
     /// 调试:打印变量装载(默认 false)。
     pub verbose: bool,
 }
@@ -121,7 +134,7 @@ pub struct Evaluator<'s> {
 impl<'s> Evaluator<'s> {
     /// 绑定变量存储(无帧局部)。
     pub fn new(store: &'s mut VariableStore) -> Self {
-        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), clock_ms: 0, display: DisplayMetrics::default(), verbose: false }
+        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), clock_ms: 0, display: DisplayMetrics::default(), system_vars: yuris_core::SystemVarMap::SkyChord, verbose: false }
     }
 
     /// 绑定变量存储 + 帧局部。
@@ -129,13 +142,16 @@ impl<'s> Evaluator<'s> {
         store: &'s mut VariableStore,
         locals: Option<&'s VariableStore>,
     ) -> Self {
-        Self { store, locals, loop_counter: 0, cursor: (0, 0), clock_ms: 0, display: DisplayMetrics::default(), verbose: false }
+        Self { store, locals, loop_counter: 0, cursor: (0, 0), clock_ms: 0, display: DisplayMetrics::default(), system_vars: yuris_core::SystemVarMap::SkyChord, verbose: false }
     }
 
     /// 注入 @48 当前值(内层 LOOP 迭代计数;无循环 = 0)。
     pub fn set_loop_counter(&mut self, v: i64) {
         self.loop_counter = v;
     }
+
+    /// Selects semantic IDs for this evaluation.
+    pub fn set_system_var_map(&mut self, map: yuris_core::SystemVarMap) { self.system_vars = map; }
 
     /// Sets the display device visible to system-variable reads.
     pub fn set_display_metrics(&mut self, display: DisplayMetrics) { self.display = display; }
@@ -310,7 +326,7 @@ impl<'s> Evaluator<'s> {
     }
 
     fn read_context(&self) -> VariableReadContext {
-        VariableReadContext { display: self.display, loop_counter: self.loop_counter, cursor: self.cursor, clock_ms: self.clock_ms }
+        VariableReadContext { system_vars: self.system_vars, display: self.display, loop_counter: self.loop_counter, cursor: self.cursor, clock_ms: self.clock_ms }
     }
 
     fn load_auto(&mut self, r: &VarRef) -> Result<Value> {
@@ -349,21 +365,13 @@ pub struct LValueRef {
 
 /// 帧局部系统变量族(@53/@60 INT、@54/@61 FLT、$55/$62 STR;成果 50/52)。
 pub fn is_frame_sysvar(r: &VarRef) -> bool {
-    match r.space {
-        VarSpace::At => matches!(r.id, 53 | 54 | 60 | 61),
-        VarSpace::Dollar => matches!(r.id, 55 | 62),
-        _ => false,
-    }
+    frame_sysvar_elem(r).is_some()
 }
 
-/// 帧局部系统族的元素类型(按 id 推断;gparam 未声明该型时读边界外默认)。
+/// Legacy standalone SkyChord frame type; runtime reads use the selected map.
 pub fn frame_sysvar_elem(r: &VarRef) -> Option<yuris_value::ElemType> {
-    match (r.space, r.id) {
-        (VarSpace::At, 53) | (VarSpace::At, 60) => Some(yuris_value::ElemType::Int),
-        (VarSpace::At, 54) | (VarSpace::At, 61) => Some(yuris_value::ElemType::Float),
-        (VarSpace::Dollar, 55) | (VarSpace::Dollar, 62) => Some(yuris_value::ElemType::Str),
-        _ => None,
-    }
+    VariableReadContext { system_vars: yuris_core::SystemVarMap::SkyChord, ..Default::default() }
+        .frame_sysvar_elem(r)
 }
 
 /// 帧局部系统族越界读的默认值(引擎 sysvar case 0x35 边界外 → 0;

@@ -123,3 +123,39 @@ bootstrap integration also succeeds: entry script 202, PC 0, 1,969 applied YSVR
 initial values, with the same report retained in `Booted`. Existing runtime
 mapping remains unchanged. This checks archive detection and VM initialization,
 not full gameplay, rendering, audio, or unprovided update archives.
+
+## Stage 2 implementation: explicit runtime mappings
+
+`yuris_core::SystemVarMap` now separates runtime semantics from the detection
+report. `SystemVarIds` centralizes the current SkyChord IDs. The shared reader,
+all VM expression evaluators (including YSVR string initializers), input codes
+and state updates, paths, date/time, text and character tables, and frame
+argument/return slots use the selected mapping.
+
+Automatic bootstrap selection currently recognizes only the verified SkyChord
+YSVR: 47,166 decompressed bytes, FNV-1a-64 `d472c3293659379d`, plus a unique
+complete 494 shape match. This is a compatibility fingerprint, not an authenticity
+check. Hashing the entire table deliberately makes modified initializers or
+patches unknown until verified. Neither a header of 555 nor a matching shape
+alone selects runtime semantics. The file evidence remains separate and intact.
+
+Unrecognized games select `Unknown`: computed reads fall through to ordinary
+storage; host input/path/time/text/character writes and frame-slot synthesis
+are disabled. In particular, the old fallback writing mouse state to @147 is
+removed. The selected map and disabled semantics are logged; skipped frame
+operations include script and PC. This does not claim unknown games can play
+correctly. It avoids assigning semantics to ordinary IDs from another layout.
+
+`Bootstrap::boot_with_system_var_map` provides an explicitly logged override for
+independently verified games. Low-level `GroupVm::load` and `Evaluator::new`
+retain the legacy standalone SkyChord behavior for existing embedding callers;
+those callers can explicitly select `Unknown`. Set the map before applying YSVR
+and executing scripts. An override does not rewrite the detection evidence.
+Additional commercial fingerprints and old layouts remain future work.
+
+Validation includes unknown-map preservation of @115 and @147, an insufficient
+single INP anchor, text/path/time writes, frame and character slots, YSVR initial
+expression reads, and explicit bootstrap overrides. SkyChord initialization
+still selects the known map, enters script 202 at PC 0, applies 1,969 initial
+values, and exposes its YSCF-derived 1920×1080 display metrics. This is a bootstrap
+check, not a full gameplay or rendering validation.

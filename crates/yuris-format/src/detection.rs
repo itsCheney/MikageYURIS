@@ -93,9 +93,9 @@ impl DetectionReport {
         if versions.len() > 1 { report.warnings.push(format!("mixed reported versions {versions:?}; not automatically incompatible")); }
         let matches = report.candidates.iter().filter(|c| c.exact_shape()).count();
         report.warnings.push(match matches {
-            0 => "system-variable profile unknown; existing runtime mapping retained",
-            1 => "unique shape match only; semantic compatibility unconfirmed; existing runtime mapping retained",
-            _ => "ambiguous system-variable shapes; existing runtime mapping retained",
+            0 => "system-variable profile unknown; shape detection does not select runtime semantics",
+            1 => "unique shape match only; semantic compatibility unconfirmed; shape detection does not select runtime semantics",
+            _ => "ambiguous system-variable shapes; shape detection does not select runtime semantics",
         }.into());
         report
     }
