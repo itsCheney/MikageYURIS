@@ -225,6 +225,12 @@ impl Player {
         })
     }
 
+    /// Overrides the virtual display capabilities exposed as @114..@116.
+    /// Does not resize the game canvas or change cursor/letterbox coordinates.
+    pub fn set_display_metrics(&mut self, display: yuris_vm::DisplayMetrics) {
+        self.vm.set_display_metrics(display);
+    }
+
     /// The game's screen size (yscfg).
     pub fn screen(&self) -> (u32, u32) {
         self.screen

@@ -90,10 +90,28 @@ the system table at id 10 (`@_TIME`), giving `$_TEXT` = 122,
 | `@48` | iteration count of the innermost LOOP (from 1; 0 outside a loop) |
 | `@53` `@54` `$55` | the current GOSUB frame's INT, FLT and STR arguments |
 | `@60` `@61` `$62` | the values the last RETURN gave back |
-| `@114` | display colour depth: fixed at 32 |
-| `@115` `@116` | screen size: fixed at 1920 × 1080 (v555 ids, from the sample; not checked on v481) |
+| `@114` | display colour depth: supplied by the virtual display (default 32) |
+| `@115` `@116` | display-device size: virtual display defaults to the YSCF game size; host may override (v555 confirmed; not checked on v481) |
 | `@133` `@138` | cursor position (the same ids in v481) |
 
 Reading a frame variable past its count gives the type's default, and so
 does reading a global array out of range; reading an undeclared variable is
 an error. The input variables are described in `yuris-vm/src/input.rs`.
+
+### Display-device evidence and portable policy
+
+SkyChord v555 (`skychord.exe`) dispatches integer system-variable ids through
+`0x5788a0 + id*4` in the reader at `0x447edc`. Entries 114, 115, 116 target
+`0x4482f8`, `0x4482e8`, `0x4482d8`, reading globals `0x8353b0`,
+`0x8353a8`, `0x8353ac`. Initialization at `0x4694de` obtains a desktop DC
+and fills these via `GetDeviceCaps` indices 12 (BITSPIXEL), 8 (HORZRES),
+10 (VERTRES). They describe the display device, not YSCF's canvas.
+
+The portable runtime exposes a virtual display: bootstrap uses the YSCF canvas
+size at 32 bpp, falling back to 1280x720 when configuration is absent/invalid.
+This is a compatibility policy, not a claim that the original engine uses
+YSCF for display metrics. `GroupVm::set_display_metrics` and
+`Player::set_display_metrics` allow a host override. Surface resizing and
+letterboxing do not update these values, resize the canvas, or alter cursor
+coordinates. WINDOWINFO continues to report the virtual game window size.
+Standalone VMs without bootstrap retain the legacy 1920x1080/32 default.

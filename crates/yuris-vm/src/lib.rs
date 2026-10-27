@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub use yuris_script::eval::DisplayMetrics;
+
 use std::collections::HashMap;
 
 pub mod boot;
@@ -549,6 +551,8 @@ pub struct GroupVm {
     trace: bool,
     /// Engine clock in ms (`@1[1]`); the host advances it.
     clock_ms: u64,
+    /// Whether the host has initialized the engine-start date row.
+    date_time_initialized: bool,
     /// Decoded expression windows by (script, offset, len); boot evaluates
     /// the same windows millions of times.
     decoded: yuris_core::FastHashMap<(u16, u32, u32), std::sync::Arc<[yuris_script::Instruction]>>,
@@ -574,6 +578,7 @@ pub struct GroupVm {
     declared_scripts: std::collections::HashSet<u16>,
     /// 播放器注入的光标逻辑坐标(@133/@138;P9.2)。
     input_cursor: (i64, i64),
+    display_metrics: yuris_script::eval::DisplayMetrics,
     /// YSVR kind2(按脚本初值)条目暂存,首载时应用(成果 59h)。
     ysvr_kind2: Vec<yuris_format::ysvr::YsvrEntry>,
     /// Global YSVR entries (kind 1), kept for VARACT INIT.
@@ -627,6 +632,7 @@ impl GroupVm {
             ctx_cache: HashMap::new(),
             trace: true,
             clock_ms: 0,
+            date_time_initialized: false,
             decoded: Default::default(),
             cmd_map: std::sync::Arc::new(commands::CommandMap::identity()),
             host: None,
@@ -649,6 +655,7 @@ impl GroupVm {
             executed_windows: 0,
             declared_scripts: std::collections::HashSet::new(),
             input_cursor: (0, 0),
+            display_metrics: Default::default(),
             ysvr_kind2: Vec::new(),
             ysvr_globals: Vec::new(),
             ysvr_kind2_applied: std::collections::HashSet::new(),
@@ -689,8 +696,12 @@ impl GroupVm {
         self.host = Some(host);
     }
 
-    /// 注入游戏虚拟 FS 存在性索引(FILEINFO EXIST 查询用;P5.2)。
-    /// 注入光标逻辑坐标(@133/@138;播放器每帧调用,P9.2)。
+    /// Sets display-device capabilities without changing game coordinates.
+    pub fn set_display_metrics(&mut self, display: yuris_script::eval::DisplayMetrics) {
+        self.display_metrics = display;
+    }
+
+    /// Sets the cursor in game logical coordinates.
     pub fn set_input_cursor(&mut self, x: i64, y: i64) {
         self.input_cursor = (x, y);
     }
@@ -3540,6 +3551,7 @@ impl GroupVm {
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
+        ev.set_display_metrics(self.display_metrics);
         // @48 系统变量注入(P5 定性,引擎 sysvar case 0x30):内层 LOOP
         // 迭代计数 —— 引擎读 obj+0x244 嵌套栈顶记录 +0x10,LOOP 置 1、
         // LOOPEND +1;无活动循环 = 0(GOSUB 不压该栈,跨帧可见)。
@@ -3828,6 +3840,7 @@ impl GroupVm {
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
+        ev.set_display_metrics(self.display_metrics);
         // @48 注入(同 eval_window_condition;左值下标表达式可读系统变量)
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
         ev.set_clock_ms(self.clock_ms as i64);
@@ -4266,101 +4279,13 @@ impl GroupVm {
     /// 同键数组(如 @53/@54/$55 帧局部族)时读帧,否则读全局
     /// (引擎 0042158e:id<1000 走帧/系统存储,id≥1000 走 desc+0x30)。
     fn read_var_value(&self, r: &yuris_value::VarRef, indices: &[i64]) -> Option<Value> {
-        // @48 系统变量(P5 定性,引擎 sysvar case 0x30/00447ebc):内层 LOOP
-        // 迭代计数,读即计算、无存储(引擎 obj+0x244 栈顶记录 +0x10);
-        // LOOP 置 1、LOOPEND +1、LOOPBREAK 清零;无活动循环 = 0。
-        if r.space == yuris_value::VarSpace::At && r.id == 48 {
-            return Some(Value::Int(
-                self.loops.last().map(|l| l.counter as i64).unwrap_or(0),
-            ));
-        }
-        // @114(引擎 sysvar case 0x72/00447ebc):显示色深 bpp,原生全局
-        // DAT_00872374(显示初始化写入;s40 色深检查用)。VM 无显示栈,
-        // 按 oracle 环境 = 32bpp(成果 59c)。
-        if r.space == yuris_value::VarSpace::At && r.id == 114 {
-            return Some(Value::Int(32));
-        }
-        // @115/@116(引擎 sysvar case 0x73/0x74,DAT_0087236c/70):屏幕宽/高
-        //(显示初始化写入)。VM 无显示栈,按 oracle 环境 = 1920×1080。
-        if r.space == yuris_value::VarSpace::At && r.id == 115 {
-            return Some(Value::Int(1920));
-        }
-        if r.space == yuris_value::VarSpace::At && r.id == 116 {
-            return Some(Value::Int(1080));
-        }
-        // A scalar read of an array variable loads element 0, as 0x48 does.
-        let zeros: Vec<i64>;
-        let indices = if indices.is_empty() {
-            let dims = self
-                .frames
-                .last()
-                .and_then(|fr| fr.locals.array_dims(r))
-                .or_else(|| self.store.array_dims(r));
-            zeros = vec![0; dims.map(|d| d.len()).unwrap_or(0)];
-            &zeros[..]
-        } else {
-            indices
+        let context = yuris_script::eval::VariableReadContext {
+            display: self.display_metrics,
+            loop_counter: self.loops.last().map(|l| l.counter as i64).unwrap_or(0),
+            cursor: self.input_cursor,
+            clock_ms: self.clock_ms as i64,
         };
-        let out: Option<Value> = (|| {
-            if let Some(fr) = self.frames.last() {
-                if fr.locals.has_array(r) {
-                    return match fr.locals.get_elem(r, indices) {
-                        Ok(v) => Some(v.clone()),
-                        Err(e) => {
-                            // 帧局部系统族越界读 = 类型默认值(引擎 sysvar
-                            // case 0x35 边界外 → 0;成果 52);其余数组严格
-                            let _ = e;
-                            if yuris_script::eval::is_frame_sysvar(r) {
-                                Some(yuris_script::eval::frame_sysvar_default(
-                                    fr.locals.array_elem_type(r),
-                                ))
-                            } else {
-                                None
-                            }
-                        }
-                    };
-                }
-                // 有帧但无该键:系统族 = 默认值,**绝无全局回退**(引擎
-                // id<1000 读永远帧内定界;成果 52)
-                if yuris_script::eval::is_frame_sysvar(r) {
-                    return Some(yuris_script::eval::frame_sysvar_default(
-                        yuris_script::eval::frame_sysvar_elem(r),
-                    ));
-                }
-                if indices.is_empty() {
-                    if let Some(v) = fr.locals.get_opt(r) {
-                        return Some(v.clone());
-                    }
-                }
-            }
-            if self.store.has_array(r) {
-                // 引擎全局数组读 FUN_00459490/00459418(成果 57):越界
-                // → 类型默认值,不报错。
-                return match self.store.get_elem(r, indices) {
-                    Ok(v) => Some(v.clone()),
-                    Err(e) => match self.store.array_elem_type(r) {
-                        Some(et) => Some(yuris_script::eval::type_default(Some(et))),
-                        None => {
-                            let _ = e;
-                            None
-                        }
-                    },
-                };
-            }
-            if indices.is_empty() {
-                return self.store.get(r).cloned().ok();
-            }
-            match self.store.get_elem(r, indices) {
-                Ok(v) => Some(v.clone()),
-                Err(e) => match self.store.array_elem_type(r) {
-                    Some(et) => Some(yuris_script::eval::type_default(Some(et))),
-                    None => {
-                        let _ = e;
-                        None
-                    }
-                },
-            }
-        })();
+        let out = context.read(&self.store, self.frames.last().map(|f| &f.locals), r, indices).ok();
         if debug_frame() && r.id == 55 {
             let fr_has = self.frames.last().map(|f| f.locals.has_array(r));
             let vs = match &out {
@@ -4572,6 +4497,7 @@ impl GroupVm {
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
         let (cx, cy) = self.input_cursor;
         ev.set_cursor(cx, cy);
+        ev.set_display_metrics(self.display_metrics);
         ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
         ev.set_clock_ms(self.clock_ms as i64);
         let stack = ev.eval_instructions(idx).map_err(|e| {
@@ -5272,3 +5198,6 @@ fn value_truthy(v: &Value) -> Result<bool> {
         Value::Float(_) => Err(Error::Unimplemented("float 真值语义")),
     }
 }
+
+#[cfg(test)]
+mod variable_read_tests;

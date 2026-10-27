@@ -85,6 +85,13 @@ impl Bootstrap {
 
         // VM with the entry script loaded
         let mut vm = GroupVm::load(ctx.script)?;
+        // A virtual display matching the game canvas is the portable default.
+        // These are device capabilities, not iOS surface/letterbox dimensions.
+        let display = self.fs.read("ysbin\\yscfg.ybn").ok()
+            .and_then(|b| yuris_format::yscf::YscfFile::from_bytes(&b).ok())
+            .and_then(|c| yuris_script::eval::DisplayMetrics::new(c.screen_width, c.screen_height, 32))
+            .unwrap_or_else(|| yuris_script::eval::DisplayMetrics::new(1280, 720, 32).unwrap());
+        vm.set_display_metrics(display);
         vm.set_command_map(cmd_map.clone());
         vm.set_script_id(script_id);
 

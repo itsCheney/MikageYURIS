@@ -63,6 +63,24 @@ fn boots_synthetic_game_with_inferred_keys() {
     assert_eq!(booted.script_id, 0);
     let mut vm = booted.vm;
     assert_eq!(vm.run(100).unwrap(), VmSuspend::Complete);
+    assert_eq!(vm.global_int(115), Some(1280)); // absent config fallback
+    assert_eq!(vm.global_int(116), Some(720));
+    std::fs::create_dir_all(dir.join("ysbin")).unwrap();
+    for (w, h) in [(800u32, 600u32), (1280, 720), (1920, 1080), (0, 0)] {
+        let mut cfg = vec![0u8; 0x4e];
+        cfg[..4].copy_from_slice(b"YSCF");
+        cfg[4..8].copy_from_slice(&555u32.to_le_bytes());
+        cfg[0x10..0x14].copy_from_slice(&w.to_le_bytes());
+        cfg[0x14..0x18].copy_from_slice(&h.to_le_bytes());
+        std::fs::write(dir.join("ysbin/yscfg.ybn"), cfg).unwrap();
+        let fs = Arc::new(GameFs::open(&dir).unwrap());
+        let vm = Bootstrap { fs, key: None, entry_label: None }.boot().unwrap().vm;
+        let expected = if w == 0 { (1280, 720) } else { (w, h) };
+        assert_eq!(vm.global_int(114), Some(32));
+        assert_eq!(vm.global_int(115), Some(i64::from(expected.0)));
+        assert_eq!(vm.global_int(116), Some(i64::from(expected.1)));
+    }
+
     if std::env::var_os("YURIS_KEEP_TEST_DIR").is_none() {
         std::fs::remove_dir_all(&dir).ok();
     }

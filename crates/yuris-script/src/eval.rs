@@ -8,6 +8,93 @@ use yuris_value::{Value, VarRef, VarSpace, VariableStore};
 
 use crate::insn::{BinOp, Cast, Insn, Instruction};
 
+/// The display device exposed to scripts, distinct from the game canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMetrics {
+    width: u32,
+    height: u32,
+    bits_per_pixel: u32,
+}
+impl DisplayMetrics {
+    /// Creates valid display metrics. Zero dimensions/depth are rejected.
+    pub fn new(width: u32, height: u32, bits_per_pixel: u32) -> Option<Self> {
+        (width > 0 && height > 0 && bits_per_pixel > 0)
+            .then_some(Self { width, height, bits_per_pixel })
+    }
+}
+impl Default for DisplayMetrics {
+    /// Legacy standalone-VM fallback; game bootstrap supplies its own metrics.
+    fn default() -> Self { Self { width: 1920, height: 1080, bits_per_pixel: 32 } }
+}
+
+/// Runtime values shared by expression and command variable reads.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VariableReadContext {
+    /// Display device properties, not the drawable surface size.
+    pub display: DisplayMetrics,
+    /// Innermost loop iteration, or zero outside a loop.
+    pub loop_counter: i64,
+    /// Cursor in game logical coordinates.
+    pub cursor: (i64, i64),
+    /// Engine monotonic time in milliseconds.
+    pub clock_ms: i64,
+}
+
+impl VariableReadContext {
+    /// Reads computed system values, then frame-local and global storage.
+    /// Empty indices mean a scalar read (element zero for arrays).
+    /// Frame argument/return families never fall back to globals when a
+    /// frame is present. Undeclared variables remain errors.
+    pub fn read(
+        &self,
+        store: &VariableStore,
+        locals: Option<&VariableStore>,
+        r: &VarRef,
+        indices: &[i64],
+    ) -> Result<Value> {
+        if r.space == VarSpace::At {
+            let computed = match r.id {
+                1 if indices == [1] => Some(self.clock_ms),
+                48 => Some(self.loop_counter),
+                133 => Some(self.cursor.0),
+                138 => Some(self.cursor.1),
+                114 => Some(i64::from(self.display.bits_per_pixel)),
+                115 => Some(i64::from(self.display.width)),
+                116 => Some(i64::from(self.display.height)),
+                _ => None,
+            };
+            if let Some(v) = computed { return Ok(Value::Int(v)); }
+        }
+        if let Some(local) = locals {
+            if indices.is_empty() {
+                if let Some(v) = local.get_opt(r) { return Ok(v.clone()); }
+            }
+            if local.has_array(r) {
+                return read_array(local, r, indices, is_frame_sysvar(r));
+            }
+            if is_frame_sysvar(r) {
+                return Ok(frame_sysvar_default(frame_sysvar_elem(r)));
+            }
+        }
+        if store.has_array(r) { return read_array(store, r, indices, true); }
+        if indices.is_empty() { return store.get(r).cloned(); }
+        store.get_elem(r, indices).cloned()
+    }
+}
+
+fn read_array(store: &VariableStore, r: &VarRef, indices: &[i64], default_on_bounds: bool) -> Result<Value> {
+    let zeros;
+    let indices = if indices.is_empty() {
+        zeros = vec![0; store.array_dims(r).unwrap_or_default().len()];
+        &zeros[..]
+    } else { indices };
+    match store.get_elem(r, indices) {
+        Ok(v) => Ok(v.clone()),
+        Err(_) if default_on_bounds => Ok(type_default(store.array_elem_type(r))),
+        Err(e) => Err(e),
+    }
+}
+
 /// 栈式求值器。
 pub struct Evaluator<'s> {
     store: &'s mut VariableStore,
@@ -26,6 +113,7 @@ pub struct Evaluator<'s> {
     /// and waits with it: Erewhon's es.CGFADEEXEC computes
     /// `256 * (@1[1] - start) / duration`). Set by the VM.
     clock_ms: i64,
+    display: DisplayMetrics,
     /// 调试:打印变量装载(默认 false)。
     pub verbose: bool,
 }
@@ -33,7 +121,7 @@ pub struct Evaluator<'s> {
 impl<'s> Evaluator<'s> {
     /// 绑定变量存储(无帧局部)。
     pub fn new(store: &'s mut VariableStore) -> Self {
-        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), clock_ms: 0, verbose: false }
+        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), clock_ms: 0, display: DisplayMetrics::default(), verbose: false }
     }
 
     /// 绑定变量存储 + 帧局部。
@@ -41,13 +129,16 @@ impl<'s> Evaluator<'s> {
         store: &'s mut VariableStore,
         locals: Option<&'s VariableStore>,
     ) -> Self {
-        Self { store, locals, loop_counter: 0, cursor: (0, 0), clock_ms: 0, verbose: false }
+        Self { store, locals, loop_counter: 0, cursor: (0, 0), clock_ms: 0, display: DisplayMetrics::default(), verbose: false }
     }
 
     /// 注入 @48 当前值(内层 LOOP 迭代计数;无循环 = 0)。
     pub fn set_loop_counter(&mut self, v: i64) {
         self.loop_counter = v;
     }
+
+    /// Sets the display device visible to system-variable reads.
+    pub fn set_display_metrics(&mut self, display: DisplayMetrics) { self.display = display; }
 
     /// Sets the clock `@1[1]` reads.
     pub fn set_clock_ms(&mut self, ms: i64) {
@@ -120,70 +211,7 @@ impl<'s> Evaluator<'s> {
                         Slot::LValue(r) => *r,
                         _ => unreachable!(),
                     };
-                    // 帧局部数组优先(引擎 0042158e:id<1000 系统变量族值的
-                    // 读写走帧/系统存储,desc 仅作形状校验;P5 定性成果 50)
-                    let v = if r.space == VarSpace::At && r.id == 48 {
-                        // @48(引擎 sysvar case 0x30):LOOP 迭代计数,读即
-                        // 计算、无存储;引擎对下标不敏感(语料无索引用法)
-                        Value::Int(self.loop_counter)
-                    } else if r.space == VarSpace::At && r.id == 1 && indices == [1] {
-                        // @1[1]: the engine clock in ms (the only element
-                        // Erewhon's scripts read; 370 uses).
-                        Value::Int(self.clock_ms)
-                    } else if r.space == VarSpace::At && r.id == 114 {
-                        // @114(sysvar case 0x72):显示色深 bpp(成果 59c)
-                        Value::Int(32)
-                    } else if r.space == VarSpace::At && r.id == 115 {
-                        // @115(sysvar case 0x73,DAT_0087236c):屏幕宽
-                        //(s41 g104 `@1074 != @115` 引擎假 → 1920;oracle 环境)
-                        Value::Int(1920)
-                    } else if r.space == VarSpace::At && r.id == 116 {
-                        // @116(sysvar case 0x74,DAT_00872370):屏幕高(oracle)
-                        Value::Int(1080)
-                    } else if let Some(locals) = self.locals {
-                        if locals.has_array(&r) {
-                            match locals.get_elem(&r, &indices) {
-                                Ok(v) => v.clone(),
-                                Err(e) => {
-                                    // 帧局部系统族越界读 = 类型默认值(引擎
-                                    // sysvar case 0x35 边界检查 `idx >= count`
-                                    // → 值 0;成果 52)。全局数组仍严格报错。
-                                    if is_frame_sysvar(&r) {
-                                        frame_sysvar_default(
-                                            locals.array_elem_type(&r),
-                                        )
-                                    } else {
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                        } else if is_frame_sysvar(&r) {
-                            // 引擎:id<1000 族读**永远走帧**,绝无全局回退
-                            // (gparam 计数 = 0 → 槽不存在 → 边界外 = 默认值;
-                            // 成果 52:s22 g260 无参调用 es.CGTSS,$55[1] 须
-                            // 为 "",读全局会吃到 YSVR 全局 $55 → 分歧)。
-                            frame_sysvar_default(frame_sysvar_elem(&r))
-                        } else {
-                            // 引擎全局数组读 FUN_00459490/00459418(成果 57):
-                            // 越界 → 类型默认值,不报错;未声明变量仍报错。
-                            match self.store.get_elem(&r, &indices) {
-                                Ok(v) => v.clone(),
-                                Err(e) => match self.store.array_elem_type(&r) {
-                                    Some(et) => type_default(Some(et)),
-                                    None => return Err(e),
-                                },
-                            }
-                        }
-                    } else {
-                        // 同上:全局读越界容忍(成果 57)。
-                        match self.store.get_elem(&r, &indices) {
-                            Ok(v) => v.clone(),
-                            Err(e) => match self.store.array_elem_type(&r) {
-                                Some(et) => type_default(Some(et)),
-                                None => return Err(e),
-                            },
-                        }
-                    };
+                    let v = self.read_context().read(self.store, self.locals, &r, &indices)?;
                     stack.truncate(marker);
                     stack.push(Slot::Val(v));
                 }
@@ -281,68 +309,14 @@ impl<'s> Evaluator<'s> {
         Ok(LValueRef { var: r, indices })
     }
 
-    /// 引擎 0x48 装载:数组 → 0 号元素;标量 → 值;都无 → 报错(0x1a5ea 同族)。
-    fn load_auto(&mut self, r: &VarRef) -> Result<Value> {
-        // @48 系统变量(引擎 sysvar case 0x30):内层 LOOP 迭代计数,
-        // 独立于变量存储(引擎无 desc,读即计算);下标被忽略(引擎同)。
-        if r.space == VarSpace::At && r.id == 48 {
-            return Ok(Value::Int(self.loop_counter));
-        }
-        // @133/@138(引擎 sysvar case 0x85/0x8a):光标逻辑坐标
-        // (窗口对象 +0x2ac/+0x2b0,输入收集层每帧写入)。VM 无窗口栈,
-        // 由播放器注入;(0,0) 缺省。
-        if r.space == VarSpace::At && r.id == 133 {
-            return Ok(Value::Int(self.cursor.0));
-        }
-        if r.space == VarSpace::At && r.id == 138 {
-            return Ok(Value::Int(self.cursor.1));
-        }
-        // @114(引擎 sysvar case 0x72,00447ebc):显示色深 bpp(原生全局
-        // DAT_00872374,显示初始化写入;s40 色深检查 `@114<=8` → 报
-        // 「需 65536 色以上」)。VM 无显示栈,按 oracle 环境 = 32bpp。
-        if r.space == VarSpace::At && r.id == 114 {
-            return Ok(Value::Int(32));
-        }
-        // @115/@116(sysvar case 0x73/0x74,DAT_0087236c/70):屏幕宽/高。
-        // VM 无显示栈,按 oracle 环境 = 1920×1080(s41 g104 引擎假反推)。
-        if r.space == VarSpace::At && r.id == 115 {
-            return Ok(Value::Int(1920));
-        }
-        if r.space == VarSpace::At && r.id == 116 {
-            return Ok(Value::Int(1080));
-        }
-        // 帧局部优先(引擎:帧局部变量 id 属独立空间)
-        if self.verbose {
-            eprintln!("DEBUG load_auto: prefix={:#04x} id={} ({:#x})", r.space.prefix(), r.id, r.id);
-        }
-        if let Some(locals) = self.locals {
-            if let Some(v) = locals.get_opt(r) {
-                return Ok(v.clone());
-            }
-            if locals.has_array(r) {
-                let dims = locals.array_dims(r);
-                let zeros = vec![0i64; dims.unwrap_or_default().len()];
-                return Ok(locals.get_elem(r, &zeros)?.clone());
-            }
-            // 有帧但无该键:系统族 = 边界外默认(引擎绝无全局回退;成果 52)
-            if is_frame_sysvar(r) {
-                return Ok(frame_sysvar_default(frame_sysvar_elem(r)));
-            }
-        }
-        if self.store.has_array(r) {
-            let dims = self.store.array_dims(r);
-            let zeros = vec![0i64; dims.unwrap_or_default().len()];
-            // 越界容忍(成果 57):0 号下标在 0 长数组上越界 → 类型默认
-            return match self.store.get_elem(r, &zeros) {
-                Ok(v) => Ok(v.clone()),
-                Err(e) => match self.store.array_elem_type(r) {
-                    Some(et) => Ok(type_default(Some(et))),
-                    None => Err(e),
-                },
-            };
-        }
-        Ok(self.store.get(r)?.clone())
+    fn read_context(&self) -> VariableReadContext {
+        VariableReadContext { display: self.display, loop_counter: self.loop_counter, cursor: self.cursor, clock_ms: self.clock_ms }
     }
+
+    fn load_auto(&mut self, r: &VarRef) -> Result<Value> {
+        self.read_context().read(self.store, self.locals, r, &[])
+    }
+
 }
 
 /// 求值栈槽位:值或左值引用(引擎平行引用栈的忠实建模)。

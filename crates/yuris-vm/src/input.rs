@@ -2,7 +2,7 @@
 //! `@_CODE_*` button codes.
 //!
 //! System variable ids follow the order of the system variable table in
-//! the v480 compiler dictionary, starting at id 10 (`@_TIME`). Erewhon
+//! the v480 compiler dictionary, with `@_TIME` at runtime id 0. Erewhon
 //! (v481) uses the same ids: `$_TEXT` = 122, `$_CHR` = 127, `@_INP` = 144,
 //! `@_MOUSE_L` = 147, `@_CODE_MOUSE_L` = 415.
 //!
@@ -297,8 +297,8 @@ impl GroupVm {
     /// Erewhon shows row 0 as the save date of a slot.
     pub fn set_date_time(&mut self, now: [i64; 8]) -> Result<()> {
         let r = at(TIME);
-        let first = !self.store.has_array(&r);
-        if first {
+        let first = !self.date_time_initialized;
+        if !self.store.has_array(&r) {
             self.store.declare_array(&r, ElemType::Int, &[2, 8]);
         }
         for (i, v) in now.iter().enumerate() {
@@ -307,6 +307,7 @@ impl GroupVm {
                 self.store.set_elem(&r, &[1, i as i64], Value::Int(*v))?;
             }
         }
+        self.date_time_initialized = true;
         Ok(())
     }
 }
