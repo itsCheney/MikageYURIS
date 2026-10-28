@@ -67,6 +67,19 @@ pub fn compare_system_shapes(table: &YsvrTable) -> Vec<Candidate> {
     }).collect()
 }
 
+/// A synthetic YSVR holding exactly a dictionary family's system variables
+/// (declarations only), for tests and tools.
+pub fn profile_table(dictionaries: &str) -> Option<YsvrTable> {
+    let shape = PROFILES.iter().find(|(n, _)| *n == dictionaries)?.1;
+    let entries = shape.split(';').enumerate().map(|(id, row)| {
+        let (ty, dims) = row.split_once(':').unwrap_or((row, ""));
+        crate::ysvr::YsvrEntry { kind: 1, category: 0, script: 0, var_id: id as u16, ty: ty.parse().expect("generated type"),
+            bounds: dims.split(',').filter(|s| !s.is_empty()).map(|s| s.parse().expect("generated dimension")).collect(),
+            init: crate::ysvr::YsvrInit::None }
+    }).collect();
+    Some(YsvrTable { version: 555, entries, consumed: 0 })
+}
+
 impl DetectionReport {
     /// Examines resolved files. Parse failures become evidence, not boot errors.
     pub fn inspect(fs: &GameFs) -> Self {
@@ -135,14 +148,8 @@ impl DetectionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ysvr::{YsvrEntry, YsvrInit};
     fn table(profile: usize) -> YsvrTable {
-        let entries = PROFILES[profile].1.split(';').enumerate().map(|(id, row)| {
-            let (ty, dims) = row.split_once(':').unwrap_or((row, ""));
-            YsvrEntry { kind: 1, category: 0, script: 0, var_id: id as u16, ty: ty.parse().unwrap(),
-                bounds: dims.split(',').filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect(), init: YsvrInit::None }
-        }).collect();
-        YsvrTable { version: 555, entries, consumed: 0 }
+        profile_table(PROFILES[profile].0).unwrap()
     }
     #[test]
     fn all_profiles_match_independently_of_reported_version() {

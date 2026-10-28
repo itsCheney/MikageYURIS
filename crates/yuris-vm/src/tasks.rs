@@ -488,7 +488,9 @@ impl GroupVm {
         self.ensure_main_task();
         let ctx = self.prepared_script(sid)?;
         let mut locals = VariableStore::new();
-        seed_task_args(&mut locals, &p);
+        if let Some(ids) = self.system_vars.ids() {
+            seed_task_args(&mut locals, &p, &ids);
+        }
         let state = ExecState {
             ctx,
             pc,
@@ -649,12 +651,13 @@ impl GroupVm {
     }
 }
 
-/// TINT/TFLT/TSTR into the entry frame's @53/@54/$55 (1-based, like GOSUB).
-fn seed_task_args(locals: &mut VariableStore, p: &TaskParams) {
+/// TINT/TFLT/TSTR into the entry frame's `@_PINT`/`@_PFLT`/`$_PSTR`
+/// (1-based, like GOSUB).
+fn seed_task_args(locals: &mut VariableStore, p: &TaskParams, ids: &yuris_core::system_vars::SystemVarIds) {
     use yuris_value::{ElemType, VarRef, VarSpace};
-    let int = VarRef { space: VarSpace::At, id: 53 };
-    let flt = VarRef { space: VarSpace::At, id: 54 };
-    let s = VarRef { space: VarSpace::Dollar, id: 55 };
+    let int = VarRef { space: VarSpace::At, id: ids.arg_int };
+    let flt = VarRef { space: VarSpace::At, id: ids.arg_float };
+    let s = VarRef { space: VarSpace::Dollar, id: ids.arg_str };
     locals.declare_array(&int, ElemType::Int, &[11]);
     locals.declare_array(&flt, ElemType::Float, &[11]);
     locals.declare_array(&s, ElemType::Str, &[11]);

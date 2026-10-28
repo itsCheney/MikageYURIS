@@ -159,7 +159,9 @@ impl GroupVm {
             self.store.set(&path(id), Value::Str(Vec::new()));
         }
         self.store.set(&path(ids.save_path), Value::Str(b"save\\".to_vec()));
-        self.store.set(&at(ids.save_path_type), Value::Int(0));
+        if let Some(id) = ids.save_path_type {
+            self.store.set(&at(id), Value::Int(0));
+        }
         Ok(())
     }
 

@@ -55,6 +55,40 @@ pub struct Booted {
 /// it).
 const VERIFIED_494_YSVR: &[(usize, u64)] = &[(47166, 0xd472c3293659379d), (43871, 0xae9b27ee25b9d6fb)];
 
+/// Picks the system-variable IDs from the YSVR evidence, strongest first:
+///
+/// 1. a verified fingerprint with the unique exact 494 shape (SkyChord);
+/// 2. the one dictionary family whose complete shape matches exactly;
+/// 3. the one family whose shapes match at every ID the runtime uses
+///    (commercial builds add or change other system variables);
+/// 4. otherwise Unknown, which disables system reads and writes.
+///
+/// 2 and 3 are shape evidence only: YSVR has no names. They are still far
+/// more likely right than Unknown, under which no game gets input or text.
+fn select_system_var_map(detection: &yuris_format::detection::DetectionReport, known_fingerprint: bool)
+    -> (yuris_core::SystemVarMap, &'static str) {
+    use yuris_core::{SystemVarMap, system_vars::DICTIONARY_IDS};
+    if detection.ysvr_fingerprint.is_none() { return (SystemVarMap::Unknown, "ysvr_missing_or_unreadable"); }
+    if detection.ysvr_layouts.iter().filter(|c| c.table.is_some()).count() != 1 {
+        return (SystemVarMap::Unknown, "ysvr_layout_unresolved");
+    }
+    let family = |c: &yuris_format::detection::Candidate| DICTIONARY_IDS.iter().find(|(n, _)| *n == c.dictionaries);
+    let exact: Vec<_> = detection.candidates.iter().filter(|c| c.exact_shape()).filter_map(family).collect();
+    if let [(name, _)] = exact[..] {
+        if *name == "494" && known_fingerprint { return (SystemVarMap::SkyChord, "verified_fingerprint_and_shape"); }
+        return (SystemVarMap::Dictionary(name), "exact_shape_unverified");
+    }
+    let anchored: Vec<_> = detection.candidates.iter()
+        .filter_map(|c| family(c).filter(|(_, ids)| ids.anchors().iter()
+            .all(|id| !c.missing.contains(id) && !c.conflicting.contains(id))))
+        .collect();
+    match anchored[..] {
+        [(name, _)] => (SystemVarMap::Dictionary(name), "anchor_shape_unverified"),
+        [] => (SystemVarMap::Unknown, "system_shape_unrecognized"),
+        _ => (SystemVarMap::Unknown, "system_shape_ambiguous"),
+    }
+}
+
 impl Bootstrap {
     /// Runs the boot chain and returns a ready [`GroupVm`].
     ///
@@ -76,15 +110,11 @@ impl Bootstrap {
         let detection = yuris_format::detection::DetectionReport::inspect(&self.fs);
         detection.log();
         let known_fingerprint = detection.ysvr_fingerprint.is_some_and(|f| VERIFIED_494_YSVR.contains(&f));
-        let known_shape = detection.candidates.iter().filter(|c| c.exact_shape()).count() == 1
-            && detection.candidates.iter().any(|c| c.dictionaries == "494" && c.exact_shape());
-        let detected = if known_fingerprint && known_shape { yuris_core::SystemVarMap::SkyChord }
-            else { yuris_core::SystemVarMap::Unknown };
-        let reason = if detection.ysvr_fingerprint.is_none() { "ysvr_missing_or_unreadable" }
-            else if detection.ysvr_layouts.iter().filter(|c| c.table.is_some()).count() != 1 { "ysvr_layout_unresolved" }
-            else if !known_shape { "system_shape_unrecognized" }
-            else if !known_fingerprint { "fingerprint_not_registered" }
-            else { "verified_fingerprint_and_shape" };
+        let (detected, reason) = select_system_var_map(&detection, known_fingerprint);
+        let known_shape = detection.candidates.iter().filter(|c| c.exact_shape()).count() == 1;
+        if matches!(detected, yuris_core::SystemVarMap::Dictionary(_)) {
+            tracing::warn!(target: "yuris_version", "runtime_map {detected:?} chosen by {reason}: not verified on this game; register its YSVR fingerprint once it plays correctly");
+        }
         let map = override_map.unwrap_or(detected);
         tracing::info!(target: "yuris_version", "runtime_map detected={detected:?} selected={map:?} reason={reason} override={override_map:?} fingerprint_match={known_fingerprint} shape_match={known_shape}");
         let mut stage = "start";
@@ -259,5 +289,59 @@ impl GroupVm {
             }
         }
         self.store.set_elem(&r, &[1], v)
+    }
+}
+
+#[cfg(test)]
+mod map_selection_tests {
+    use super::select_system_var_map;
+    use yuris_core::SystemVarMap;
+    use yuris_format::detection::{compare_system_shapes, profile_table, DetectionReport};
+    use yuris_format::ysvr::{LayoutEvidence, YsvrLayout, YsvrTable};
+
+    fn report(t: YsvrTable) -> DetectionReport {
+        DetectionReport {
+            candidates: compare_system_shapes(&t),
+            ysvr_layouts: vec![LayoutEvidence { layout: YsvrLayout::Category, table: Some(t), error: None }],
+            ysvr_fingerprint: Some((1, 1)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_family_selects_its_own_ids() {
+        for (name, ids) in yuris_core::system_vars::DICTIONARY_IDS {
+            let (map, reason) = select_system_var_map(&report(profile_table(name).unwrap()), false);
+            assert_eq!(map, SystemVarMap::Dictionary(name), "{name}");
+            assert_eq!(reason, "exact_shape_unverified");
+            assert_eq!(map.ids(), Some(*ids));
+        }
+        let (map, _) = select_system_var_map(&report(profile_table("494").unwrap()), true);
+        assert_eq!(map, SystemVarMap::SkyChord);
+    }
+
+    #[test]
+    fn changes_away_from_used_ids_keep_the_family() {
+        let mut t = profile_table("480").unwrap();
+        // A commercial build: one unused variable retyped, one extra.
+        t.entries[300].ty = 3;
+        let mut extra = t.entries[0].clone();
+        extra.var_id = 600;
+        t.entries.push(extra);
+        let (map, reason) = select_system_var_map(&report(t.clone()), false);
+        assert_eq!((map, reason), (SystemVarMap::Dictionary("480"), "anchor_shape_unverified"));
+        // A used one (_INP) changed: no family left.
+        t.entries[134].bounds = vec![512];
+        assert_eq!(select_system_var_map(&report(t), false).0, SystemVarMap::Unknown);
+    }
+
+    #[test]
+    fn unrelated_tables_stay_unknown() {
+        let mut t = profile_table("494").unwrap();
+        t.entries.truncate(20);
+        assert_eq!(select_system_var_map(&report(t), true), (SystemVarMap::Unknown, "system_shape_unrecognized"));
+        let mut r = report(profile_table("494").unwrap());
+        r.ysvr_fingerprint = None;
+        assert_eq!(select_system_var_map(&r, false).0, SystemVarMap::Unknown);
     }
 }

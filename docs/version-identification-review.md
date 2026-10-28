@@ -232,3 +232,32 @@ rows and 1,647 existing VM event rows), including Category selection,
 `verified_fingerprint_and_shape`, and `boot_success` at script 202 / PC 0 with
 1,969 applied initial values. This verifies export and initialization, not full
 gameplay; the CLI still reports an unimplemented/recorded ERROR command later.
+
+## Stage 4: shape-selected maps for unregistered games
+
+Requiring a registered fingerprint meant every new game (Erewhon included,
+until it was added) booted with `Unknown`: no input, text or path variables,
+so a black screen. Selection is now tiered (`select_system_var_map` in
+`yuris-vm/src/boot.rs`):
+
+1. Verified fingerprint plus the unique exact 494 shape: `SkyChord`
+   (`verified_fingerprint_and_shape`).
+2. The one family whose complete shape matches exactly:
+   `Dictionary(family)` (`exact_shape_unverified`).
+3. Otherwise, the one family whose shapes match at every ID the runtime
+   reads or writes (`SystemVarIds::anchors`), so commercial builds that add
+   or retype other system variables still play: `anchor_shape_unverified`.
+4. Otherwise `Unknown` (`system_shape_unrecognized`, or
+   `system_shape_ambiguous` when several families pass step 3).
+
+Steps 2 and 3 log a warning; register the game's fingerprint in
+`VERIFIED_494_YSVR` once it is checked by playing. `DICTIONARY_IDS` in
+`yuris-core/src/system_vars.rs` gives each of the seven families' IDs, looked
+up by name in the public dictionaries (yuri 183b85e). Within every family the
+input blocks keep the same relative layout; only their bases move.
+`_SAVE_PATH_TYPE` does not exist before 470. Task arguments (TINT/TFLT/TSTR)
+now also use the map instead of fixed @53/@54/$55.
+
+Only 494 games have been played. The older families' IDs are dictionary
+facts; their engines' other behaviour (expression format, containers) is
+not covered by this.
