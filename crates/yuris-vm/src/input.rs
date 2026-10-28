@@ -1,11 +1,12 @@
 //! The engine's input variables: mouse buttons, keys, `@_INP` and the
 //! `@_CODE_*` button codes.
 //!
-//! System variable ids follow the order of the system variable table in
-//! the verified SkyChord layout (shape matching public dictionary 494),
-//! with `@_TIME` at runtime id 0. Erewhon
-//! (v481) uses the same ids: `$_TEXT` = 122, `$_CHR` = 127, `@_INP` = 144,
-//! `@_MOUSE_L` = 147, `@_CODE_MOUSE_L` = 415.
+//! System variable ids come from the selected `SystemVarMap` (one table per
+//! public dictionary family, `@_TIME` at id 0). SkyChord and Erewhon both
+//! use the 494 dictionary's ids (`$_TEXT` = 122, `$_CHR` = 127, `@_INP` =
+//! 144, `@_MOUSE_L` = 147, `@_CODE_MOUSE_L` = 415), although Erewhon's
+//! files report version 481. Only the bases move between families: the
+//! layout inside the mouse, key, counter and code blocks is the same.
 //!
 //! From the manual (system variables): a button's state variable holds the
 //! number of frames it has been held (1, 2, 3, ...) while it is down, and

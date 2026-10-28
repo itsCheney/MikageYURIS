@@ -8,8 +8,8 @@
 //! engine's handlers are not reversed yet). In manual output mode
 //! (`TEXT OUTPUTMODE=0`) the engine draws nothing itself. It keeps two
 //! system strings that the script reads:
-//! - `$_TEXT` (v481 id 122): the characters of the text so far;
-//! - `$_TEXT_FLAG` (v481 id 123): one flag per unit: `1` a single-byte
+//! - `$_TEXT` (494 dictionary id 122): the characters of the text so far;
+//! - `$_TEXT_FLAG` (494 dictionary id 123): one flag per unit: `1` a single-byte
 //!   character, `2` a double-byte one, `E` the end of a line (RETURNCODE)
 //!   and `Z` the end of the text (see below). The text task also knows
 //!   `c`/`C` (click), `R` (new line) and `P` (new page), which the `\c`,
@@ -32,10 +32,10 @@ use yuris_value::{Value, VarRef, VarSpace};
 
 use crate::{cmd, GroupVm, VmEvent, VmSuspend};
 
-/// `$_TEXT` in v481.
+/// `$_TEXT` in the 494 dictionary.
 #[cfg(test)]
 pub(crate) const TEXT_VAR: u16 = 122;
-/// `$_TEXT_FLAG` in v481.
+/// `$_TEXT_FLAG` in the 494 dictionary.
 #[cfg(test)]
 pub(crate) const TEXT_FLAG_VAR: u16 = 123;
 /// A STR[256] the engine fills with the 256 one-byte strings: scripts use
