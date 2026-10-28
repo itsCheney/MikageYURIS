@@ -327,23 +327,40 @@ impl GameFs {
         decode_image_rgba(&self.read(&hit).ok()?)
     }
 
-    /// Decodes an image using the script's original filename bytes. Resource
-    /// names can remain CP932 even when a translation uses GBK for dialogue.
-    pub fn image_rgba_raw(&self, path: &[u8]) -> Option<RgbaImage> {
-        let mut candidates = vec![path.to_vec()];
-        for ext in IMAGE_EXTS {
+    /// Finds a file by the script's original name bytes: as given, then
+    /// with each of `exts`. Resource names stay CP932 even when a
+    /// translation uses GBK for its text, so they must not be decoded.
+    fn locate_raw_with_ext(&self, path: &[u8], exts: &[&str]) -> Option<Hit<'_>> {
+        if let Some(hit) = self.locate(&normalize_name(path)) {
+            return Some(hit);
+        }
+        exts.iter().find_map(|ext| {
             let mut name = path.to_vec();
             name.push(b'.');
             name.extend_from_slice(ext.as_bytes());
-            candidates.push(name);
+            self.locate(&normalize_name(&name))
+        })
+    }
+
+    /// Whether a file exists, by original name bytes (see
+    /// [`Self::read_raw_with_ext`]).
+    pub fn exists_raw_with_ext(&self, path: &[u8], exts: &[&str]) -> bool {
+        self.locate_raw_with_ext(path, exts).is_some()
+    }
+
+    /// Reads a file by the script's original name bytes, trying the name as
+    /// given and then with each of `exts`.
+    pub fn read_raw_with_ext(&self, path: &[u8], exts: &[&str]) -> Option<Vec<u8>> {
+        match self.locate_raw_with_ext(path, exts)? {
+            Hit::Disk(p) => std::fs::read(p).ok(),
+            Hit::Virtual(pkg, f) => pkg.read(f).ok(),
+            Hit::Pack(pack, e) => pack.read_entry(e).ok(),
         }
-        let hit = candidates.iter().find_map(|name| self.locate(&normalize_name(name)))?;
-        let bytes = match hit {
-            Hit::Disk(p) => std::fs::read(p).ok()?,
-            Hit::Virtual(pkg, f) => pkg.read(f).ok()?,
-            Hit::Pack(pack, e) => pack.read_entry(e).ok()?,
-        };
-        decode_image_rgba(&bytes)
+    }
+
+    /// Decodes an image using the script's original filename bytes.
+    pub fn image_rgba_raw(&self, path: &[u8]) -> Option<RgbaImage> {
+        decode_image_rgba(&self.read_raw_with_ext(path, &IMAGE_EXTS)?)
     }
 
     /// Image width and height from the file header (PNG, BMP, JPEG). The

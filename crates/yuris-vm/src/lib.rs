@@ -3090,7 +3090,7 @@ impl GroupVm {
                     // file probe nothing is written back and the event
                     // records an error. Other queries are reversed as needed.
                     if other == 0x15 {
-                        let mut path: Option<String> = None;
+                        let mut path: Option<Vec<u8>> = None;
                         let mut image_path = false;
                         let mut exist = false;
                         let mut let_ref: Option<yuris_format::ystb::CommandSlot> = None;
@@ -3104,7 +3104,12 @@ impl GroupVm {
                                 1 | 2 => {
                                     image_path = slot == 2;
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
-                                        path = Some(v.str_as_string());
+                                        // Original name bytes: CP932 names
+                                        // must survive a GBK translation.
+                                        path = Some(match &v {
+                                            Value::Str(b) => b.clone(),
+                                            other => other.str_as_string().into_bytes(),
+                                        });
                                         {
                                             evaluated.push((slot, value_summary(&v)));
                                         }
@@ -3140,15 +3145,15 @@ impl GroupVm {
                                         })?;
                                     let target = extract_var_target(&bytes)?;
                                     let hit = if image_path {
-                                        probe.resolve_with_ext(p, &yuris_format::vfs::IMAGE_EXTS).is_some()
+                                        probe.exists_raw_with_ext(p, &yuris_format::vfs::IMAGE_EXTS)
                                     } else {
-                                        probe.exists(p)
+                                        probe.exists_raw_with_ext(p, &[])
                                     };
                                     self.write_var_target(&target, Value::Int(hit as i64))?;
                                     {
                                         evaluated.push((
                                             255u8,
-                                            format!("EXIST({p})={} → {}", hit as i64, target.summary()),
+                                            format!("EXIST({})={} → {}", String::from_utf8_lossy(p), hit as i64, target.summary()),
                                         ));
                                     }
                                 }

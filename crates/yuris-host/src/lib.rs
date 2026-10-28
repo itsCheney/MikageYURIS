@@ -511,10 +511,10 @@ impl Host {
 
     /// Reads a sound file: as given, then with `.ogg`, then `.wav`.
     fn load_sound(&mut self, file: &[u8]) -> Option<Vec<u8>> {
-        let path = self.decode(file);
         let fs = self.fs.clone()?;
-        let data = fs.resolve_with_ext(&path, &["ogg", "wav"]).and_then(|p| fs.read(&p).ok());
+        let data = fs.read_raw_with_ext(file, &["ogg", "wav"]);
         if data.is_none() {
+            let path = self.decode(file);
             self.note(format!("SOUND: cannot load {path}"));
         }
         data
