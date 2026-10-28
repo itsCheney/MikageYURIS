@@ -130,3 +130,35 @@ fn gpu_matches_cpu() {
     compare(&mut r, &t, screen, "image changed in place");
     assert!(r.cached_images() > 0);
 }
+
+#[test]
+fn vertex_buffer_growth_keeps_frame_draws_valid() {
+    let Some(mut r) = Renderer::headless() else {
+        eprintln!("no GPU adapter; skipped");
+        return;
+    };
+    let mut present = Renderer::headless().expect("adapter was available");
+    let output = present.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("growth test output"),
+        size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: present.out_format(),
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let output_view = output.create_view(&Default::default());
+    let mut t = LayerTree::new();
+    let screen = (32, 32);
+    for count in [1, 300, 1200] {
+        for i in 0..count {
+            layer(&mut t, &format!("growth{i}"),
+                RgbaImage { width: 1, height: 1, data: vec![(i % 251) as u8, 80, 170, 255] },
+                (i % 32) as i64, ((i / 32) % 32) as i64, i as i64, 256, 0);
+        }
+        compare(&mut r, &t, screen, &format!("vertex growth to {count} layers"));
+        present.render(&t, screen, &output_view, screen);
+        present.device().poll(wgpu::PollType::Wait).unwrap();
+    }
+}

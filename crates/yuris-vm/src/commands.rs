@@ -443,6 +443,8 @@ pub const FOREIGN: u8 = 0x80;
 #[derive(Debug, Clone)]
 pub struct CommandMap {
     to_canon: [u8; 256],
+    /// The compact FILE/LET/CLEAR text interface delegates output to scripts.
+    pub(crate) script_text_only: bool,
     game_names: Vec<String>,
     /// Per game command: game slot -> canonical slot; None = unchanged.
     slot_maps: Vec<Option<Vec<u8>>>,
@@ -463,6 +465,7 @@ impl CommandMap {
         }
         Self {
             to_canon,
+            script_text_only: false,
             game_names: CANONICAL.iter().map(|s| s.to_string()).collect(),
             slot_maps: Vec::new(),
         }
@@ -511,7 +514,12 @@ impl CommandMap {
             game_names.push(c.name.clone());
             slot_maps.push(slots);
         }
-        Self { to_canon, game_names, slot_maps }
+        let script_text_only = t.commands().iter().any(|c| {
+            c.name.eq_ignore_ascii_case("TEXT") && c.params.len() == 3
+                && c.params.iter().zip(["FILE", "LET", "CLEAR"])
+                    .all(|(p, name)| p.name.eq_ignore_ascii_case(name))
+        });
+        Self { to_canon, game_names, slot_maps, script_text_only }
     }
 
     /// Maps one game command index.
@@ -587,6 +595,14 @@ impl CommandMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_text_interface_uses_script_output() {
+        assert!(CommandMap::from_yscm(&yscm(&[("TEXT", &["FILE", "LET", "CLEAR"])])).script_text_only);
+        assert!(!CommandMap::identity().script_text_only);
+        assert!(!CommandMap::from_yscm(&yscm(&[("TEXT", &["FILE", "LET", "CLEAR", "ID", "OUTPUTMODE"])])).script_text_only);
+        assert!(!CommandMap::from_yscm(&yscm(&[("TEXT", &["FILE"])])).script_text_only);
+    }
 
     fn yscm(cmds: &[(&str, &[&str])]) -> YscmTable {
         let mut v = b"YSCM".to_vec();

@@ -348,11 +348,14 @@ impl Renderer {
         out_size: (u32, u32),
     ) -> [f32; 4] {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("yuris frame") });
-        self.encode_frame(&mut encoder, tree, screen);
+        let passes = self.prepare_frame(tree, screen);
         let rect = fit(screen, out_size);
         let first = self.vertices.len() as u32;
         quad(&mut self.vertices, out_size, rect, [0.0, 0.0, 1.0, 1.0], 1.0, true, 0, None);
         self.upload_vertices();
+        for pass in passes.iter().rev() {
+            self.encode_pass(&mut encoder, pass);
+        }
         let frame = self.frame.as_ref().expect("frame target");
         let present_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("yuris present"),
@@ -380,8 +383,11 @@ impl Renderer {
     /// like `yuris_host::compose::render_window`. Waits for the GPU.
     pub fn render_image(&mut self, tree: &LayerTree, screen: (u32, u32)) -> RgbaImage {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("yuris frame") });
-        self.encode_frame(&mut encoder, tree, screen);
+        let passes = self.prepare_frame(tree, screen);
         self.upload_vertices();
+        for pass in passes.iter().rev() {
+            self.encode_pass(&mut encoder, pass);
+        }
         let (w, h) = (screen.0.max(1), screen.1.max(1));
         let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -416,8 +422,9 @@ impl Renderer {
         RgbaImage { width: w, height: h, data }
     }
 
-    /// Builds and encodes the frame's passes into the frame target.
-    fn encode_frame(&mut self, encoder: &mut wgpu::CommandEncoder, tree: &LayerTree, screen: (u32, u32)) {
+    /// Builds all draws before allocating/uploading their vertex buffer.
+    /// No pass may bind the buffer before upload_vertices: growth replaces it.
+    fn prepare_frame(&mut self, tree: &LayerTree, screen: (u32, u32)) -> Vec<Pass> {
         self.frame_no += 1;
         self.vertices.clear();
         let (w, h) = (screen.0.max(1), screen.1.max(1));
@@ -433,9 +440,7 @@ impl Renderer {
         // A set's pass comes after the pass that draws it, and its own
         // sets' passes after it: drawn back to front, each is ready when
         // it is needed.
-        for pass in passes.iter().rev() {
-            self.encode_pass(encoder, pass);
-        }
+        passes
     }
 
     /// Adds the children of `set` to pass `p`, with the set's origin at

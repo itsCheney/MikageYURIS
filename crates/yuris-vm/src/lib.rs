@@ -683,6 +683,11 @@ impl GroupVm {
     /// Sets the command map and remaps the loaded script (call once, after
     /// loading and before running). Scripts loaded later are remapped too.
     pub fn set_command_map(&mut self, map: std::sync::Arc<commands::CommandMap>) {
+        // The compact TEXT interface has no OUTPUTMODE command. Its scripts
+        // consume one line before allowing the scenario task to write the next.
+        if map.script_text_only {
+            self.text.auto = false;
+        }
         map.remap(std::sync::Arc::make_mut(&mut self.ctx));
         self.ctx_cache.clear();
         self.cmd_map = map;

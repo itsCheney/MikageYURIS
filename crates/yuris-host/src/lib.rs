@@ -108,7 +108,7 @@ impl Host {
             return hit.clone();
         }
         let path = self.decode(file);
-        let img = self.fs.as_ref().and_then(|fs| fs.image_rgba(&path)).map(Arc::new);
+        let img = self.fs.as_ref().and_then(|fs| fs.image_rgba_raw(file)).map(Arc::new);
         if img.is_none() && self.fs.is_some() {
             self.note(format!("CG: cannot load image {path}"));
         }

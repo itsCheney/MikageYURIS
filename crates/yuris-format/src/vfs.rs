@@ -327,6 +327,25 @@ impl GameFs {
         decode_image_rgba(&self.read(&hit).ok()?)
     }
 
+    /// Decodes an image using the script's original filename bytes. Resource
+    /// names can remain CP932 even when a translation uses GBK for dialogue.
+    pub fn image_rgba_raw(&self, path: &[u8]) -> Option<RgbaImage> {
+        let mut candidates = vec![path.to_vec()];
+        for ext in IMAGE_EXTS {
+            let mut name = path.to_vec();
+            name.push(b'.');
+            name.extend_from_slice(ext.as_bytes());
+            candidates.push(name);
+        }
+        let hit = candidates.iter().find_map(|name| self.locate(&normalize_name(name)))?;
+        let bytes = match hit {
+            Hit::Disk(p) => std::fs::read(p).ok()?,
+            Hit::Virtual(pkg, f) => pkg.read(f).ok()?,
+            Hit::Pack(pack, e) => pack.read_entry(e).ok()?,
+        };
+        decode_image_rgba(&bytes)
+    }
+
     /// Image width and height from the file header (PNG, BMP, JPEG). The
     /// extension may be left out.
     pub fn image_size(&self, path: &str) -> Option<(u32, u32)> {
@@ -523,6 +542,21 @@ mod tests {
         v.extend_from_slice(&w.to_be_bytes());
         v.extend_from_slice(&h.to_be_bytes());
         v
+    }
+
+    #[test]
+    fn raw_image_names_preserve_cp932_bytes() {
+        let dir = std::env::temp_dir().join(format!("yuris-raw-image-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("cg/tr")).unwrap();
+        let name = "cg/tr/ブラインド・右→左";
+        std::fs::write(dir.join(format!("{name}.jpg")), include_bytes!("../tests/fixtures/gray.jpg")).unwrap();
+        let fs = GameFs::open(&dir).unwrap();
+        let (raw, _, errors) = encoding_rs::SHIFT_JIS.encode(name);
+        assert!(!errors);
+        let image = fs.image_rgba_raw(&raw).expect("original resource bytes resolve");
+        assert!(image.width > 0 && image.height > 0);
+        assert!(fs.image_rgba_raw(b"cg/tr/missing").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
