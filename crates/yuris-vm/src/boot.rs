@@ -48,6 +48,13 @@ pub struct Booted {
     pub key: [u8; 4],
 }
 
+/// YSVR files (length, FNV-1a 64) of games whose system variables were
+/// checked against the 494 dictionary's semantics by playing them:
+/// SkyChord, and Erewhon (the same ysv.ybn in the Japanese release and the
+/// Chinese patch; the input, text and path IDs were first worked out on
+/// it).
+const VERIFIED_494_YSVR: &[(usize, u64)] = &[(47166, 0xd472c3293659379d), (43871, 0xae9b27ee25b9d6fb)];
+
 impl Bootstrap {
     /// Runs the boot chain and returns a ready [`GroupVm`].
     ///
@@ -68,7 +75,7 @@ impl Bootstrap {
     fn boot_impl(self, override_map: Option<yuris_core::SystemVarMap>) -> Result<Booted> {
         let detection = yuris_format::detection::DetectionReport::inspect(&self.fs);
         detection.log();
-        let known_fingerprint = detection.ysvr_fingerprint == Some((47166, 0xd472c3293659379d));
+        let known_fingerprint = detection.ysvr_fingerprint.is_some_and(|f| VERIFIED_494_YSVR.contains(&f));
         let known_shape = detection.candidates.iter().filter(|c| c.exact_shape()).count() == 1
             && detection.candidates.iter().any(|c| c.dictionaries == "494" && c.exact_shape());
         let detected = if known_fingerprint && known_shape { yuris_core::SystemVarMap::SkyChord }
