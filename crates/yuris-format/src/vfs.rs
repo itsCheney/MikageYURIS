@@ -320,7 +320,7 @@ impl GameFs {
             .find(|c| self.exists(c))
     }
 
-    /// Decodes an image to RGBA (PNG or YCG). The extension may be left
+    /// Decodes an image to RGBA (PNG, JPEG or YCG), identified by content. The extension may be left
     /// out.
     pub fn image_rgba(&self, path: &str) -> Option<RgbaImage> {
         let hit = self.resolve_with_ext(path, &IMAGE_EXTS)?;
@@ -449,9 +449,31 @@ pub fn decode_ycg_rgba(b: &[u8]) -> Option<RgbaImage> {
 pub fn decode_image_rgba(bytes: &[u8]) -> Option<RgbaImage> {
     if bytes.starts_with(b"YCG\0") {
         decode_ycg_rgba(bytes)
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        decode_jpeg_rgba(bytes)
     } else {
         decode_png_rgba(bytes)
     }
+}
+
+/// Decodes RGB/grayscale JPEG data, including patches using `.png` names.
+pub fn decode_jpeg_rgba(bytes: &[u8]) -> Option<RgbaImage> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let channels = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => 1,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        _ => return None,
+    };
+    let len = usize::from(info.width).checked_mul(usize::from(info.height))?;
+    if pixels.len() != len.checked_mul(channels)? { return None; }
+    let mut data = Vec::with_capacity(len.checked_mul(4)?);
+    for pixel in pixels.chunks_exact(channels) {
+        let rgb = if channels == 1 { [pixel[0]; 3] } else { [pixel[0], pixel[1], pixel[2]] };
+        data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    }
+    Some(RgbaImage { width: u32::from(info.width), height: u32::from(info.height), data })
 }
 
 /// Image width and height from a file header.

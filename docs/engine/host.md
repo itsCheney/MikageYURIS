@@ -27,7 +27,8 @@ clips its children.
 - **CG** creates a layer (FILE, or a set path) or changes one; FILE on an
   existing layer swaps the image and keeps the attributes. `FILE=""` with
   SX and SY makes a black canvas of that size; Erewhon draws its text glow
-  into one.
+  into one. `LINT` and `LINT2` retain script-owned integer metadata,
+  readable through CGINFO (SkyChord uses LINT2 for button-table indices).
 - **CGINFO** answers the attributes, the image size, and ONMOUSE (the
   pixel under the cursor), which Erewhon's buttons use for hit tests.
 - **CGACT** runs image operations: COPY, SWAP, SIZE, RESIZE, TRIM,
@@ -36,7 +37,7 @@ clips its children.
   values use 0x80 as 100%, after the manual's MEIDO example. Blurs weight
   by alpha. TRANSITION is not done yet.
 
-Images are PNG, or YCG (the engine's own format: zlib strips of BGRA rows,
+Images are PNG, JPEG, or YCG (the engine's own format: zlib strips of BGRA rows,
 used by Erewhon's Chinese UI images under `.png` names). Names may leave
 out the extension.
 

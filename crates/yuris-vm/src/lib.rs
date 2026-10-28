@@ -3078,13 +3078,15 @@ impl GroupVm {
                     // FILEINFO(0x15,引擎 0043eb28):FOLDER(0)/FILE(1)/
                     // CGFILE(2)/SOUNDFILE(3) = 路径源;EXIST(4)/SIZE(5)/
                     // RELATION(6) = 查询项;LET(7) = 写回目标。
-                    // Implemented: EXIST + FILE + LET asks `GameFs` whether
-                    // the file exists (s207 es.R18Check: the engine finds
+                    // Implemented: EXIST + FILE/CGFILE + LET asks `GameFs` whether
+                    // the file exists; CGFILE also resolves image extensions.
+                    // (s207 es.R18Check: the engine finds
                     // `cg/thumb_cg/A_HAN_2002_a.png` and gets 1). Without a
                     // file probe nothing is written back and the event
                     // records an error. Other queries are reversed as needed.
                     if other == 0x15 {
                         let mut path: Option<String> = None;
+                        let mut image_path = false;
                         let mut exist = false;
                         let mut let_ref: Option<yuris_format::ystb::CommandSlot> = None;
                         let mut evaluated: Vec<(u8, String)> = Vec::new();
@@ -3094,7 +3096,8 @@ impl GroupVm {
                             }
                             let slot = (w.tag & 0xff) as u8;
                             match slot {
-                                1 => {
+                                1 | 2 => {
+                                    image_path = slot == 2;
                                     if let Some(v) = self.eval_window_condition(Some(w))? {
                                         path = Some(v.str_as_string());
                                         {
@@ -3131,7 +3134,11 @@ impl GroupVm {
                                             Error::format("FILEINFO LET 引用窗越过池尾")
                                         })?;
                                     let target = extract_var_target(&bytes)?;
-                                    let hit = probe.exists(p);
+                                    let hit = if image_path {
+                                        probe.resolve_with_ext(p, &yuris_format::vfs::IMAGE_EXTS).is_some()
+                                    } else {
+                                        probe.exists(p)
+                                    };
                                     self.write_var_target(&target, Value::Int(hit as i64))?;
                                     {
                                         evaluated.push((

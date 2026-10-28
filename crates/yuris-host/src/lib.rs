@@ -167,6 +167,8 @@ impl Host {
                 "SX" => l.sx = a.apply(l.sx),
                 "SY" => l.sy = a.apply(l.sy),
                 "MODE" => l.mode = a.apply(l.mode),
+                "LINT" => l.lint[0] = a.apply(l.lint[0]),
+                "LINT2" => l.lint[1] = a.apply(l.lint[1]),
                 "T" => l.t = a.apply(l.t),
                 "TA" => l.ta = a.apply(l.ta),
                 "MID" => l.mid = str_of(&a.value),
@@ -182,7 +184,7 @@ impl Host {
     fn cginfo(&mut self, c: &NativeCall<'_>) -> Option<Value> {
         const QUERIES: &[&str] = &[
             "EXIST", "E", "A", "TID", "T", "TA", "X", "Y", "Z", "SX", "SY", "MODE", "COLOR",
-            "ONMOUSE", "ONMOUSE2", "ONMOUSE3",
+            "ONMOUSE", "ONMOUSE2", "ONMOUSE3", "LINT", "LINT2",
         ];
         let id = c.bytes("ID")?;
         let q = c.first_flag(QUERIES)?;
@@ -201,6 +203,8 @@ impl Host {
             "SX" => l.width(),
             "SY" => l.height(),
             "MODE" => l.mode,
+            "LINT" => l.lint[0],
+            "LINT2" => l.lint[1],
             "COLOR" => {
                 let (x, y) = (c.int("SET").unwrap_or(0), c.int("SET2").unwrap_or(0));
                 l.image.pixel(x, y).map_or(0, |[r, g, b, _]| rgb(r, g, b))
@@ -274,6 +278,7 @@ impl Host {
             l.y = s.y;
             l.z = s.z;
             l.mode = s.mode;
+            l.lint = s.lint;
             l.mid = s.mid;
             l.tid = s.tid;
             l.t = s.t;
@@ -332,6 +337,7 @@ impl Host {
                             l.y = src.y;
                             l.z = src.z;
                             l.mode = src.mode;
+                            l.lint = src.lint;
                         }
                     }
                 }
@@ -715,6 +721,35 @@ mod tests {
 
     fn arg(param: &'static str, value: Value) -> NativeArg {
         NativeArg { slot: 0, param, value, op: 0 }
+    }
+
+    #[test]
+    fn layer_integer_metadata_survives_image_edits() {
+        let mut h = Host::new(None, (64, 64));
+        let id = |s: &str| arg("ID", Value::Str(s.as_bytes().to_vec()));
+        let query = |h: &mut Host, name: &str, field| {
+            h.cginfo(&call("CGINFO", &[id(name), arg(field, Value::Int(1))], (0, 0)))
+        };
+        assert_eq!(query(&mut h, "button", "LINT2"), Some(Value::Int(0)));
+        h.cg(&call("CG", &[id("button"), arg("FILE", Value::Str(vec![])),
+            arg("SX", Value::Int(4)), arg("SY", Value::Int(4)),
+            arg("LINT", Value::Int(999)), arg("LINT2", Value::Int(27))], (0, 0)));
+        // SkyChord reads the button table index back through CGINFO LINT2.
+        assert_eq!(query(&mut h, "button", "LINT"), Some(Value::Int(999)));
+        assert_eq!(query(&mut h, "button", "LINT2"), Some(Value::Int(27)));
+        h.cg(&call("CG", &[id("button"), NativeArg { op: 1, ..arg("LINT2", Value::Int(3)) },
+            arg("E", Value::Int(0))], (0, 0)));
+        h.cgact(&call("CGACT", &[id("button"), arg("RECTPAINT3", Value::Int(1)),
+            arg("SET", Value::Int(0))], (0, 0)));
+        assert_eq!(query(&mut h, "button", "LINT2"), Some(Value::Int(30)));
+        h.cgact(&call("CGACT", &[id("button"), arg("COPY", Value::Int(1)),
+            arg("ID2", Value::Str(b"copy".to_vec()))], (0, 0)));
+        assert_eq!(query(&mut h, "copy", "LINT2"), Some(Value::Int(30)));
+        h.cgact(&call("CGACT", &[id("button"), arg("COPY2", Value::Int(1)),
+            arg("ID2", Value::Str(b"pixels".to_vec()))], (0, 0)));
+        assert_eq!(query(&mut h, "pixels", "LINT2"), Some(Value::Int(0)));
+        h.tree.remove(h.tree.find(b"button").unwrap());
+        assert_eq!(query(&mut h, "button", "LINT2"), Some(Value::Int(0)));
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub struct Layer {
     pub sy: i64,
     /// MODE: blend mode (0 normal, 1 add, 2 subtract, 3 multiply, 5 screen, ...).
     pub mode: i64,
+    /// LINT and LINT2: script-owned integer metadata.
+    pub lint: [i64; 2],
     /// MID: mask layer ID.
     pub mid: Vec<u8>,
     /// TID: transition layer ID.
@@ -75,6 +77,7 @@ impl Layer {
             sx: 0,
             sy: 0,
             mode: 0,
+            lint: [0; 2],
             mid: Vec::new(),
             tid: Vec::new(),
             t: 0,
