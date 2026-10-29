@@ -296,6 +296,13 @@ impl Player {
             }
         } else {
             self.keys_held.retain(|&h| h != k);
+            // A key pressed in an earlier frame goes up now; one pressed
+            // since the last frame still gets its frame down first (see
+            // begin_frame). Without this a held key (Ctrl for skip) stayed
+            // down in the game forever.
+            if !self.keys_pressed.contains(&k) {
+                self.vm.set_key(k, false);
+            }
         }
     }
 
@@ -499,6 +506,24 @@ mod tests {
         assert_eq!(key_from_vk(0x11), Some(Key::Ctrl));
         assert_eq!(key_from_vk(0xe2), Some(Key::Backslash));
         assert_eq!(key_from_vk(0x07), None);
+    }
+
+    #[test]
+    fn held_key_goes_up_on_release() {
+        // Needs a real 494-layout game (Erewhon, SkyChord) in YURIS_TEST_GAME.
+        let Some(dir) = std::env::var_os("YURIS_TEST_GAME").map(PathBuf::from) else { return };
+        let config = Config { game_dir: dir, launcher: None, save_dir: Some(std::env::temp_dir().join("yuris-key-test")),
+            fonts: Vec::new(), encoding: Encoding::Auto, utc_offset_ms: 0 };
+        let mut p = Player::open(&config).unwrap();
+        const KEY_CTRL: u16 = 247; // `@_KEY_CTRL` in the 494 dictionary
+        let run = |p: &mut Player, n: usize| for _ in 0..n { p.step(17); };
+        run(&mut p, 30);
+        p.key(Key::Ctrl, true);
+        run(&mut p, 10);
+        assert!(p.vm.global_int(KEY_CTRL).unwrap_or(0) > 0, "held");
+        p.key(Key::Ctrl, false);
+        run(&mut p, 10);
+        assert!(p.vm.global_int(KEY_CTRL).unwrap_or(0) < 0, "released");
     }
 
     #[test]
